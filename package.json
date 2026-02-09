@@ -1,0 +1,56 @@
+{
+  "name": "relux-laundry-backend",
+  "version": "1.0.0",
+  "description": "Relux Laundry Management System - Backend API (JavaScript)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "seed": "node src/utils/seeder.js",
+    "start:cluster": "pm2 start ecosystem.config.js --env production",
+    "start:prod": "pm2 start ecosystem.config.js --env production",
+    "stop": "pm2 stop relux-laundry-api",
+    "restart": "pm2 restart relux-laundry-api",
+    "logs": "pm2 logs relux-laundry-api",
+    "monitor": "pm2 monit",
+    "delete": "pm2 delete relux-laundry-api",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "laundry",
+    "management",
+    "api",
+    "express",
+    "mongodb"
+  ],
+  "author": "Godswill",
+  "license": "ISC",
+  "dependencies": {
+    "@clerk/express": "^1.7.67",
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^7.2.0",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "hpp": "^0.2.3",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.3.0",
+    "morgan": "^1.10.0",
+    "nodemailer": "^6.9.13",
+    "pm2": "^5.3.1",
+    "socket.io": "^4.7.5",
+    "svix": "^1.84.1",
+    "twilio": "^5.0.4",
+    "winston": "^3.13.0",
+    "xss-clean": "^0.1.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

@@ -1,0 +1,20 @@
+node_modules/
+.env
+.env.example
+.claude
+*.log
+null
+# .DS_Store
+# uploads/
+# src/logs/
+# .vscode/
+# .idea/
+# *.swp
+# *.swo
+# *~
+# .pm2/
+# pids/
+# *.pid
+# *.seed
+# coverage/
+# .nyc_output/
