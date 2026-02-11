@@ -9,12 +9,12 @@ const {
   updateReferralStatus,
 } = require('../controllers/referralController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Customer self-service (must be before /:id)
-router.get('/me', dualProtect, getMyReferrals);
-router.get('/me/code', dualProtect, getMyReferralCode);
-router.post('/apply', dualProtect, applyReferralCode);
+router.get('/me', protect, getMyReferrals);
+router.get('/me/code', protect, getMyReferralCode);
+router.post('/apply', protect, applyReferralCode);
 
 // Admin
 router.get('/', protect, authorize('admin', 'manager'), getReferrals);

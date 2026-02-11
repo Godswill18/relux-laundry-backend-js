@@ -9,9 +9,9 @@ const {
   updatePreferences,
 } = require('../controllers/notificationController.js');
 
-const { dualProtect } = require('../middleware/auth.js');
+const { protect } = require('../middleware/auth.js');
 
-router.use(dualProtect);
+router.use(protect);
 
 router.get('/', getNotifications);
 

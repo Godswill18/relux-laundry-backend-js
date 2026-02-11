@@ -11,11 +11,11 @@ const {
   activateCustomer,
 } = require('../controllers/customerController.js');
 
-const { protect, dualProtect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Customer self-service routes
-router.get('/me', dualProtect, getMyProfile);
-router.put('/me', dualProtect, updateMyProfile);
+router.get('/me', protect, getMyProfile);
+router.put('/me', protect, updateMyProfile);
 
 // Admin/staff routes
 router.use(protect);

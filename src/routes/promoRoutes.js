@@ -11,11 +11,11 @@ const {
   getRedemptions,
 } = require('../controllers/promoController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Customer-facing routes
-router.post('/validate', dualProtect, validatePromoCode);
-router.post('/redeem', dualProtect, redeemPromoCode);
+router.post('/validate', protect, validatePromoCode);
+router.post('/redeem', protect, redeemPromoCode);
 
 // Admin/manager routes
 router.get('/', protect, authorize('admin', 'manager'), getPromoCodes);

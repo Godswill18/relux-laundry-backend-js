@@ -9,12 +9,12 @@ const {
   getTransactionsByCustomer,
 } = require('../controllers/walletController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Customer self-service routes
-router.get('/me', dualProtect, getMyWallet);
-router.post('/topup', dualProtect, topUpWallet);
-router.get('/me/transactions', dualProtect, getTransactions);
+router.get('/me', protect, getMyWallet);
+router.post('/topup', protect, topUpWallet);
+router.get('/me/transactions', protect, getTransactions);
 
 // Admin/staff routes
 router.get('/customer/:customerId', protect, authorize('admin', 'manager'), getWalletByCustomer);

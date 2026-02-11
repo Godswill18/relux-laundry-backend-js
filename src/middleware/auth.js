@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const { clerkClient } = require('@clerk/express');
+// const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
 const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
@@ -41,48 +41,10 @@ exports.protect = asyncHandler(async (req, res, next) => {
   }
 });
 
-// Dual protect - accepts either custom JWT or Clerk session token
-exports.dualProtect = asyncHandler(async (req, res, next) => {
-  let token;
-
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  } else if (req.cookies.token) {
-    token = req.cookies.token;
-  }
-
-  if (!token) {
-    return next(new AppError('Not authorized to access this route', 401));
-  }
-
-  // Try custom JWT first (fast, local verification)
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
-    if (user && user.isActive) {
-      req.user = user;
-      return next();
-    }
-  } catch (jwtError) {
-    // Not a valid custom JWT - try Clerk
-  }
-
-  // Try Clerk token verification
-  try {
-    const { sub: clerkUserId } = await clerkClient.verifyToken(token);
-    if (clerkUserId) {
-      const user = await User.findOne({ clerkId: clerkUserId });
-      if (user && user.isActive) {
-        req.user = user;
-        return next();
-      }
-    }
-  } catch (clerkError) {
-    // Not a valid Clerk token either
-  }
-
-  return next(new AppError('Not authorized to access this route', 401));
-});
+// --- Clerk dualProtect commented out — using custom JWT protect instead ---
+// exports.dualProtect = asyncHandler(async (req, res, next) => {
+//   // ... Clerk + JWT dual verification ...
+// });
 
 // Grant access to specific roles
 exports.authorize = (...roles) => {

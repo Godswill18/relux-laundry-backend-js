@@ -12,18 +12,18 @@ const {
   adjustPoints,
 } = require('../controllers/loyaltyController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Tier routes
-router.get('/tiers', dualProtect, getTiers);
+router.get('/tiers', protect, getTiers);
 router.post('/tiers', protect, authorize('admin'), createTier);
-router.get('/tiers/:id', dualProtect, getTier);
+router.get('/tiers/:id', protect, getTier);
 router.put('/tiers/:id', protect, authorize('admin'), updateTier);
 router.delete('/tiers/:id', protect, authorize('admin'), deleteTier);
 
 // Customer self-service
-router.get('/me', dualProtect, getMyLoyalty);
-router.get('/me/ledger', dualProtect, getLedger);
+router.get('/me', protect, getMyLoyalty);
+router.get('/me/ledger', protect, getLedger);
 
 // Admin
 router.get('/customer/:customerId', protect, authorize('admin', 'manager'), getCustomerLoyalty);

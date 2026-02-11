@@ -14,10 +14,10 @@ const {
   updateServiceLevelConfig,
 } = require('../controllers/settingsController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Service level configs (readable by any authenticated user)
-router.get('/service-levels', dualProtect, getServiceLevelConfigs);
+router.get('/service-levels', protect, getServiceLevelConfigs);
 router.post('/service-levels', protect, authorize('admin'), createServiceLevelConfig);
 router.put('/service-levels/:id', protect, authorize('admin'), updateServiceLevelConfig);
 

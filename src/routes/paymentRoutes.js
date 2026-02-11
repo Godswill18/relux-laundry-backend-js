@@ -10,14 +10,14 @@ const {
   verifyPaystack,
 } = require('../controllers/paymentController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Paystack routes (customer-facing)
-router.post('/paystack/initialize', dualProtect, initializePaystack);
-router.get('/paystack/verify/:reference', dualProtect, verifyPaystack);
+router.post('/paystack/initialize', protect, initializePaystack);
+router.get('/paystack/verify/:reference', protect, verifyPaystack);
 
 // Order payment lookup
-router.get('/order/:orderId', dualProtect, getPaymentByOrder);
+router.get('/order/:orderId', protect, getPaymentByOrder);
 
 // Admin/staff routes
 router.get('/', protect, authorize('admin', 'manager'), getPayments);

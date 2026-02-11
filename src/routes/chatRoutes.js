@@ -9,9 +9,9 @@ const {
   sendMessage,
 } = require('../controllers/chatController.js');
 
-const { dualProtect } = require('../middleware/auth.js');
+const { protect } = require('../middleware/auth.js');
 
-router.use(dualProtect);
+router.use(protect);
 
 router.route('/').get(getThreads).post(createThread);
 

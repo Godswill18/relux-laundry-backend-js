@@ -61,6 +61,9 @@ const UserSchema = new mongoose.Schema(
       type: String,
       enum: ['receptionist', 'washer', 'delivery', null],
     },
+    address: String,
+    city: String,
+    dateOfBirth: String,
     addresses: [AddressSchema],
     preferredPickupTime: String,
     isActive: {

@@ -1,7 +1,33 @@
 const User = require('../models/User.js');
+const Customer = require('../models/Customer.js');
+// const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
-const { generateOTP, sendTokenResponse } = require('../utils/helpers.js');
+const { generateOTP, splitName, sendTokenResponse } = require('../utils/helpers.js');
+
+// Ensure a Customer document exists for the given User and link them.
+// Idempotent — safe to call on every login/register.
+const ensureCustomer = async (user) => {
+  if (user.customerId) return user;
+
+  // Try to find existing Customer by phone or email
+  let customer;
+  if (user.phone) customer = await Customer.findOne({ phone: user.phone });
+  if (!customer && user.email) customer = await Customer.findOne({ email: user.email });
+
+  if (!customer) {
+    customer = await Customer.create({
+      name: user.name,
+      phone: user.phone || undefined,
+      email: user.email || undefined,
+      status: 'active',
+    });
+  }
+
+  user.customerId = customer._id;
+  await user.save({ validateBeforeSave: false });
+  return user;
+};
 
 // @desc    Register user
 // @route   POST /api/v1/auth/register
@@ -9,37 +35,114 @@ const { generateOTP, sendTokenResponse } = require('../utils/helpers.js');
 exports.register = asyncHandler(async (req, res, next) => {
   const { name, email, phone, password, role } = req.body;
 
+  // Validate required fields
+  if (!name || !phone || !password) {
+    return next(new AppError('Please provide name, phone and password', 400));
+  }
+
   // Check if user already exists
   const existingUser = await User.findOne({ phone });
   if (existingUser) {
     return next(new AppError('Phone number already registered', 400));
   }
 
-  // Create user
+  // Create user (convert empty strings to undefined for sparse unique fields)
   const user = await User.create({
     name,
-    email,
+    email: email || undefined,
     phone,
     password,
     role: role || 'customer',
   });
 
+  // Create linked Customer document for wallet/loyalty/orders
+  await ensureCustomer(user);
+
   sendTokenResponse(user, 201, res);
+});
+
+// @desc    Sync Clerk user to MongoDB (create if not exists)
+// @route   POST /api/v1/auth/clerk-sync
+// @access  Public (requires valid Clerk token)
+exports.clerkSync = asyncHandler(async (req, res, next) => {
+  let token;
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+
+  if (!token) {
+    console.log('[clerkSync] No token in Authorization header');
+    return next(new AppError('No token provided', 401));
+  }
+
+  console.log('[clerkSync] Token received:', token.substring(0, 20) + '...');
+
+  // Verify Clerk token
+  let clerkUserId;
+  try {
+    const verified = await clerkClient.verifyToken(token);
+    console.log('[clerkSync] Clerk verified:', JSON.stringify(verified));
+    clerkUserId = verified.sub;
+  } catch (err) {
+    console.log('[clerkSync] Clerk verifyToken FAILED:', err.message);
+    return next(new AppError('Invalid Clerk token', 401));
+  }
+
+  if (!clerkUserId) {
+    return next(new AppError('Invalid Clerk token', 401));
+  }
+
+  // Check if user already exists by clerkId
+  let user = await User.findOne({ clerkId: clerkUserId });
+
+  if (!user) {
+    const { email, name, phone } = req.body;
+
+    // Try to link to an existing user by email
+    if (email) {
+      user = await User.findOne({ email });
+    }
+
+    if (user) {
+      // Link existing user to Clerk
+      user.clerkId = clerkUserId;
+      user.authProvider = 'clerk';
+      if (name && !user.name) user.name = name;
+      await user.save({ validateBeforeSave: false });
+    } else {
+      // Create new user
+      user = await User.create({
+        clerkId: clerkUserId,
+        authProvider: 'clerk',
+        name: name || 'Customer',
+        email: email || undefined,
+        phone: phone || undefined,
+        role: 'customer',
+      });
+    }
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'User synced successfully',
+    data: { user },
+  });
 });
 
 // @desc    Login user
 // @route   POST /api/v1/auth/login
 // @access  Public
 exports.login = asyncHandler(async (req, res, next) => {
-  const { phone, password } = req.body;
+  const { phone, email, password } = req.body;
 
-  // Validate phone & password
-  if (!phone || !password) {
-    return next(new AppError('Please provide phone number and password', 400));
+  // Validate credentials
+  if ((!phone && !email) || !password) {
+    return next(new AppError('Please provide phone/email and password', 400));
   }
 
-  // Check for user
-  const user = await User.findOne({ phone }).select('+password');
+  // Check for user by phone or email
+  const query = phone ? { phone } : { email: email.toLowerCase() };
+  const user = await User.findOne(query).select('+password');
 
   if (!user) {
     return next(new AppError('Invalid credentials', 401));
@@ -57,6 +160,9 @@ exports.login = asyncHandler(async (req, res, next) => {
     return next(new AppError('Your account has been deactivated', 401));
   }
 
+  // Ensure Customer document exists (backfill for users created before this fix)
+  await ensureCustomer(user);
+
   sendTokenResponse(user, 200, res);
 });
 
@@ -66,10 +172,19 @@ exports.login = asyncHandler(async (req, res, next) => {
 exports.getMe = asyncHandler(async (req, res, next) => {
   const user = await User.findById(req.user.id);
 
+  // Backfill Customer if missing (for users created before ensureCustomer was added)
+  await ensureCustomer(user);
+
+  const userObj = user.toObject();
+  const { firstName, lastName } = splitName(userObj.name);
+  userObj.firstName = firstName;
+  userObj.lastName = lastName;
+  if (userObj._id && !userObj.id) userObj.id = userObj._id.toString();
+
   res.status(200).json({
     success: true,
     message: 'User profile fetched successfully',
-    data: { user },
+    data: { user: userObj },
   });
 });
 
@@ -77,21 +192,38 @@ exports.getMe = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/auth/update
 // @access  Private
 exports.updateDetails = asyncHandler(async (req, res, next) => {
-  const fieldsToUpdate = {
-    name: req.body.name,
-    email: req.body.email,
-    preferredPickupTime: req.body.preferredPickupTime,
-  };
+  const { firstName, lastName, name, email, phone, address, city, dateOfBirth, preferredPickupTime } = req.body;
+
+  const fieldsToUpdate = {};
+
+  // Support both "name" and "firstName/lastName" from frontend
+  if (firstName || lastName) {
+    fieldsToUpdate.name = [firstName, lastName].filter(Boolean).join(' ');
+  } else if (name) {
+    fieldsToUpdate.name = name;
+  }
+  if (email) fieldsToUpdate.email = email;
+  if (phone) fieldsToUpdate.phone = phone;
+  if (address) fieldsToUpdate.address = address;
+  if (city) fieldsToUpdate.city = city;
+  if (dateOfBirth) fieldsToUpdate.dateOfBirth = dateOfBirth;
+  if (preferredPickupTime) fieldsToUpdate.preferredPickupTime = preferredPickupTime;
 
   const user = await User.findByIdAndUpdate(req.user.id, fieldsToUpdate, {
     new: true,
-    runValidators: true,
+    runValidators: false,
   });
+
+  const userObj = user.toObject();
+  const { firstName: fn, lastName: ln } = splitName(userObj.name);
+  userObj.firstName = fn;
+  userObj.lastName = ln;
+  if (userObj._id && !userObj.id) userObj.id = userObj._id.toString();
 
   res.status(200).json({
     success: true,
     message: 'Profile updated successfully',
-    data: { user },
+    data: { user: userObj },
   });
 });
 

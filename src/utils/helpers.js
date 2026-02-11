@@ -3,6 +3,16 @@ const generateOTP = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
 };
 
+// Split a "name" string into firstName / lastName
+const splitName = (name) => {
+  if (!name) return { firstName: '', lastName: '' };
+  const parts = name.trim().split(/\s+/);
+  return {
+    firstName: parts[0] || '',
+    lastName: parts.slice(1).join(' ') || '',
+  };
+};
+
 // Send token response
 const sendTokenResponse = (user, statusCode, res) => {
   const token = user.generateAuthToken();
@@ -21,12 +31,20 @@ const sendTokenResponse = (user, statusCode, res) => {
   // Remove password from output
   user.password = undefined;
 
+  // Build a plain object so we can add firstName/lastName for the frontend
+  const userObj = user.toObject ? user.toObject() : { ...user };
+  const { firstName, lastName } = splitName(userObj.name);
+  userObj.firstName = firstName;
+  userObj.lastName = lastName;
+  // Normalize id field
+  if (userObj._id && !userObj.id) userObj.id = userObj._id.toString();
+
   res.status(statusCode).cookie('token', token, options).json({
     success: true,
     message: 'Login successful',
     data: {
       token,
-      user,
+      user: userObj,
     },
   });
 };
@@ -58,6 +76,7 @@ const generateQRCode = (orderNumber) => {
 
 module.exports = {
   generateOTP,
+  splitName,
   sendTokenResponse,
   calculateOrderPricing,
   generateQRCode,

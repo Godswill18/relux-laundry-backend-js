@@ -15,26 +15,26 @@ const {
   getUsage,
 } = require('../controllers/subscriptionController.js');
 
-const { dualProtect, protect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Plan routes (must be before /:id)
-router.get('/plans', dualProtect, getPlans);
+router.get('/plans', protect, getPlans);
 router.post('/plans', protect, authorize('admin'), createPlan);
-router.get('/plans/:id', dualProtect, getPlan);
+router.get('/plans/:id', protect, getPlan);
 router.put('/plans/:id', protect, authorize('admin'), updatePlan);
 router.delete('/plans/:id', protect, authorize('admin'), deletePlan);
 
 // Customer self-service
-router.get('/me', dualProtect, getMySubscription);
-router.post('/', dualProtect, subscribe);
+router.get('/me', protect, getMySubscription);
+router.post('/', protect, subscribe);
 
 // Admin list
 router.get('/', protect, authorize('admin', 'manager'), getSubscriptions);
 
 // Subscription actions
-router.put('/:id/cancel', dualProtect, cancelSubscription);
-router.put('/:id/pause', dualProtect, pauseSubscription);
-router.put('/:id/resume', dualProtect, resumeSubscription);
-router.get('/:id/usage', dualProtect, getUsage);
+router.put('/:id/cancel', protect, cancelSubscription);
+router.put('/:id/pause', protect, pauseSubscription);
+router.put('/:id/resume', protect, resumeSubscription);
+router.get('/:id/usage', protect, getUsage);
 
 module.exports = router;

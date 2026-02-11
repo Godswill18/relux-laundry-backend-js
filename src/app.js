@@ -67,7 +67,7 @@ if (process.env.NODE_ENV === 'development') {
 }
 
 // API rate limiting
-app.use('/api', apiLimiter);
+// app.use('/api', apiLimiter);
 
 // Health check
 app.get('/health', (req, res) => {

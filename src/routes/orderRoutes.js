@@ -14,11 +14,11 @@ const {
   getOrderMedia,
 } = require('../controllers/orderController.js');
 
-const { dualProtect, authorize } = require('../middleware/auth.js');
+const { protect, authorize } = require('../middleware/auth.js');
 const { orderLimiter } = require('../middleware/rateLimiter.js');
 
-// All routes require authentication (accepts both JWT and Clerk tokens)
-router.use(dualProtect);
+// All routes require authentication (JWT tokens)
+router.use(protect);
 
 router.route('/')
   .get(getOrders)

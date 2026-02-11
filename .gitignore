@@ -3,7 +3,6 @@ node_modules/
 .env.example
 .claude
 *.log
-null
 # .DS_Store
 # uploads/
 # src/logs/
