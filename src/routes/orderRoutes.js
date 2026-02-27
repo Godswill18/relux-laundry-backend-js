@@ -6,6 +6,7 @@ const {
   getOrder,
   updateOrderStatus,
   assignStaff,
+  acceptOrder,
   updatePayment,
   cancelOrder,
   addOrderItem,
@@ -27,8 +28,9 @@ router.route('/')
 router.route('/:id')
   .get(getOrder);
 
-router.put('/:id/status', authorize('staff', 'admin', 'manager'), updateOrderStatus);
-router.put('/:id/assign', authorize('admin', 'manager'), assignStaff);
+router.patch('/:id/status', authorize('staff', 'admin', 'manager'), updateOrderStatus);
+router.patch('/:id/accept', authorize('staff', 'admin', 'manager'), acceptOrder);
+router.patch('/:id/assign', authorize('admin', 'manager'), assignStaff);
 router.put('/:id/payment', authorize('staff', 'admin', 'manager'), updatePayment);
 router.put('/:id/cancel', cancelOrder);
 

@@ -1,17 +1,26 @@
 const Order = require('../models/Order.js');
 const OrderItem = require('../models/OrderItem.js');
 const OrderMedia = require('../models/OrderMedia.js');
+const Customer = require('../models/Customer.js');
+const Wallet = require('../models/Wallet.js');
+const WalletTransaction = require('../models/WalletTransaction.js');
+const Referral = require('../models/Referral.js');
+const ReferralSetting = require('../models/ReferralSetting.js');
+const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const ERROR_CODES = require('../utils/errorCodes.js');
 const { calculateOrderPricing, generateQRCode } = require('../utils/helpers.js');
 
-// @desc    Create new order
+// @desc    Create new order (online or offline walk-in)
 // @route   POST /api/v1/orders
 // @access  Private
 exports.createOrder = asyncHandler(async (req, res, next) => {
   const {
     serviceType,
     orderType,
+    orderSource,
+    walkInCustomer,
     items,
     pickupAddress,
     deliveryAddress,
@@ -20,30 +29,84 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     specialInstructions,
     pricing,
     paymentMethod,
+    customerId: bodyCustomerId,
+    assignedStaff,
+    serviceLevel,
+    pickupMethod,
+    rush,
+    stainRemoval,
   } = req.body;
+
+  const isStaffRole = ['staff', 'admin', 'manager'].includes(req.user.role);
+  // Auto-classify: staff/admin/manager always creates walk-in (offline); customers always create online
+  const isOffline = isStaffRole;
+
+  // Determine the customer for this order
+  let orderCustomerId = null;
+  let orderCustomerRefId = null;
+
+  if (isOffline && isStaffRole) {
+    // Offline walk-in order created by staff — no customer User account required
+    // walkInCustomer.name and walkInCustomer.phone are used instead
+    if (!walkInCustomer || !walkInCustomer.name) {
+      return next(new AppError('Walk-in customer name is required for offline orders', 400));
+    }
+    // Use the staff member's own ID as a placeholder to satisfy the schema
+    orderCustomerId = req.user.id;
+  } else {
+    // Online order
+    orderCustomerId = req.user.id;
+    orderCustomerRefId = req.user.customerId;
+
+    if (bodyCustomerId && isStaffRole) {
+      const customer = await Customer.findById(bodyCustomerId);
+      if (!customer) {
+        return next(new AppError('Customer not found', 404));
+      }
+      const customerUser = await User.findOne({ customerId: bodyCustomerId });
+      orderCustomerId = customerUser ? customerUser._id : req.user.id;
+      orderCustomerRefId = bodyCustomerId;
+    }
+  }
+
+  // Validate that every item includes a serviceType
+  if (Array.isArray(items) && items.length > 0) {
+    const missing = items.find((item) => !item.serviceType);
+    if (missing) {
+      return next(new AppError(`Item "${missing.itemType || 'unknown'}" is missing a service type`, 400));
+    }
+  }
 
   // Calculate pricing if not provided
   let orderPricing = pricing;
   if (!pricing) {
     orderPricing = calculateOrderPricing(
-      items,
-      req.body.pickupFee || 500,
-      req.body.deliveryFee || 500,
+      items || [],
+      req.body.pickupFee || 0,
+      req.body.deliveryFee || 0,
       req.body.discount || 0
     );
   }
 
   // Create order
   const order = await Order.create({
-    customer: req.user.id,
+    customer: orderCustomerId,
+    orderSource: isOffline ? 'offline' : 'online',
+    walkInCustomer: isOffline ? walkInCustomer : undefined,
+    createdByStaff: isStaffRole ? req.user.id : undefined,
     serviceType,
-    orderType,
-    items,
+    orderType: orderType || (isOffline ? 'walk-in' : undefined),
+    items: items || [],
     pickupAddress: orderType === 'pickup-delivery' ? pickupAddress : undefined,
     deliveryAddress: orderType === 'pickup-delivery' ? deliveryAddress : undefined,
     pickupDate,
     scheduledPickupTime,
     specialInstructions,
+    serviceLevel: serviceLevel || 'standard',
+    pickupMethod: pickupMethod || undefined,
+    rush: rush || false,
+    stainRemoval: stainRemoval || false,
+    assignedStaff: isOffline ? req.user.id : (assignedStaff || undefined),
     pricing: orderPricing,
     payment: {
       method: paymentMethod || 'cash',
@@ -56,10 +119,59 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   order.qrCode = generateQRCode(order.orderNumber);
   await order.save();
 
+  // Handle wallet payment if payment method is 'wallet'
+  if (paymentMethod && paymentMethod.toLowerCase() === 'wallet') {
+    // Get customer's wallet
+    const wallet = await Wallet.findOne({ customerId: orderCustomerRefId });
+
+    if (!wallet) {
+      return next(new AppError('Wallet not found for this customer', 404, ERROR_CODES.NOT_FOUND));
+    }
+
+    // Validate sufficient balance
+    if (wallet.balance < orderPricing.total) {
+      return next(new AppError('Insufficient wallet balance', 400, ERROR_CODES.INSUFFICIENT_BALANCE));
+    }
+
+    // Deduct from wallet
+    wallet.balance -= orderPricing.total;
+    await wallet.save();
+
+    // Create wallet transaction
+    await WalletTransaction.create({
+      walletId: wallet._id,
+      customerId: orderCustomerRefId,
+      type: 'debit',
+      amount: orderPricing.total,
+      reason: `Payment for order ${order.orderNumber}`,
+      balanceAfter: wallet.balance,
+      orderId: order._id,
+    });
+
+    // Mark payment as paid
+    order.payment.status = 'paid';
+    order.payment.paidAt = new Date();
+    await order.save();
+
+    // Emit Socket.io event for wallet update
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user-${orderCustomerRefId}`).emit('wallet:balance-updated', {
+        balance: wallet.balance,
+        transaction: {
+          type: 'debit',
+          amount: orderPricing.total,
+          reason: `Payment for order ${order.orderNumber}`,
+        },
+      });
+    }
+  }
+
   // Emit socket event for real-time update
   const io = req.app.get('io');
   if (io) {
     io.emit('order-created', order);
+    io.to(`user-${orderCustomerRefId || orderCustomerId}`).emit('order:created', order);
   }
 
   res.status(201).json({
@@ -72,18 +184,59 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
 // @desc    Get all orders
 // @route   GET /api/v1/orders
 // @access  Private
+// Query params (staff/admin):
+//   ?status=pending
+//   ?orderSource=online|offline
+//   ?assignedStaff=me            → orders assigned to logged-in staff
+//   ?unassigned=true             → pending orders with no staff assigned
+//   ?tab=new|mine|offline        → convenience shorthand for staff tabs
 exports.getOrders = asyncHandler(async (req, res, next) => {
   let query;
 
-  // For customers, only show their orders
+  // Customers only see their own orders
   if (req.user.role === 'customer') {
     query = { customer: req.user.id };
   } else {
-    // For staff/admin, allow filtering
     query = {};
-    if (req.query.status) query.status = req.query.status;
-    if (req.query.serviceType) query.serviceType = req.query.serviceType;
-    if (req.query.customer) query.customer = req.query.customer;
+
+    // --- Staff dashboard tab shortcuts ---
+    if (req.query.tab === 'new') {
+      // Unassigned online orders available to claim
+      query.orderSource = 'online';
+      query.assignedStaff = { $exists: false };
+      query.status = { $in: ['pending', 'confirmed'] };
+    } else if (req.query.tab === 'mine') {
+      // Orders assigned to this staff member that are still active
+      query.assignedStaff = req.user.id;
+      query.status = { $nin: ['completed', 'delivered', 'cancelled'] };
+    } else if (req.query.tab === 'offline') {
+      // Offline walk-in orders created by this staff member
+      query.orderSource = 'offline';
+      if (req.user.role === 'staff') query.createdByStaff = req.user.id;
+    } else if (req.query.tab === 'completed') {
+      // All finished orders handled by this staff (assigned OR created)
+      query.$or = [
+        { assignedStaff: req.user.id },
+        { createdByStaff: req.user.id },
+      ];
+      query.status = { $in: ['completed', 'delivered'] };
+    } else {
+      // Manual filters
+      if (req.query.status) query.status = req.query.status;
+      if (req.query.serviceType) query.serviceType = req.query.serviceType;
+      if (req.query.customer) query.customer = req.query.customer;
+      if (req.query.orderSource) query.orderSource = req.query.orderSource;
+
+      if (req.query.assignedStaff === 'me') {
+        query.assignedStaff = req.user.id;
+      } else if (req.query.assignedStaff) {
+        query.assignedStaff = req.query.assignedStaff;
+      }
+
+      if (req.query.unassigned === 'true') {
+        query.assignedStaff = { $exists: false };
+      }
+    }
   }
 
   // Pagination
@@ -94,8 +247,16 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   const total = await Order.countDocuments(query);
 
   const orders = await Order.find(query)
-    .populate('customer', 'name phone email')
-    .populate('assignedStaff', 'name phone staffRole')
+    .populate({
+      path: 'customer',
+      select: 'name phone email avatar customerId',
+      populate: {
+        path: 'customerId',
+        select: 'loyaltyPointsBalance status loyaltyTierId',
+        populate: { path: 'loyaltyTierId', select: 'name rank multiplierPercent' },
+      },
+    })
+    .populate('assignedStaff', 'name phone staffRole email')
     .sort('-createdAt')
     .skip(startIndex)
     .limit(limit);
@@ -118,8 +279,16 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
 // @access  Private
 exports.getOrder = asyncHandler(async (req, res, next) => {
   const order = await Order.findById(req.params.id)
-    .populate('customer', 'name phone email addresses')
-    .populate('assignedStaff', 'name phone staffRole')
+    .populate({
+      path: 'customer',
+      select: 'name phone email addresses avatar customerId',
+      populate: {
+        path: 'customerId',
+        select: 'loyaltyPointsBalance status loyaltyTierId',
+        populate: { path: 'loyaltyTierId', select: 'name rank multiplierPercent freePickup freeDelivery' },
+      },
+    })
+    .populate('assignedStaff', 'name phone staffRole email avatar')
     .populate('statusHistory.updatedBy', 'name role');
 
   if (!order) {
@@ -166,6 +335,81 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
+  // Handle referral rewards when order is completed
+  if (status && status.toLowerCase() === 'completed') {
+    // Check if this is the customer's first completed order
+    const completedOrdersCount = await Order.countDocuments({
+      customer: order.customer,
+      status: 'completed',
+    });
+
+    if (completedOrdersCount === 1) {
+      // This is the first completed order - check for referral
+      const orderCustomer = await Order.findById(order._id).populate('customer');
+      const customerId = orderCustomer.customer._id;
+
+      // Find referral where this customer is the referee
+      const referral = await Referral.findOne({
+        refereeUserId: customerId,
+        status: { $in: ['pending', 'qualified'] },
+      });
+
+      if (referral) {
+        // Get referral settings
+        const settings = await ReferralSetting.findOne();
+        const rewardAmount = settings?.referrerRewardAmount || 1000;
+
+        // Get referrer's customer ID
+        const referrerUser = await User.findById(referral.referrerUserId);
+        if (referrerUser && referrerUser.customerId) {
+          // Get referrer's wallet
+          const referrerWallet = await Wallet.findOne({ customerId: referrerUser.customerId });
+
+          if (referrerWallet) {
+            // Credit referrer's wallet
+            referrerWallet.balance += rewardAmount;
+            await referrerWallet.save();
+
+            // Create wallet transaction
+            await WalletTransaction.create({
+              walletId: referrerWallet._id,
+              customerId: referrerUser.customerId,
+              type: 'credit',
+              amount: rewardAmount,
+              reason: `Referral reward for ${orderCustomer.customer.name}`,
+              balanceAfter: referrerWallet.balance,
+            });
+
+            // Update referral status
+            referral.status = 'rewarded';
+            referral.rewardCredited = true;
+            referral.rewardAmount = rewardAmount;
+            await referral.save();
+
+            // Emit Socket.io event for referrer
+            const io = req.app.get('io');
+            if (io) {
+              io.to(`user-${referrerUser.customerId}`).emit('wallet:balance-updated', {
+                balance: referrerWallet.balance,
+                transaction: {
+                  type: 'credit',
+                  amount: rewardAmount,
+                  reason: `Referral reward for ${orderCustomer.customer.name}`,
+                },
+              });
+
+              io.to(`user-${referrerUser.customerId}`).emit('referral:rewarded', {
+                referralId: referral._id,
+                amount: rewardAmount,
+                refereeName: orderCustomer.customer.name,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Emit socket event
   const io = req.app.get('io');
   if (io) {
@@ -202,6 +446,57 @@ exports.assignStaff = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Staff assigned successfully',
+    data: { order },
+  });
+});
+
+// @desc    Staff accepts/claims an unassigned online order
+// @route   PATCH /api/v1/orders/:id/accept
+// @access  Private (Staff/Admin/Manager)
+exports.acceptOrder = asyncHandler(async (req, res, next) => {
+  const order = await Order.findById(req.params.id);
+
+  if (!order) {
+    return next(new AppError('Order not found', 404));
+  }
+
+  if (order.assignedStaff) {
+    return next(new AppError('This order has already been claimed by another staff member', 400));
+  }
+
+  if (['completed', 'cancelled', 'delivered'].includes(order.status)) {
+    return next(new AppError('Cannot accept a completed or cancelled order', 400));
+  }
+
+  order.assignedStaff = req.user.id;
+  order.status = 'confirmed';
+  order.statusHistory.push({
+    status: 'confirmed',
+    updatedBy: req.user.id,
+    notes: `Order accepted by staff: ${req.user.name}`,
+  });
+  await order.save();
+
+  await order.populate('assignedStaff', 'name phone staffRole');
+  await order.populate('customer', 'name phone email');
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order-status-updated', {
+      orderId: order._id,
+      status: 'confirmed',
+      assignedStaff: req.user.id,
+    });
+    io.to(`user-${order.customer?._id || order.customer}`).emit('order:accepted', {
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      staffName: req.user.name,
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Order accepted successfully',
     data: { order },
   });
 });

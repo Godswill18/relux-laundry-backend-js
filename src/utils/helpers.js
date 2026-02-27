@@ -14,8 +14,9 @@ const splitName = (name) => {
 };
 
 // Send token response
-const sendTokenResponse = (user, statusCode, res) => {
+const sendTokenResponse = async (user, statusCode, res) => {
   const token = user.generateAuthToken();
+  const { getRolePermissionsFromDB } = require('./rolePermissions.js');
 
   const options = {
     expires: new Date(
@@ -38,6 +39,9 @@ const sendTokenResponse = (user, statusCode, res) => {
   userObj.lastName = lastName;
   // Normalize id field
   if (userObj._id && !userObj.id) userObj.id = userObj._id.toString();
+
+  // Add permissions based on role (DB-first, with fallback to hardcoded defaults)
+  userObj.permissions = await getRolePermissionsFromDB(userObj.role);
 
   res.status(statusCode).cookie('token', token, options).json({
     success: true,
@@ -74,10 +78,37 @@ const generateQRCode = (orderNumber) => {
   return `RELUX-${orderNumber}-${Date.now()}`;
 };
 
+// Get current date in WAT (West Africa Time, UTC+1) as "YYYY-MM-DD"
+const getTodayWAT = () => {
+  const now = new Date();
+  const watOffset = 1 * 60; // WAT = UTC+1 in minutes
+  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+  const watMs = utcMs + watOffset * 60000;
+  return new Date(watMs).toISOString().slice(0, 10);
+};
+
+// Get current date and time in WAT as { dateStr: "YYYY-MM-DD", timeStr: "HH:MM" }
+const getNowWAT = () => {
+  const now = new Date();
+  const watOffset = 1 * 60;
+  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+  const watMs = utcMs + watOffset * 60000;
+  const watDate = new Date(watMs);
+
+  const dateStr = watDate.toISOString().slice(0, 10);
+  const hours = String(watDate.getHours()).padStart(2, '0');
+  const minutes = String(watDate.getMinutes()).padStart(2, '0');
+  const timeStr = `${hours}:${minutes}`;
+
+  return { dateStr, timeStr };
+};
+
 module.exports = {
   generateOTP,
   splitName,
   sendTokenResponse,
   calculateOrderPricing,
   generateQRCode,
+  getTodayWAT,
+  getNowWAT,
 };

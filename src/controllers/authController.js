@@ -1,9 +1,11 @@
 const User = require('../models/User.js');
 const Customer = require('../models/Customer.js');
+const WorkShift = require('../models/WorkShift.js');
 // const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
-const { generateOTP, splitName, sendTokenResponse } = require('../utils/helpers.js');
+const ERROR_CODES = require('../utils/errorCodes.js');
+const { generateOTP, splitName, sendTokenResponse, getTodayWAT } = require('../utils/helpers.js');
 
 // Ensure a Customer document exists for the given User and link them.
 // Idempotent — safe to call on every login/register.
@@ -58,7 +60,7 @@ exports.register = asyncHandler(async (req, res, next) => {
   // Create linked Customer document for wallet/loyalty/orders
   await ensureCustomer(user);
 
-  sendTokenResponse(user, 201, res);
+  await sendTokenResponse(user, 201, res);
 });
 
 // @desc    Sync Clerk user to MongoDB (create if not exists)
@@ -140,8 +142,17 @@ exports.login = asyncHandler(async (req, res, next) => {
     return next(new AppError('Please provide phone/email and password', 400));
   }
 
-  // Check for user by phone or email
-  const query = phone ? { phone } : { email: email.toLowerCase() };
+  // Smart detection: Check if phone field contains an email
+  let query;
+  const identifier = phone || email;
+  const isEmail = identifier && identifier.includes('@');
+
+  if (isEmail) {
+    query = { email: identifier.toLowerCase() };
+  } else {
+    query = { phone: identifier };
+  }
+
   const user = await User.findOne(query).select('+password');
 
   if (!user) {
@@ -155,15 +166,40 @@ exports.login = asyncHandler(async (req, res, next) => {
     return next(new AppError('Invalid credentials', 401));
   }
 
-  // Check if user is active
+  // Check if user account is active (manual admin control)
   if (!user.isActive) {
-    return next(new AppError('Your account has been deactivated', 401));
+    return next(new AppError('Your account has been deactivated. Contact an administrator.', 403, ERROR_CODES.ACCOUNT_DEACTIVATED));
+  }
+
+  // Shift-based login restriction for staff role only
+  // Admin and manager bypass shift checks entirely
+  if (user.role === 'staff') {
+    const today = getTodayWAT();
+
+    // Find shifts assigned to this user that cover today's date
+    const userShifts = await WorkShift.find({
+      userId: user._id,
+      startDate: { $lte: today },
+      endDate: { $gte: today },
+      status: { $ne: 'cancelled' },
+    });
+
+    if (userShifts.length === 0) {
+      return next(new AppError('You have no active shift assigned. Contact a manager.', 403, ERROR_CODES.NO_ACTIVE_SHIFT));
+    }
+
+    // Check if any of the found shifts has isActive === true
+    const activeShift = userShifts.find(s => s.isActive === true);
+
+    if (!activeShift) {
+      return next(new AppError('It is not your shift time yet. Please try again during your scheduled shift.', 403, ERROR_CODES.NOT_SHIFT_TIME));
+    }
   }
 
   // Ensure Customer document exists (backfill for users created before this fix)
   await ensureCustomer(user);
 
-  sendTokenResponse(user, 200, res);
+  await sendTokenResponse(user, 200, res);
 });
 
 // @desc    Get current logged in user
@@ -241,7 +277,7 @@ exports.updatePassword = asyncHandler(async (req, res, next) => {
   user.password = req.body.newPassword;
   await user.save();
 
-  sendTokenResponse(user, 200, res);
+  await sendTokenResponse(user, 200, res);
 });
 
 // @desc    Logout user / clear cookie
@@ -312,7 +348,7 @@ exports.verifyOTP = asyncHandler(async (req, res, next) => {
   user.isPhoneVerified = true;
   await user.save({ validateBeforeSave: false });
 
-  sendTokenResponse(user, 200, res);
+  await sendTokenResponse(user, 200, res);
 });
 
 // @desc    Add address

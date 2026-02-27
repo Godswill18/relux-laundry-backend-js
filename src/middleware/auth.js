@@ -35,6 +35,21 @@ exports.protect = asyncHandler(async (req, res, next) => {
       return next(new AppError('User account is deactivated', 401));
     }
 
+    // Reject stale JWTs when the user's permissions or role have been changed.
+    // Old JWTs (issued before jwtVersion was added) default to 0, which won't
+    // match the DB default of 1 — this forces a one-time re-login so every
+    // user gets a fresh JWT carrying the current DB permissions.
+    const tokenVersion = decoded.jwtVersion ?? 0;
+    if (tokenVersion !== req.user.jwtVersion) {
+      return next(
+        new AppError(
+          'Your permissions have changed. Please log in again.',
+          401,
+          'JWT_VERSION_MISMATCH'
+        )
+      );
+    }
+
     next();
   } catch (error) {
     return next(new AppError('Not authorized to access this route', 401));

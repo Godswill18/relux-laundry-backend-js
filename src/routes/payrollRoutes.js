@@ -4,7 +4,10 @@ const {
   getPeriods,
   getPeriod,
   createPeriod,
+  updatePeriod,
+  deletePeriod,
   finalizePeriod,
+  approvePeriod,
   markPeriodPaid,
   getEntries,
   generateEntries,
@@ -26,6 +29,9 @@ router.get('/payslips/:id', getPayslip);
 router.get('/periods', authorize('admin', 'manager'), getPeriods);
 router.post('/periods', authorize('admin'), createPeriod);
 router.get('/periods/:id', authorize('admin', 'manager'), getPeriod);
+router.put('/periods/:id', authorize('admin'), updatePeriod);
+router.delete('/periods/:id', authorize('admin'), deletePeriod);
+router.put('/periods/:id/approve', authorize('admin'), approvePeriod);
 router.put('/periods/:id/finalize', authorize('admin'), finalizePeriod);
 router.put('/periods/:id/paid', authorize('admin'), markPeriodPaid);
 

@@ -144,6 +144,43 @@ exports.getTransactions = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Admin credit wallet for a customer
+// @route   POST /api/v1/wallets/admin-credit
+// @access  Private (Admin/Manager)
+exports.adminCreditWallet = asyncHandler(async (req, res, next) => {
+  const { customerId, amount, reason } = req.body;
+
+  if (!customerId) {
+    return next(new AppError('customerId is required', 400));
+  }
+
+  if (!amount || amount <= 0) {
+    return next(new AppError('Amount must be greater than 0', 400));
+  }
+
+  let wallet = await Wallet.findOne({ customerId });
+
+  if (!wallet) {
+    wallet = await Wallet.create({ customerId, balance: 0 });
+  }
+
+  wallet.balance += amount;
+  await wallet.save();
+
+  await WalletTransaction.create({
+    walletId: wallet._id,
+    amount,
+    type: 'credit',
+    reason: reason || 'Admin wallet credit',
+  });
+
+  res.status(200).json({
+    success: true,
+    message: 'Wallet credited successfully',
+    data: { wallet },
+  });
+});
+
 // @desc    Get wallet transactions by customer
 // @route   GET /api/v1/wallets/customer/:customerId/transactions
 // @access  Private (Admin/Manager)

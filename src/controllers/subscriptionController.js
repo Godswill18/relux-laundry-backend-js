@@ -1,6 +1,8 @@
 const SubscriptionPlan = require('../models/SubscriptionPlan.js');
 const Subscription = require('../models/Subscription.js');
 const SubscriptionUsage = require('../models/SubscriptionUsage.js');
+const Wallet = require('../models/Wallet.js');
+const WalletTransaction = require('../models/WalletTransaction.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 
@@ -41,7 +43,7 @@ exports.getPlan = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/subscriptions/plans
 // @access  Private (Admin)
 exports.createPlan = asyncHandler(async (req, res, next) => {
-  const { name, description, price, durationDays, itemLimit } = req.body;
+  const { name, description, price, durationDays, itemLimit, features } = req.body;
 
   const plan = await SubscriptionPlan.create({
     name,
@@ -49,6 +51,7 @@ exports.createPlan = asyncHandler(async (req, res, next) => {
     price,
     durationDays,
     itemLimit,
+    features,
   });
 
   res.status(201).json({
@@ -68,6 +71,7 @@ exports.updatePlan = asyncHandler(async (req, res, next) => {
     price: req.body.price,
     durationDays: req.body.durationDays,
     itemLimit: req.body.itemLimit,
+    features: req.body.features,
     active: req.body.active,
   };
 
@@ -126,33 +130,70 @@ exports.getMySubscription = asyncHandler(async (req, res, next) => {
   });
 });
 
-// @desc    Subscribe to a plan
+// @desc    Subscribe to a plan (wallet deduction)
 // @route   POST /api/v1/subscriptions
 // @access  Private
 exports.subscribe = asyncHandler(async (req, res, next) => {
   const { planId } = req.body;
+  const customerId = req.user.customerId;
 
+  // 1. Validate plan
   const plan = await SubscriptionPlan.findById(planId);
   if (!plan || !plan.active) {
     return next(new AppError('Plan not found or inactive', 404));
   }
 
-  // Check for existing active subscription
+  // 2. Check for existing active subscription
   const existing = await Subscription.findOne({
-    customerId: req.user.customerId,
+    customerId,
     status: { $in: ['active', 'paused'] },
   });
 
   if (existing) {
-    return next(new AppError('You already have an active subscription', 400));
+    return next(new AppError('You already have an active subscription. Cancel it first to switch plans.', 400));
   }
 
+  // 3. Find or create wallet, check balance
+  let wallet = await Wallet.findOne({ customerId });
+  if (!wallet) {
+    wallet = await Wallet.create({ customerId, balance: 0 });
+  }
+
+  if (wallet.balance < plan.price) {
+    return next(
+      new AppError(
+        `Insufficient wallet balance. You need ₦${plan.price.toLocaleString()} but have ₦${wallet.balance.toLocaleString()}.`,
+        400
+      )
+    );
+  }
+
+  // 4. Atomic wallet deduction — use findOneAndUpdate to prevent race conditions
+  const updatedWallet = await Wallet.findOneAndUpdate(
+    { _id: wallet._id, balance: { $gte: plan.price } },
+    { $inc: { balance: -plan.price } },
+    { new: true }
+  );
+
+  if (!updatedWallet) {
+    return next(new AppError('Wallet deduction failed. Please try again.', 400));
+  }
+
+  // 5. Record wallet transaction
+  await WalletTransaction.create({
+    walletId: updatedWallet._id,
+    amount: plan.price,
+    type: 'debit',
+    reason: `Subscription: ${plan.name} (${plan.durationDays} days)`,
+  });
+
+  // 6. Create subscription
   const periodStart = new Date();
   const periodEnd = new Date();
   periodEnd.setDate(periodEnd.getDate() + plan.durationDays);
 
   const subscription = await Subscription.create({
-    customerId: req.user.customerId,
+    customerId,
     planName: plan.name,
     planId: plan._id,
     periodStart,
@@ -160,7 +201,7 @@ exports.subscribe = asyncHandler(async (req, res, next) => {
     nextBilling: periodEnd,
   });
 
-  // Create initial usage record
+  // 7. Create initial usage record
   await SubscriptionUsage.create({
     subscriptionId: subscription._id,
     periodStart,
@@ -168,10 +209,28 @@ exports.subscribe = asyncHandler(async (req, res, next) => {
     usedQuantity: 0,
   });
 
+  // 8. Populate plan details for the response
+  await subscription.populate('planId');
+
+  // 9. Emit Socket.io events for real-time UI sync
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${customerId}`).emit('subscription:activated', {
+      subscription,
+      plan: { name: plan.name, price: plan.price, durationDays: plan.durationDays },
+    });
+    io.to(`user-${customerId}`).emit('wallet:updated', {
+      balance: updatedWallet.balance,
+    });
+  }
+
   res.status(201).json({
     success: true,
-    message: 'Subscribed successfully',
-    data: { subscription },
+    message: `Subscribed to ${plan.name} successfully. ₦${plan.price.toLocaleString()} deducted from wallet.`,
+    data: {
+      subscription,
+      wallet: { balance: updatedWallet.balance },
+    },
   });
 });
 
@@ -192,6 +251,13 @@ exports.cancelSubscription = asyncHandler(async (req, res, next) => {
   subscription.status = 'cancelled';
   subscription.autoRenew = false;
   await subscription.save();
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${subscription.customerId}`).emit('subscription:cancelled', {
+      subscriptionId: subscription._id,
+    });
+  }
 
   res.status(200).json({
     success: true,
@@ -217,6 +283,13 @@ exports.pauseSubscription = asyncHandler(async (req, res, next) => {
   subscription.status = 'paused';
   await subscription.save();
 
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${subscription.customerId}`).emit('subscription:paused', {
+      subscriptionId: subscription._id,
+    });
+  }
+
   res.status(200).json({
     success: true,
     message: 'Subscription paused successfully',
@@ -241,6 +314,13 @@ exports.resumeSubscription = asyncHandler(async (req, res, next) => {
   subscription.status = 'active';
   await subscription.save();
 
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${subscription.customerId}`).emit('subscription:resumed', {
+      subscriptionId: subscription._id,
+    });
+  }
+
   res.status(200).json({
     success: true,
     message: 'Subscription resumed successfully',
@@ -264,7 +344,7 @@ exports.getSubscriptions = asyncHandler(async (req, res, next) => {
 
   const subscriptions = await Subscription.find(query)
     .populate('customerId', 'name phone')
-    .populate('planId', 'name price')
+    .populate('planId', 'name price durationDays itemLimit features')
     .sort('-createdAt')
     .skip(startIndex)
     .limit(limit);

@@ -12,6 +12,7 @@ const AttendanceSchema = new mongoose.Schema(
     deviceId: { type: String },
     geoLat: { type: Number },
     geoLng: { type: Number },
+    autoClockOut: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

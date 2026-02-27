@@ -10,9 +10,20 @@ const {
   getLedger,
   getCustomerLoyalty,
   adjustPoints,
+  redeemPoints,
+  getSettings,
+  updateSettings,
+  getTransactions,
 } = require('../controllers/loyaltyController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
+
+// Settings routes (static paths before parameterized)
+router.get('/settings', protect, authorize('admin', 'manager'), getSettings);
+router.patch('/settings', protect, authorize('admin'), updateSettings);
+
+// Transactions route (admin)
+router.get('/transactions', protect, authorize('admin', 'manager'), getTransactions);
 
 // Tier routes
 router.get('/tiers', protect, getTiers);
@@ -28,5 +39,8 @@ router.get('/me/ledger', protect, getLedger);
 // Admin
 router.get('/customer/:customerId', protect, authorize('admin', 'manager'), getCustomerLoyalty);
 router.post('/adjust', protect, authorize('admin', 'manager'), adjustPoints);
+
+// Redeem points
+router.post('/redeem', protect, redeemPoints);
 
 module.exports = router;

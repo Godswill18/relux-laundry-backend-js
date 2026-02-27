@@ -1,0 +1,42 @@
+// ============================================================================
+// ERROR CODES - Standardized Error Code Constants
+// ============================================================================
+
+const ERROR_CODES = {
+  // Authentication & Authorization
+  INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
+  TOKEN_EXPIRED: 'TOKEN_EXPIRED',
+  TOKEN_INVALID: 'TOKEN_INVALID',
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
+
+  // Resource Errors
+  NOT_FOUND: 'NOT_FOUND',
+  ALREADY_EXISTS: 'ALREADY_EXISTS',
+
+  // Validation Errors
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  INVALID_INPUT: 'INVALID_INPUT',
+  MISSING_REQUIRED_FIELD: 'MISSING_REQUIRED_FIELD',
+
+  // Shift & Account Status Errors
+  ACCOUNT_DEACTIVATED: 'ACCOUNT_DEACTIVATED',
+  NOT_SHIFT_TIME: 'NOT_SHIFT_TIME',
+  NO_ACTIVE_SHIFT: 'NO_ACTIVE_SHIFT',
+
+  // Business Logic Errors
+  INSUFFICIENT_BALANCE: 'INSUFFICIENT_BALANCE',
+  INSUFFICIENT_POINTS: 'INSUFFICIENT_POINTS',
+  ORDER_NOT_CANCELLABLE: 'ORDER_NOT_CANCELLABLE',
+  PAYMENT_FAILED: 'PAYMENT_FAILED',
+
+  // Database Errors
+  DUPLICATE_KEY: 'DUPLICATE_KEY',
+  CAST_ERROR: 'CAST_ERROR',
+
+  // Server Errors
+  SERVER_ERROR: 'SERVER_ERROR',
+  NETWORK_ERROR: 'NETWORK_ERROR',
+};
+
+module.exports = ERROR_CODES;

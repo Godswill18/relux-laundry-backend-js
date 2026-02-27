@@ -1,5 +1,7 @@
 const Order = require('../models/Order.js');
 const User = require('../models/User.js');
+const PayrollPeriod = require('../models/PayrollPeriod.js');
+const PayrollEntry = require('../models/PayrollEntry.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 
 // @desc    Get dashboard stats
@@ -189,5 +191,115 @@ exports.getOrderStats = asyncHandler(async (req, res, next) => {
       ordersByType,
       paymentMethods,
     },
+  });
+});
+
+// @desc    Get payroll statistics
+// @route   GET /api/v1/admin/stats/payroll
+// @access  Private (Admin/Manager)
+exports.getPayrollStats = asyncHandler(async (req, res, next) => {
+  // Monthly payroll totals for the last 6 months
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+  const monthlyPayroll = await PayrollPeriod.aggregate([
+    { $match: { startDate: { $gte: sixMonthsAgo } } },
+    {
+      $lookup: {
+        from: 'payrollentries',
+        localField: '_id',
+        foreignField: 'periodId',
+        as: 'entries',
+      },
+    },
+    {
+      $project: {
+        month: { $dateToString: { format: '%Y-%m', date: '$startDate' } },
+        status: 1,
+        totalPay: { $sum: '$entries.totalPay' },
+        staffCount: { $size: '$entries' },
+      },
+    },
+    { $sort: { month: 1 } },
+  ]);
+
+  // Overall totals
+  const totals = await PayrollEntry.aggregate([
+    {
+      $group: {
+        _id: null,
+        totalPaid: { $sum: '$totalPay' },
+        totalBonuses: { $sum: '$bonuses' },
+        totalDeductions: { $sum: '$deductions' },
+        avgPay: { $avg: '$totalPay' },
+      },
+    },
+  ]);
+
+  const periodsByStatus = await PayrollPeriod.aggregate([
+    { $group: { _id: '$status', count: { $sum: 1 } } },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    message: 'Payroll stats fetched successfully',
+    data: {
+      monthlyPayroll,
+      totals: totals[0] || { totalPaid: 0, totalBonuses: 0, totalDeductions: 0, avgPay: 0 },
+      periodsByStatus,
+    },
+  });
+});
+
+// @desc    Get staff productivity stats
+// @route   GET /api/v1/admin/stats/staff-productivity
+// @access  Private (Admin/Manager)
+exports.getStaffProductivity = asyncHandler(async (req, res, next) => {
+  // Orders per staff member
+  const staffOrders = await Order.aggregate([
+    { $match: { assignedTo: { $ne: null } } },
+    {
+      $group: {
+        _id: '$assignedTo',
+        orderCount: { $sum: 1 },
+        totalRevenue: { $sum: '$pricing.total' },
+        completedOrders: {
+          $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] },
+        },
+      },
+    },
+    {
+      $lookup: {
+        from: 'users',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'staff',
+      },
+    },
+    { $unwind: '$staff' },
+    {
+      $project: {
+        name: '$staff.name',
+        role: '$staff.role',
+        orderCount: 1,
+        totalRevenue: 1,
+        completedOrders: 1,
+        completionRate: {
+          $cond: [
+            { $eq: ['$orderCount', 0] },
+            0,
+            { $multiply: [{ $divide: ['$completedOrders', '$orderCount'] }, 100] },
+          ],
+        },
+      },
+    },
+    { $sort: { orderCount: -1 } },
+    { $limit: 20 },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    message: 'Staff productivity stats fetched successfully',
+    data: { staffOrders },
   });
 });

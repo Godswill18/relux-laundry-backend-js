@@ -4,6 +4,8 @@ const {
   getDashboardStats,
   getRevenueReport,
   getOrderStats,
+  getPayrollStats,
+  getStaffProductivity,
 } = require('../controllers/adminController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
@@ -15,5 +17,7 @@ router.use(authorize('admin', 'manager'));
 router.get('/dashboard', getDashboardStats);
 router.get('/reports/revenue', getRevenueReport);
 router.get('/stats/orders', getOrderStats);
+router.get('/stats/payroll', getPayrollStats);
+router.get('/stats/staff-productivity', getStaffProductivity);
 
 module.exports = router;

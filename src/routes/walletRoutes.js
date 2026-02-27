@@ -5,6 +5,7 @@ const {
   getWalletByCustomer,
   topUpWallet,
   debitWallet,
+  adminCreditWallet,
   getTransactions,
   getTransactionsByCustomer,
 } = require('../controllers/walletController.js');
@@ -20,5 +21,6 @@ router.get('/me/transactions', protect, getTransactions);
 router.get('/customer/:customerId', protect, authorize('admin', 'manager'), getWalletByCustomer);
 router.get('/customer/:customerId/transactions', protect, authorize('admin', 'manager'), getTransactionsByCustomer);
 router.post('/debit', protect, authorize('admin', 'manager', 'staff'), debitWallet);
+router.post('/admin-credit', protect, authorize('admin', 'manager'), adminCreditWallet);
 
 module.exports = router;

@@ -4,15 +4,25 @@ const PayrollEntrySchema = new mongoose.Schema(
   {
     periodId: { type: mongoose.Schema.Types.ObjectId, ref: 'PayrollPeriod', required: true },
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    payType: { type: String, enum: ['hourly', 'monthly'], default: 'hourly' },
     baseHours: { type: Number, default: 0 },
     overtimeHours: { type: Number, default: 0 },
     hourlyRate: { type: Number, default: 0 },
     overtimeRate: { type: Number, default: 0 },
+    basePay: { type: Number, default: 0 },
+    overtimePay: { type: Number, default: 0 },
     bonuses: { type: Number, default: 0 },
     deductions: { type: Number, default: 0 },
     totalPay: { type: Number, default: 0 },
     attendanceCount: { type: Number, default: 0 },
     lateCount: { type: Number, default: 0 },
+    paymentStatus: {
+      type: String,
+      enum: ['pending', 'paid'],
+      default: 'pending',
+    },
+    paidAt: { type: Date },
+    notes: { type: String, default: '' },
   },
   { timestamps: true }
 );

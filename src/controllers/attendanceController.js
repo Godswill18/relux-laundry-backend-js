@@ -8,10 +8,12 @@ const AppError = require('../utils/appError.js');
 exports.clockIn = asyncHandler(async (req, res, next) => {
   const { shiftId, source, ipAddress, deviceId, geoLat, geoLng } = req.body;
 
-  // Check if already clocked in without clocking out
+  // Check if already clocked in without clocking out (ignore auto clock-outs —
+  // those are treated as closed so the staff member can clock in again)
   const openAttendance = await Attendance.findOne({
     userId: req.user.id,
     clockOutAt: null,
+    autoClockOut: { $ne: true },
   });
 
   if (openAttendance) {
@@ -40,16 +42,33 @@ exports.clockIn = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/attendance/clock-out
 // @access  Private
 exports.clockOut = asyncHandler(async (req, res, next) => {
-  const attendance = await Attendance.findOne({
+  // First try to find a genuinely open attendance record
+  let attendance = await Attendance.findOne({
     userId: req.user.id,
     clockOutAt: null,
   }).sort('-clockInAt');
+
+  if (!attendance) {
+    // Fallback: check for today's auto-clocked-out record so staff can correct
+    // the time after being auto-logged out at shift end
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+
+    attendance = await Attendance.findOne({
+      userId: req.user.id,
+      autoClockOut: true,
+      clockInAt: { $gte: todayStart, $lte: todayEnd },
+    }).sort('-clockInAt');
+  }
 
   if (!attendance) {
     return next(new AppError('No active clock-in found', 400));
   }
 
   attendance.clockOutAt = new Date();
+  attendance.autoClockOut = false; // Staff manually confirmed clock-out
   await attendance.save();
 
   res.status(200).json({
@@ -79,7 +98,7 @@ exports.getMyAttendance = asyncHandler(async (req, res, next) => {
   const total = await Attendance.countDocuments(query);
 
   const attendance = await Attendance.find(query)
-    .populate('shiftId', 'title startAt endAt')
+    .populate('shiftId', 'startDate startTime endDate endTime shiftType status isActive')
     .sort('-clockInAt')
     .skip(startIndex)
     .limit(limit);
@@ -120,7 +139,7 @@ exports.getAttendance = asyncHandler(async (req, res, next) => {
 
   const attendance = await Attendance.find(query)
     .populate('userId', 'name role staffRole')
-    .populate('shiftId', 'title startAt endAt')
+    .populate('shiftId', 'startDate startTime endDate endTime shiftType status isActive')
     .sort('-clockInAt')
     .skip(startIndex)
     .limit(limit);
@@ -149,7 +168,7 @@ exports.getAttendanceByUser = asyncHandler(async (req, res, next) => {
   const total = await Attendance.countDocuments({ userId: req.params.userId });
 
   const attendance = await Attendance.find({ userId: req.params.userId })
-    .populate('shiftId', 'title startAt endAt')
+    .populate('shiftId', 'startDate startTime endDate endTime shiftType status isActive')
     .sort('-clockInAt')
     .skip(startIndex)
     .limit(limit);
@@ -176,7 +195,13 @@ exports.updateAttendance = asyncHandler(async (req, res, next) => {
     clockOutAt: req.body.clockOutAt,
     status: req.body.status,
     shiftId: req.body.shiftId,
+    autoClockOut: req.body.autoClockOut,
   };
+
+  // When admin manually sets a clock-out time, clear the auto-clock-out flag
+  if (req.body.clockOutAt !== undefined) {
+    fieldsToUpdate.autoClockOut = false;
+  }
 
   Object.keys(fieldsToUpdate).forEach(
     (key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]

@@ -54,7 +54,7 @@ const UserSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['customer', 'staff', 'admin', 'manager'],
+      enum: ['customer', 'staff', 'admin', 'manager', 'receptionist'],
       default: 'customer',
     },
     staffRole: {
@@ -93,8 +93,18 @@ const UserSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Staff-specific fields
+    hireDate: String,
+    bankName: String,
+    bankAccountNumber: String,
+    bankAccountName: String,
+    emergencyContactName: String,
+    emergencyContactPhone: String,
+    guarantorName: String,
+    guarantorPhone: String,
     otp: String,
     otpExpires: Date,
+    jwtVersion: { type: Number, default: 1 },
   },
   {
     timestamps: true,
@@ -120,7 +130,7 @@ UserSchema.methods.comparePassword = async function (candidatePassword) {
 // Generate JWT token
 UserSchema.methods.generateAuthToken = function () {
   return jwt.sign(
-    { id: this._id, role: this.role },
+    { id: this._id, role: this.role, jwtVersion: this.jwtVersion },
     process.env.JWT_SECRET,
     {
       expiresIn: process.env.JWT_EXPIRE || '7d',

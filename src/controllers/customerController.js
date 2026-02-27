@@ -1,15 +1,16 @@
 const Customer = require('../models/Customer.js');
+const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 
-// @desc    Get all customers
+// @desc    Get all customers (Users with role=customer)
 // @route   GET /api/v1/customers
 // @access  Private (Admin/Manager/Staff)
 exports.getCustomers = asyncHandler(async (req, res, next) => {
-  let query = {};
+  let query = { role: 'customer' };
 
-  if (req.query.status) {
-    query.status = req.query.status;
+  if (req.query.status && req.query.status !== 'all') {
+    query.isActive = req.query.status === 'active';
   }
 
   if (req.query.search) {
@@ -21,13 +22,17 @@ exports.getCustomers = asyncHandler(async (req, res, next) => {
   }
 
   const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 10;
+  const limit = parseInt(req.query.limit, 10) || 50;
   const startIndex = (page - 1) * limit;
 
-  const total = await Customer.countDocuments(query);
+  const total = await User.countDocuments(query);
 
-  const customers = await Customer.find(query)
-    .populate('loyaltyTierId', 'name rank')
+  const customers = await User.find(query)
+    .select('-password -otp -otpExpires')
+    .populate({
+      path: 'customerId',
+      populate: { path: 'loyaltyTierId', select: 'name rank' },
+    })
     .sort('-createdAt')
     .skip(startIndex)
     .limit(limit);

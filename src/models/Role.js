@@ -4,6 +4,7 @@ const RoleSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, unique: true, trim: true },
     permissions: [{ type: String }],
+    description: { type: String, default: '' },
   },
   { timestamps: true }
 );

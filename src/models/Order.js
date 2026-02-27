@@ -2,7 +2,14 @@ const mongoose = require('mongoose');
 
 const OrderItemSchema = new mongoose.Schema({
   itemType: { type: String, required: true },
+  // Per-item service type (e.g. wash-fold, wash-iron, iron-only, dry-clean)
+  serviceType: { type: String },
   quantity: { type: Number, required: true, min: 1 },
+  unitPrice: { type: Number, default: 0 },
+  total: { type: Number, default: 0 },
+  careType: String,
+  categoryId: String,
+  categoryName: String,
   description: String,
   condition: String,
 });
@@ -35,6 +42,7 @@ const PricingSchema = new mongoose.Schema({
   subtotal: { type: Number, default: 0 },
   pickupFee: { type: Number, default: 0 },
   deliveryFee: { type: Number, default: 0 },
+  addOnsFee: { type: Number, default: 0 },
   discount: { type: Number, default: 0 },
   tax: { type: Number, default: 0 },
   total: { type: Number, required: true },
@@ -43,7 +51,7 @@ const PricingSchema = new mongoose.Schema({
 const PaymentSchema = new mongoose.Schema({
   method: {
     type: String,
-    enum: ['online', 'cash', 'pos', 'wallet'],
+    enum: ['online', 'cash', 'pos', 'wallet', 'card', 'transfer'],
     default: 'cash',
   },
   status: {
@@ -68,10 +76,25 @@ const OrderSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+    // 'online' = placed by customer via app; 'offline' = created by staff for walk-in
+    orderSource: {
+      type: String,
+      enum: ['online', 'offline'],
+      default: 'online',
+    },
+    // Walk-in customer info for offline orders (no User account required)
+    walkInCustomer: {
+      name: String,
+      phone: String,
+    },
+    // Staff member who created this order (populated for offline orders)
+    createdByStaff: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
     customer: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
     },
     customerId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -171,14 +194,25 @@ const OrderSchema = new mongoose.Schema(
   }
 );
 
-// Generate order number before saving
-OrderSchema.pre('save', async function (next) {
+// Generate order number before validation (must run before validate, not save,
+// because orderNumber is required and validation runs before pre-save hooks)
+OrderSchema.pre('validate', async function (next) {
   if (!this.isNew) {
     return next();
   }
 
   const count = await mongoose.model('Order').countDocuments();
   this.orderNumber = `RLX${Date.now()}${String(count + 1).padStart(4, '0')}`;
+
+  // Generate a short 6-character alphanumeric code for customer reference
+  if (!this.code) {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    this.code = code;
+  }
 
   // Add initial status to history
   this.statusHistory.push({

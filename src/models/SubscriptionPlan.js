@@ -7,6 +7,7 @@ const SubscriptionPlanSchema = new mongoose.Schema(
     price: { type: Number, required: true },
     durationDays: { type: Number, default: 30 },
     itemLimit: { type: Number },
+    features: [{ type: String }],
     active: { type: Boolean, default: true },
   },
   { timestamps: true }
