@@ -66,6 +66,9 @@ if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }
 
+// ✅ Add this before rate limiter and routes
+app.set('trust proxy', 1);
+
 // API rate limiting
 // app.use('/api', apiLimiter);
 
