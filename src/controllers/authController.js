@@ -6,6 +6,7 @@ const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
 const { generateOTP, splitName, sendTokenResponse, getTodayWAT } = require('../utils/helpers.js');
+const sendEmail = require('../utils/sendEmail.js');
 
 // Ensure a Customer document exists for the given User and link them.
 // Idempotent — safe to call on every login/register.
@@ -349,6 +350,105 @@ exports.verifyOTP = asyncHandler(async (req, res, next) => {
   await user.save({ validateBeforeSave: false });
 
   await sendTokenResponse(user, 200, res);
+});
+
+// @desc    Forgot password — send OTP to registered email
+// @route   POST /api/v1/auth/forgot-password
+// @access  Public
+exports.forgotPassword = asyncHandler(async (req, res, next) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return next(new AppError('Please provide your email address', 400));
+  }
+
+  const user = await User.findOne({ email: email.toLowerCase() });
+
+  // Always respond with success to prevent email enumeration
+  if (!user) {
+    return res.status(200).json({
+      success: true,
+      message: 'If that email is registered, a reset code has been sent.',
+    });
+  }
+
+  // Generate 6-digit OTP and store it (reuses existing otp / otpExpires fields)
+  const otp = generateOTP();
+  user.otp = otp;
+  user.otpExpires = Date.now() + 15 * 60 * 1000; // 15 minutes
+  await user.save({ validateBeforeSave: false });
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px;">
+      <h2 style="color:#1d4ed8;margin-bottom:8px;">Relux Laundry</h2>
+      <h3 style="margin-bottom:16px;">Password Reset Code</h3>
+      <p>Hi ${user.name},</p>
+      <p>You requested a password reset. Use the code below to set a new password. It expires in <strong>15 minutes</strong>.</p>
+      <div style="text-align:center;margin:32px 0;">
+        <span style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#1d4ed8;">${otp}</span>
+      </div>
+      <p>If you did not request this, you can safely ignore this email.</p>
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
+      <p style="font-size:12px;color:#6b7280;">Relux Laundry &mdash; Admin Dashboard</p>
+    </div>
+  `;
+
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: 'Your Relux Laundry password reset code',
+      html,
+    });
+  } catch (err) {
+    // Clear OTP so user can retry
+    user.otp = undefined;
+    user.otpExpires = undefined;
+    await user.save({ validateBeforeSave: false });
+    return next(new AppError('Email could not be sent. Please try again later.', 500));
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'If that email is registered, a reset code has been sent.',
+    ...(process.env.NODE_ENV === 'development' && { otp }),
+  });
+});
+
+// @desc    Reset password using OTP from email
+// @route   POST /api/v1/auth/reset-password
+// @access  Public
+exports.resetPassword = asyncHandler(async (req, res, next) => {
+  const { email, otp, newPassword } = req.body;
+
+  if (!email || !otp || !newPassword) {
+    return next(new AppError('Please provide email, code, and new password', 400));
+  }
+
+  if (newPassword.length < 6) {
+    return next(new AppError('Password must be at least 6 characters', 400));
+  }
+
+  const user = await User.findOne({
+    email: email.toLowerCase(),
+    otp,
+    otpExpires: { $gt: Date.now() },
+  }).select('+password');
+
+  if (!user) {
+    return next(new AppError('Invalid or expired reset code', 400));
+  }
+
+  user.password = newPassword;
+  user.otp = undefined;
+  user.otpExpires = undefined;
+  // Bump jwtVersion to invalidate all existing sessions
+  user.jwtVersion = (user.jwtVersion || 0) + 1;
+  await user.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Password reset successful. Please log in with your new password.',
+  });
 });
 
 // @desc    Add address

@@ -11,6 +11,8 @@ const {
   requestOTP,
   verifyOTP,
   addAddress,
+  forgotPassword,
+  resetPassword,
 } = require('../controllers/authController.js');
 
 const { protect } = require('../middleware/auth.js');
@@ -22,6 +24,8 @@ router.post('/login', authLimiter, login);
 // router.post('/clerk-sync', clerkSync); // Clerk disabled
 router.post('/request-otp', authLimiter, requestOTP);
 router.post('/verify-otp', authLimiter, verifyOTP);
+router.post('/forgot-password', authLimiter, forgotPassword);
+router.post('/reset-password', authLimiter, resetPassword);
 
 // Protected routes (JWT only)
 router.get('/me', protect, getMe);
