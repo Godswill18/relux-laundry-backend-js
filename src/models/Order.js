@@ -201,8 +201,18 @@ OrderSchema.pre('validate', async function (next) {
     return next();
   }
 
-  const count = await mongoose.model('Order').countDocuments();
-  this.orderNumber = `RLX${Date.now()}${String(count + 1).padStart(4, '0')}`;
+  const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const now = new Date();
+  const monthYear = `${MONTHS[now.getMonth()]}${now.getFullYear()}`;
+  const prefix = `RLX-${monthYear}-`;
+
+  // Count orders for this month to get the next sequence number
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  const monthCount = await mongoose.model('Order').countDocuments({
+    createdAt: { $gte: monthStart, $lt: monthEnd },
+  });
+  this.orderNumber = `${prefix}${String(monthCount + 1).padStart(3, '0')}`;
 
   // Generate a short 6-character alphanumeric code for customer reference
   if (!this.code) {

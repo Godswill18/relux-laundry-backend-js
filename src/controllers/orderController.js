@@ -257,6 +257,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       },
     })
     .populate('assignedStaff', 'name phone staffRole email')
+    .populate('statusHistory.updatedBy', 'name')
     .sort('-createdAt')
     .skip(startIndex)
     .limit(limit);
@@ -423,6 +424,85 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Order status updated successfully',
+    data: { order },
+  });
+});
+
+// @desc    Look up order by QR code (no status change — preview before confirming)
+// @route   POST /api/v1/orders/lookup-by-qr
+// @access  Private (Staff/Admin/Manager)
+exports.lookupByQR = asyncHandler(async (req, res, next) => {
+  const { qrCode } = req.body;
+
+  if (!qrCode) {
+    return next(new AppError('QR code is required', 400));
+  }
+
+  const order = await Order.findOne({ qrCode })
+    .populate('customer', 'name phone email')
+    .populate('assignedStaff', 'name')
+    .populate('statusHistory.updatedBy', 'name');
+
+  if (!order) {
+    return next(new AppError('Invalid or unrecognized QR code', 404));
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Order found',
+    data: { order },
+  });
+});
+
+// @desc    Scan QR code to confirm delivery
+// @route   POST /api/v1/orders/scan-delivery
+// @access  Private (Staff/Admin/Manager)
+exports.scanDelivery = asyncHandler(async (req, res, next) => {
+  const { qrCode } = req.body;
+
+  if (!qrCode) {
+    return next(new AppError('QR code is required', 400));
+  }
+
+  const order = await Order.findOne({ qrCode })
+    .populate('customer', 'name phone email')
+    .populate('assignedStaff', 'name');
+
+  if (!order) {
+    return next(new AppError('Invalid or unrecognized QR code', 404));
+  }
+
+  if (['delivered', 'completed'].includes(order.status)) {
+    return next(new AppError('This order has already been delivered', 400));
+  }
+
+  if (order.status === 'cancelled') {
+    return next(new AppError('This order has been cancelled and cannot be delivered', 400));
+  }
+
+  order.status = 'delivered';
+  order.actualDeliveryDate = new Date();
+  order.statusHistory.push({
+    status: 'delivered',
+    updatedBy: req.user.id,
+    notes: 'Delivery confirmed via barcode scan',
+    timestamp: new Date(),
+  });
+
+  await order.save();
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order-status-updated', {
+      orderId: order._id,
+      status: 'delivered',
+    });
+    io.emit('order:status-updated', { orderId: order._id, status: 'delivered' });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Order delivered successfully',
     data: { order },
   });
 });

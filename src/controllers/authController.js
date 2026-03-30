@@ -1,5 +1,4 @@
 const User = require('../models/User.js');
-const Customer = require('../models/Customer.js');
 const WorkShift = require('../models/WorkShift.js');
 // const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
 const asyncHandler = require('../utils/asyncHandler.js');
@@ -7,30 +6,7 @@ const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
 const { generateOTP, splitName, sendTokenResponse, getTodayWAT } = require('../utils/helpers.js');
 const sendEmail = require('../utils/sendEmail.js');
-
-// Ensure a Customer document exists for the given User and link them.
-// Idempotent — safe to call on every login/register.
-const ensureCustomer = async (user) => {
-  if (user.customerId) return user;
-
-  // Try to find existing Customer by phone or email
-  let customer;
-  if (user.phone) customer = await Customer.findOne({ phone: user.phone });
-  if (!customer && user.email) customer = await Customer.findOne({ email: user.email });
-
-  if (!customer) {
-    customer = await Customer.create({
-      name: user.name,
-      phone: user.phone || undefined,
-      email: user.email || undefined,
-      status: 'active',
-    });
-  }
-
-  user.customerId = customer._id;
-  await user.save({ validateBeforeSave: false });
-  return user;
-};
+const ensureCustomer = require('../utils/ensureCustomer.js');
 
 // @desc    Register user
 // @route   POST /api/v1/auth/register

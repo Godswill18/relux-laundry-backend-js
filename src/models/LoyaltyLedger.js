@@ -18,6 +18,9 @@ const LoyaltyLedgerSchema = new mongoose.Schema(
 LoyaltyLedgerSchema.index({ customerId: 1 });
 LoyaltyLedgerSchema.index({ orderId: 1 });
 LoyaltyLedgerSchema.index({ type: 1 });
-LoyaltyLedgerSchema.index({ orderId: 1, type: 1 }, { unique: true, sparse: true });
+LoyaltyLedgerSchema.index(
+  { orderId: 1, type: 1 },
+  { unique: true, partialFilterExpression: { orderId: { $exists: true, $ne: null } } }
+);
 
 module.exports = mongoose.model('LoyaltyLedger', LoyaltyLedgerSchema);

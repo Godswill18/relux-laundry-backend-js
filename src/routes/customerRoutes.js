@@ -5,6 +5,7 @@ const {
   getCustomer,
   createCustomer,
   updateCustomer,
+  deleteCustomer,
   getMyProfile,
   updateMyProfile,
   suspendCustomer,
@@ -23,7 +24,10 @@ router.use(authorize('admin', 'manager', 'staff'));
 
 router.route('/').get(getCustomers).post(createCustomer);
 
-router.route('/:id').get(getCustomer).put(authorize('admin', 'manager'), updateCustomer);
+router.route('/:id')
+  .get(getCustomer)
+  .put(authorize('admin', 'manager'), updateCustomer)
+  .delete(authorize('admin'), deleteCustomer);
 
 router.put('/:id/suspend', authorize('admin', 'manager'), suspendCustomer);
 router.put('/:id/activate', authorize('admin', 'manager'), activateCustomer);

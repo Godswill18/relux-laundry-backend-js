@@ -63,6 +63,10 @@ const UserSchema = new mongoose.Schema(
     },
     address: String,
     city: String,
+    gender: {
+      type: String,
+      enum: ['male', 'female', 'prefer_not_to_say', null],
+    },
     dateOfBirth: String,
     addresses: [AddressSchema],
     preferredPickupTime: String,

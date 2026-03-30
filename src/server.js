@@ -47,6 +47,17 @@ io.on('connection', (socket) => {
     logger.info(`Auto-joined customer room: user-${customerId}`);
   }
 
+  // Join payments room for admin real-time payment updates
+  socket.on('join-payments', () => {
+    socket.join('payments');
+    logger.info(`${userName} joined payments room`);
+  });
+
+  socket.on('leave-payments', () => {
+    socket.leave('payments');
+    logger.info(`${userName} left payments room`);
+  });
+
   // Join order room for real-time updates
   socket.on('join-order', (orderId) => {
     if (!orderId) return;

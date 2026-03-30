@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const ensureCustomer = require('../utils/ensureCustomer.js');
 
 // Protect routes - verify JWT token
 exports.protect = asyncHandler(async (req, res, next) => {
@@ -33,6 +34,12 @@ exports.protect = asyncHandler(async (req, res, next) => {
 
     if (!req.user.isActive) {
       return next(new AppError('User account is deactivated', 401));
+    }
+
+    // Backfill customerId for users created before ensureCustomer was added.
+    // Exits immediately if already set — no extra DB work for normal requests.
+    if (!req.user.customerId) {
+      await ensureCustomer(req.user);
     }
 
     // Reject stale JWTs when the user's permissions or role have been changed.

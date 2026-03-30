@@ -7,6 +7,10 @@ const AppError = require('../utils/appError.js');
 // @route   GET /api/v1/wallets/me
 // @access  Private
 exports.getMyWallet = asyncHandler(async (req, res, next) => {
+  if (!req.user.customerId) {
+    return next(new AppError('No customer profile linked to this account', 400));
+  }
+
   let wallet = await Wallet.findOne({ customerId: req.user.customerId });
 
   if (!wallet) {
@@ -41,10 +45,15 @@ exports.getWalletByCustomer = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/wallets/topup
 // @access  Private
 exports.topUpWallet = asyncHandler(async (req, res, next) => {
-  const { amount, reason } = req.body;
+  if (!req.user.customerId) {
+    return next(new AppError('No customer profile linked to this account', 400));
+  }
 
-  if (!amount || amount <= 0) {
-    return next(new AppError('Amount must be greater than 0', 400));
+  const amount = parseFloat(req.body.amount);
+  const { reason } = req.body;
+
+  if (isNaN(amount) || amount <= 0) {
+    return next(new AppError('Amount must be a number greater than 0', 400));
   }
 
   let wallet = await Wallet.findOne({ customerId: req.user.customerId });
@@ -74,10 +83,15 @@ exports.topUpWallet = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/wallets/debit
 // @access  Private (Admin/Manager/Staff)
 exports.debitWallet = asyncHandler(async (req, res, next) => {
-  const { customerId, amount, reason } = req.body;
+  const { customerId, reason } = req.body;
+  const amount = parseFloat(req.body.amount);
 
-  if (!amount || amount <= 0) {
-    return next(new AppError('Amount must be greater than 0', 400));
+  if (!customerId) {
+    return next(new AppError('customerId is required', 400));
+  }
+
+  if (isNaN(amount) || amount <= 0) {
+    return next(new AppError('Amount must be a number greater than 0', 400));
   }
 
   const wallet = await Wallet.findOne({ customerId });
@@ -111,6 +125,10 @@ exports.debitWallet = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/wallets/me/transactions
 // @access  Private
 exports.getTransactions = asyncHandler(async (req, res, next) => {
+  if (!req.user.customerId) {
+    return next(new AppError('No customer profile linked to this account', 400));
+  }
+
   const wallet = await Wallet.findOne({ customerId: req.user.customerId });
 
   if (!wallet) {
@@ -148,14 +166,15 @@ exports.getTransactions = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/wallets/admin-credit
 // @access  Private (Admin/Manager)
 exports.adminCreditWallet = asyncHandler(async (req, res, next) => {
-  const { customerId, amount, reason } = req.body;
+  const { customerId, reason } = req.body;
+  const amount = parseFloat(req.body.amount);
 
   if (!customerId) {
     return next(new AppError('customerId is required', 400));
   }
 
-  if (!amount || amount <= 0) {
-    return next(new AppError('Amount must be greater than 0', 400));
+  if (isNaN(amount) || amount <= 0) {
+    return next(new AppError('Amount must be a number greater than 0', 400));
   }
 
   let wallet = await Wallet.findOne({ customerId });

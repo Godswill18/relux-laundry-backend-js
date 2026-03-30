@@ -20,7 +20,11 @@ exports.getPayments = asyncHandler(async (req, res, next) => {
   const total = await Payment.countDocuments(query);
 
   const payments = await Payment.find(query)
-    .populate('orderId', 'orderNumber status total')
+    .populate({
+      path: 'orderId',
+      select: 'orderNumber walkInCustomer customer',
+      populate: { path: 'customer', select: 'name' },
+    })
     .populate('confirmedById', 'name')
     .sort('-createdAt')
     .skip(startIndex)
@@ -130,6 +134,18 @@ exports.confirmPayment = asyncHandler(async (req, res, next) => {
 
   // Update order payment status
   await Order.findByIdAndUpdate(payment.orderId, { paymentStatus: 'paid' });
+
+  // Emit real-time event to all admins watching the payments room
+  const io = req.app.get('io');
+  if (io) {
+    io.to('payments').emit('payment:confirmed', {
+      paymentId: payment._id,
+      orderId: payment.orderId,
+      amount: payment.amount,
+      state: payment.state,
+      paidAt: payment.paidAt,
+    });
+  }
 
   res.status(200).json({
     success: true,

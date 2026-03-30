@@ -213,6 +213,31 @@ exports.suspendCustomer = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Delete customer (User + Customer doc)
+// @route   DELETE /api/v1/customers/:id
+// @access  Private (Admin only)
+exports.deleteCustomer = asyncHandler(async (req, res, next) => {
+  const user = await User.findOne({ _id: req.params.id, role: 'customer' });
+
+  if (!user) {
+    return next(new AppError('Customer not found', 404));
+  }
+
+  // Delete the linked Customer profile doc if it exists
+  if (user.customerId) {
+    await Customer.findByIdAndDelete(user.customerId);
+  }
+
+  // Delete the User account
+  await User.findByIdAndDelete(user._id);
+
+  res.status(200).json({
+    success: true,
+    message: 'Customer deleted successfully',
+    data: {},
+  });
+});
+
 // @desc    Activate customer
 // @route   PUT /api/v1/customers/:id/activate
 // @access  Private (Admin/Manager)

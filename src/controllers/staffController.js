@@ -435,7 +435,7 @@ exports.getMyProfile = asyncHandler(async (req, res, next) => {
 // @route   PATCH /api/v1/staff/me
 // @access  Private
 exports.updateMyProfile = asyncHandler(async (req, res, next) => {
-  const ALLOWED = ['phone', 'address', 'city', 'emergencyContactName', 'emergencyContactPhone'];
+  const ALLOWED = ['phone', 'address', 'city', 'gender', 'emergencyContactName', 'emergencyContactPhone'];
   const fields = {};
   ALLOWED.forEach((key) => {
     if (req.body[key] !== undefined) fields[key] = req.body[key];

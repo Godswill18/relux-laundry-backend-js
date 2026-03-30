@@ -9,6 +9,8 @@ const {
   acceptOrder,
   updatePayment,
   cancelOrder,
+  lookupByQR,
+  scanDelivery,
   addOrderItem,
   removeOrderItem,
   addOrderMedia,
@@ -24,6 +26,10 @@ router.use(protect);
 router.route('/')
   .get(getOrders)
   .post(orderLimiter, createOrder);
+
+// Must be before /:id to avoid route conflict
+router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager'), lookupByQR);
+router.post('/scan-delivery', authorize('staff', 'admin', 'manager'), scanDelivery);
 
 router.route('/:id')
   .get(getOrder);
