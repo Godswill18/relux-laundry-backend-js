@@ -102,7 +102,6 @@ const OrderSchema = new mongoose.Schema(
     },
     serviceType: {
       type: String,
-      enum: ['wash-fold', 'wash-iron', 'iron-only'],
     },
     orderType: {
       type: String,
