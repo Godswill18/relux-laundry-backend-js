@@ -3,7 +3,10 @@ const router = express.Router();
 const {
   createOrder,
   getOrders,
+  getOrderCounts,
+  getStaffCounts,
   getOrder,
+  updateOrder,
   updateOrderStatus,
   assignStaff,
   acceptOrder,
@@ -28,11 +31,14 @@ router.route('/')
   .post(orderLimiter, createOrder);
 
 // Must be before /:id to avoid route conflict
+router.get('/counts',       authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
+router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
 router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager'), lookupByQR);
 router.post('/scan-delivery', authorize('staff', 'admin', 'manager'), scanDelivery);
 
 router.route('/:id')
-  .get(getOrder);
+  .get(getOrder)
+  .put(authorize('staff', 'admin', 'manager'), updateOrder);
 
 router.patch('/:id/status', authorize('staff', 'admin', 'manager'), updateOrderStatus);
 router.patch('/:id/accept', authorize('staff', 'admin', 'manager'), acceptOrder);

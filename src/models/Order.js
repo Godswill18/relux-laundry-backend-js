@@ -200,9 +200,9 @@ OrderSchema.pre('validate', async function (next) {
     return next();
   }
 
-  const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
   const now = new Date();
-  const monthYear = `${MONTHS[now.getMonth()]}${now.getFullYear()}`;
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const monthYear = `${month}${now.getFullYear()}`;
   const prefix = `RLX-${monthYear}-`;
 
   // Count orders for this month to get the next sequence number

@@ -222,7 +222,13 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       query.status = { $in: ['completed', 'delivered'] };
     } else {
       // Manual filters
-      if (req.query.status) query.status = req.query.status;
+      if (req.query.excludeCompleted === 'true') {
+        query.status = { $nin: ['delivered', 'completed', 'cancelled'] };
+      } else if (req.query.doneOnly === 'true') {
+        query.status = { $in: ['delivered', 'completed'] };
+      } else if (req.query.status) {
+        query.status = req.query.status;
+      }
       if (req.query.serviceType) query.serviceType = req.query.serviceType;
       if (req.query.customer) query.customer = req.query.customer;
       if (req.query.orderSource) query.orderSource = req.query.orderSource;
@@ -275,6 +281,56 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Get staff-specific tab counts for the logged-in staff member
+// @route   GET /api/v1/orders/staff-counts
+// @access  Private (staff, admin, manager)
+exports.getStaffCounts = asyncHandler(async (req, res) => {
+  const staffId = req.user.id;
+  const activeStatus = { $nin: ['delivered', 'completed', 'cancelled'] };
+  const doneStatus   = { $in:  ['delivered', 'completed'] };
+
+  const [newOrders, mine, online, walkin, completed] = await Promise.all([
+    // New: unassigned active orders (any staff can pick)
+    Order.countDocuments({ assignedStaff: { $exists: false }, status: activeStatus }),
+    // Mine: assigned to me, still active
+    Order.countDocuments({ assignedStaff: staffId, status: activeStatus }),
+    // Online: assigned to me, online source, active
+    Order.countDocuments({ assignedStaff: staffId, orderSource: 'online', status: activeStatus }),
+    // Walk-in: created by me, offline source, active
+    Order.countDocuments({ createdByStaff: staffId, orderSource: 'offline', status: activeStatus }),
+    // Completed: assigned to or created by me, done
+    Order.countDocuments({
+      $or: [{ assignedStaff: staffId }, { createdByStaff: staffId }],
+      status: doneStatus,
+    }),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: { new: newOrders, mine, online, walkin, completed },
+  });
+});
+
+// @desc    Get order counts segmented by type (undelivered total, online, walk-in, completed)
+// @route   GET /api/v1/orders/counts
+// @access  Private (staff, admin, manager)
+exports.getOrderCounts = asyncHandler(async (req, res) => {
+  const ACTIVE = { status: { $nin: ['delivered', 'completed', 'cancelled'] } };
+  const DONE   = { status: { $in:  ['delivered', 'completed'] } };
+
+  const [total, online, walkin, completed] = await Promise.all([
+    Order.countDocuments(ACTIVE),
+    Order.countDocuments({ ...ACTIVE, orderSource: 'online' }),
+    Order.countDocuments({ ...ACTIVE, orderSource: 'offline' }),
+    Order.countDocuments(DONE),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: { total, online, walkin, completed },
+  });
+});
+
 // @desc    Get single order
 // @route   GET /api/v1/orders/:id
 // @access  Private
@@ -307,6 +363,76 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Order fetched successfully',
+    data: { order },
+  });
+});
+
+// @desc    Update order details (non-status fields)
+// @route   PUT /api/v1/orders/:id
+// @access  Private (Staff/Admin/Manager)
+exports.updateOrder = asyncHandler(async (req, res, next) => {
+  const order = await Order.findById(req.params.id);
+
+  if (!order) {
+    return next(new AppError('Order not found', 404));
+  }
+
+  // Customers cannot edit orders
+  if (req.user.role === 'customer') {
+    return next(new AppError('Not authorized to edit orders', 403));
+  }
+
+  // Only allow editing orders that are not yet completed/cancelled
+  if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
+    return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
+  }
+
+  const allowedFields = [
+    'serviceType',
+    'orderType',
+    'items',
+    'pickupAddress',
+    'deliveryAddress',
+    'pickupDate',
+    'deliveryDate',
+    'scheduledPickupTime',
+    'specialInstructions',
+    'serviceLevel',
+    'pickupMethod',
+    'rush',
+    'stainRemoval',
+    'pricing',
+    'notes',
+    'walkInCustomer',
+    'assignedStaff',
+    'paymentStatus',
+  ];
+
+  allowedFields.forEach((field) => {
+    if (req.body[field] !== undefined) {
+      order[field] = req.body[field];
+    }
+  });
+
+  // Recalculate total from pricing if pricing was updated
+  if (req.body.pricing && req.body.pricing.total !== undefined) {
+    order.total = req.body.pricing.total;
+  }
+
+  order.lastUpdatedById = req.user.id;
+  await order.save();
+
+  await order.populate('customer', 'name phone email');
+  await order.populate('assignedStaff', 'name phone staffRole');
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order:updated', { orderId: order._id });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Order updated successfully',
     data: { order },
   });
 });
