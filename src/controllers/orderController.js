@@ -94,6 +94,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     orderSource: isOffline ? 'offline' : 'online',
     walkInCustomer: isOffline ? walkInCustomer : undefined,
     createdByStaff: isStaffRole ? req.user.id : undefined,
+    createdByRole: req.user.role,
     serviceType,
     orderType: orderType || (isOffline ? 'walk-in' : undefined),
     items: items || [],
@@ -106,7 +107,12 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     pickupMethod: pickupMethod || undefined,
     rush: rush || false,
     stainRemoval: stainRemoval || false,
-    assignedStaff: isOffline ? req.user.id : (assignedStaff || undefined),
+    // Staff-created walk-in orders → auto-assigned + skip pending (go straight to confirmed)
+    // Admin/manager-created and online orders → unassigned pending pool for staff to pick
+    assignedStaff: (req.user.role === 'staff' && isOffline)
+      ? req.user.id
+      : (assignedStaff || undefined),
+    status: (req.user.role === 'staff' && isOffline) ? 'confirmed' : 'pending',
     pricing: orderPricing,
     payment: {
       method: paymentMethod || 'cash',
@@ -220,6 +226,31 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
         { createdByStaff: req.user.id },
       ];
       query.status = { $in: ['completed', 'delivered'] };
+    } else if (req.query.statusTab) {
+      // --- 11-status workflow tab (Admin & Staff pages) ---
+      const st = req.query.statusTab;
+      const isAdminRole = ['admin', 'manager', 'receptionist'].includes(req.user.role);
+
+      if (st === 'pending') {
+        query.status = 'pending';
+        if (!isAdminRole) {
+          // Staff see only the pickable pool: unassigned orders created by admin/manager OR online orders
+          // Staff-created orders are auto-assigned at creation so they never land here,
+          // but createdByRole filter ensures correctness even for edge cases
+          query.assignedStaff = { $exists: false };
+          query.$or = [
+            { orderSource: 'online' },                                             // customer / app orders
+            { createdByRole: { $in: ['admin', 'manager', 'receptionist'] } },      // admin-created walk-ins
+          ];
+        }
+      } else {
+        query.status = st;
+        // Staff only see orders assigned to them — covers orders they created,
+        // orders they picked, and orders admin assigned to them
+        if (!isAdminRole) {
+          query.assignedStaff = req.user.id;
+        }
+      }
     } else {
       // Manual filters
       if (req.query.excludeCompleted === 'true') {
@@ -281,53 +312,70 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   });
 });
 
-// @desc    Get staff-specific tab counts for the logged-in staff member
+// @desc    Get staff-specific tab counts per status (11-workflow)
 // @route   GET /api/v1/orders/staff-counts
 // @access  Private (staff, admin, manager)
 exports.getStaffCounts = asyncHandler(async (req, res) => {
   const staffId = req.user.id;
-  const activeStatus = { $nin: ['delivered', 'completed', 'cancelled'] };
-  const doneStatus   = { $in:  ['delivered', 'completed'] };
 
-  const [newOrders, mine, online, walkin, completed] = await Promise.all([
-    // New: unassigned active orders (any staff can pick)
-    Order.countDocuments({ assignedStaff: { $exists: false }, status: activeStatus }),
-    // Mine: assigned to me, still active
-    Order.countDocuments({ assignedStaff: staffId, status: activeStatus }),
-    // Online: assigned to me, online source, active
-    Order.countDocuments({ assignedStaff: staffId, orderSource: 'online', status: activeStatus }),
-    // Walk-in: created by me, offline source, active
-    Order.countDocuments({ createdByStaff: staffId, orderSource: 'offline', status: activeStatus }),
-    // Completed: assigned to or created by me, done
-    Order.countDocuments({
-      $or: [{ assignedStaff: staffId }, { createdByStaff: staffId }],
-      status: doneStatus,
-    }),
-  ]);
+  const STATUSES = [
+    'pending', 'confirmed', 'picked-up', 'in_progress',
+    'washing', 'ironing', 'ready', 'out-for-delivery',
+    'delivered', 'completed', 'cancelled',
+  ];
+
+  const results = await Promise.all(
+    STATUSES.map((s) => {
+      if (s === 'pending') {
+        // Pending badge = pickable pool: unassigned admin/manager/online orders
+        return Order.countDocuments({
+          status: 'pending',
+          assignedStaff: { $exists: false },
+          $or: [
+            { orderSource: 'online' },
+            { createdByRole: { $in: ['admin', 'manager', 'receptionist'] } },
+          ],
+        });
+      }
+      // Count orders strictly by assignedStaff — covers staff-created (auto-assigned),
+      // picked orders, and admin-assigned orders
+      return Order.countDocuments({ status: s, assignedStaff: staffId });
+    })
+  );
+
+  const byStatus = Object.fromEntries(STATUSES.map((s, i) => [s, results[i]]));
 
   res.status(200).json({
     success: true,
-    data: { new: newOrders, mine, online, walkin, completed },
+    data: byStatus,
   });
 });
 
-// @desc    Get order counts segmented by type (undelivered total, online, walk-in, completed)
+// @desc    Get order counts per status (admin view — all orders, no staff filter)
 // @route   GET /api/v1/orders/counts
 // @access  Private (staff, admin, manager)
 exports.getOrderCounts = asyncHandler(async (req, res) => {
-  const ACTIVE = { status: { $nin: ['delivered', 'completed', 'cancelled'] } };
-  const DONE   = { status: { $in:  ['delivered', 'completed'] } };
+  const STATUSES = [
+    'pending', 'confirmed', 'picked-up', 'in_progress',
+    'washing', 'ironing', 'ready', 'out-for-delivery',
+    'delivered', 'completed', 'cancelled',
+  ];
 
-  const [total, online, walkin, completed] = await Promise.all([
-    Order.countDocuments(ACTIVE),
-    Order.countDocuments({ ...ACTIVE, orderSource: 'online' }),
-    Order.countDocuments({ ...ACTIVE, orderSource: 'offline' }),
-    Order.countDocuments(DONE),
-  ]);
+  const results = await Promise.all(
+    STATUSES.map((s) => Order.countDocuments({ status: s }))
+  );
+
+  const byStatus = Object.fromEntries(STATUSES.map((s, i) => [s, results[i]]));
+
+  // Convenience totals
+  const total      = results.reduce((a, b) => a + b, 0);
+  const active     = STATUSES
+    .filter((s) => !['delivered', 'completed', 'cancelled'].includes(s))
+    .reduce((sum, s) => sum + byStatus[s], 0);
 
   res.status(200).json({
     success: true,
-    data: { total, online, walkin, completed },
+    data: { ...byStatus, total, active },
   });
 });
 
@@ -668,6 +716,12 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
 
   if (order.assignedStaff) {
     return next(new AppError('This order has already been claimed by another staff member', 400));
+  }
+
+  // Only admin/manager-created and online (customer) orders are pickable
+  // Staff-created orders are auto-assigned at creation
+  if (order.createdByRole === 'staff') {
+    return next(new AppError('Walk-in orders created by staff are automatically assigned and cannot be picked', 400));
   }
 
   if (['completed', 'cancelled', 'delivered'].includes(order.status)) {

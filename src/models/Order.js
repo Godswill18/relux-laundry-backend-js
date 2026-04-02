@@ -92,6 +92,12 @@ const OrderSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
     },
+    // Role of the creator: 'admin' | 'manager' | 'staff' | 'customer'
+    // Used to determine if an order is pickable by other staff
+    createdByRole: {
+      type: String,
+      enum: ['admin', 'manager', 'staff', 'receptionist', 'customer'],
+    },
     customer: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
