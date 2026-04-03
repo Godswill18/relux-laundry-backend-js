@@ -4,6 +4,7 @@ const LoyaltyTierSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, unique: true, trim: true },
     pointsRequired: { type: Number, default: 0 },
+    minSpend: { type: Number, default: 0 },
     multiplierPercent: { type: Number, default: 100 },
     rank: { type: Number, default: 1 },
     freePickup: { type: Boolean, default: false },

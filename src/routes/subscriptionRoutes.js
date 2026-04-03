@@ -9,6 +9,7 @@ const {
   getMySubscription,
   subscribe,
   cancelSubscription,
+  toggleAutoRenew,
   pauseSubscription,
   resumeSubscription,
   getSubscriptions,
@@ -33,6 +34,7 @@ router.get('/', protect, authorize('admin', 'manager'), getSubscriptions);
 
 // Subscription actions
 router.put('/:id/cancel', protect, cancelSubscription);
+router.put('/:id/auto-renew', protect, toggleAutoRenew);
 router.put('/:id/pause', protect, pauseSubscription);
 router.put('/:id/resume', protect, resumeSubscription);
 router.get('/:id/usage', protect, getUsage);

@@ -5,6 +5,7 @@ const {
   getOrders,
   getOrderCounts,
   getStaffCounts,
+  getMyStats,
   getOrder,
   updateOrder,
   updateOrderStatus,
@@ -33,6 +34,7 @@ router.route('/')
 // Must be before /:id to avoid route conflict
 router.get('/counts',       authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
 router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
+router.get('/my-stats',     authorize('customer'), getMyStats);
 router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager'), lookupByQR);
 router.post('/scan-delivery', authorize('staff', 'admin', 'manager'), scanDelivery);
 

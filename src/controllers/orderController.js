@@ -7,10 +7,20 @@ const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
 const ReferralSetting = require('../models/ReferralSetting.js');
 const User = require('../models/User.js');
+const ServiceCategory = require('../models/ServiceCategory.js');
+const LoyaltyTier = require('../models/LoyaltyTier.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
 const { calculateOrderPricing, generateQRCode } = require('../utils/helpers.js');
+
+// Care-type multipliers — single source of truth on the backend
+const CARE_TYPE_MULTIPLIERS = {
+  'wash-fold': 1,
+  'wash-only': 1,
+  'iron-only': 0.6,
+  'wash-iron': 1.5,
+};
 
 // @desc    Create new order (online or offline walk-in)
 // @route   POST /api/v1/orders
@@ -77,16 +87,28 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     }
   }
 
-  // Calculate pricing if not provided
-  let orderPricing = pricing;
-  if (!pricing) {
-    orderPricing = calculateOrderPricing(
-      items || [],
-      req.body.pickupFee || 0,
-      req.body.deliveryFee || 0,
-      req.body.discount || 0
+  // Recompute unitPrice from DB for every item — never trust frontend price
+  let pricedItems = items || [];
+  if (pricedItems.length > 0) {
+    pricedItems = await Promise.all(
+      pricedItems.map(async (item) => {
+        if (!item.categoryId) return item; // walk-in items without a category pass through
+        const category = await ServiceCategory.findById(item.categoryId).select('basePrice').lean();
+        if (!category) return item; // unknown category — leave as-is
+        const multiplier = CARE_TYPE_MULTIPLIERS[item.serviceType] ?? 1;
+        const unitPrice = Math.round(category.basePrice * multiplier);
+        return { ...item, unitPrice, total: unitPrice * (item.quantity || 1) };
+      })
     );
   }
+
+  // Always recalculate pricing from DB-verified item prices — ignore frontend pricing
+  const orderPricing = calculateOrderPricing(
+    pricedItems,
+    req.body.pickupFee || 0,
+    req.body.deliveryFee || 0,
+    req.body.discount || 0
+  );
 
   // Create order
   const order = await Order.create({
@@ -97,7 +119,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     createdByRole: req.user.role,
     serviceType,
     orderType: orderType || (isOffline ? 'walk-in' : undefined),
-    items: items || [],
+    items: pricedItems,
     pickupAddress: orderType === 'pickup-delivery' ? pickupAddress : undefined,
     deliveryAddress: orderType === 'pickup-delivery' ? deliveryAddress : undefined,
     pickupDate,
@@ -945,5 +967,67 @@ exports.getOrderMedia = asyncHandler(async (req, res, next) => {
     success: true,
     message: 'Order media fetched successfully',
     data: { media },
+  });
+});
+
+// @desc    Get customer order stats (total orders, total spent) + tier progress from DB tiers
+// @route   GET /api/v1/orders/my-stats
+// @access  Private (Customer)
+exports.getMyStats = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  if (!userId) {
+    return next(new AppError('Not authorized', 403));
+  }
+
+  const mongoose = require('mongoose');
+
+  // Aggregate total orders and total spent for this customer
+  const [agg] = await Order.aggregate([
+    { $match: { customer: new mongoose.Types.ObjectId(userId), status: { $ne: 'CANCELLED' } } },
+    {
+      $group: {
+        _id: null,
+        totalOrders: { $sum: 1 },
+        totalSpent: { $sum: '$total' },
+      },
+    },
+  ]);
+
+  const totalOrders = agg?.totalOrders || 0;
+  const totalSpent = agg?.totalSpent || 0;
+
+  // Load all active tiers sorted by minSpend ascending
+  const tiers = await LoyaltyTier.find({ active: true }).sort({ minSpend: 1 });
+
+  // Determine current tier and next tier based on totalSpent
+  let currentTier = null;
+  let nextTier = null;
+
+  for (let i = 0; i < tiers.length; i++) {
+    if (totalSpent >= tiers[i].minSpend) {
+      currentTier = tiers[i];
+      nextTier = tiers[i + 1] || null;
+    }
+  }
+
+  // If no tier matched (spending below first tier), use first tier as next
+  if (!currentTier && tiers.length > 0) {
+    nextTier = tiers[0];
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Stats fetched successfully',
+    data: {
+      totalOrders,
+      totalSpent,
+      currentTier: currentTier
+        ? { name: currentTier.name, minSpend: currentTier.minSpend, rank: currentTier.rank }
+        : null,
+      nextTier: nextTier
+        ? { name: nextTier.name, minSpend: nextTier.minSpend, rank: nextTier.rank }
+        : null,
+      tiers: tiers.map((t) => ({ name: t.name, minSpend: t.minSpend, rank: t.rank })),
+    },
   });
 });

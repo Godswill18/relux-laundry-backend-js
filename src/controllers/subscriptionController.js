@@ -244,7 +244,7 @@ exports.cancelSubscription = asyncHandler(async (req, res, next) => {
     return next(new AppError('Subscription not found', 404));
   }
 
-  if (req.user.role === 'customer' && subscription.customerId.toString() !== req.user.customerId) {
+  if (req.user.role === 'customer' && subscription.customerId.toString() !== req.user.customerId.toString()) {
     return next(new AppError('Not authorized', 403));
   }
 
@@ -262,6 +262,30 @@ exports.cancelSubscription = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Subscription cancelled successfully',
+    data: { subscription },
+  });
+});
+
+// @desc    Toggle auto-renew on subscription
+// @route   PUT /api/v1/subscriptions/:id/auto-renew
+// @access  Private
+exports.toggleAutoRenew = asyncHandler(async (req, res, next) => {
+  const subscription = await Subscription.findById(req.params.id);
+
+  if (!subscription) {
+    return next(new AppError('Subscription not found', 404));
+  }
+
+  if (req.user.role === 'customer' && subscription.customerId.toString() !== req.user.customerId.toString()) {
+    return next(new AppError('Not authorized', 403));
+  }
+
+  subscription.autoRenew = !subscription.autoRenew;
+  await subscription.save();
+
+  res.status(200).json({
+    success: true,
+    message: `Auto-renew ${subscription.autoRenew ? 'enabled' : 'disabled'}`,
     data: { subscription },
   });
 });
