@@ -54,22 +54,24 @@ const sendTokenResponse = async (user, statusCode, res) => {
 };
 
 // Calculate order pricing
-const calculateOrderPricing = (items, pickupFee = 0, deliveryFee = 0, discount = 0) => {
+// serviceFee  = surcharge for EXPRESS / PREMIUM service levels
+// addOnsFee   = stain removal, fragrance, etc.
+const calculateOrderPricing = (items, pickupFee = 0, deliveryFee = 0, discount = 0, serviceFee = 0, addOnsFee = 0) => {
   const subtotal = items.reduce((acc, item) => {
     return acc + (item.unitPrice || 0) * item.quantity;
   }, 0);
 
-  const taxRate = 0.075; // 7.5% tax
-  const tax = subtotal * taxRate;
-  const total = subtotal + pickupFee + deliveryFee - discount + tax;
+  const total = subtotal + serviceFee + pickupFee + deliveryFee + addOnsFee - discount;
 
   return {
     subtotal,
+    serviceFee,
     pickupFee,
     deliveryFee,
+    addOnsFee,
     discount,
-    tax: Math.round(tax * 100) / 100,
-    total: Math.round(total * 100) / 100,
+    tax: 0,
+    total: Math.max(0, Math.round(total * 100) / 100),
   };
 };
 

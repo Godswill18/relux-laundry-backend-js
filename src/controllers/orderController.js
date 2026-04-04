@@ -35,6 +35,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     pickupAddress,
     deliveryAddress,
     pickupDate,
+    deliveryDate,
     scheduledPickupTime,
     specialInstructions,
     pricing,
@@ -45,6 +46,9 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     pickupMethod,
     rush,
     stainRemoval,
+    fragrance,
+    pickupFee: bodyPickupFee,
+    discount: bodyDiscount,
   } = req.body;
 
   const isStaffRole = ['staff', 'admin', 'manager'].includes(req.user.role);
@@ -102,17 +106,35 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // Always recalculate pricing from DB-verified item prices — ignore frontend pricing
+  // Service-level surcharge: EXPRESS = +50% of subtotal, PREMIUM = +100%
+  const SERVICE_LEVEL_MULTIPLIERS = { standard: 1, express: 1.5, premium: 2 };
+  const slMultiplier = SERVICE_LEVEL_MULTIPLIERS[(serviceLevel || 'standard').toLowerCase()] || 1;
+  const baseSubtotal = pricedItems.reduce((acc, item) => acc + (item.unitPrice || 0) * (item.quantity || 1), 0);
+  const serviceFee = Math.round(baseSubtotal * (slMultiplier - 1) * 100) / 100;
+
+  // Add-ons fee: stain removal ₦300, fragrance ₦200
+  const addOnsFee = (stainRemoval ? 300 : 0) + (fragrance ? 200 : 0);
+
+  // pickupFee: frontend passes it at top-level or inside pricing object
+  const resolvedPickupFee = bodyPickupFee || (pricing && pricing.pickupFee) || 0;
+  const resolvedDeliveryFee = req.body.deliveryFee || (pricing && pricing.deliveryFee) || 0;
+  // discount: promo + points reductions passed by frontend
+  const resolvedDiscount = bodyDiscount != null ? bodyDiscount : (pricing && pricing.discount) || 0;
+
+  // Always recalculate pricing from DB-verified item prices — ignore frontend total
   const orderPricing = calculateOrderPricing(
     pricedItems,
-    req.body.pickupFee || 0,
-    req.body.deliveryFee || 0,
-    req.body.discount || 0
+    resolvedPickupFee,
+    resolvedDeliveryFee,
+    resolvedDiscount,
+    serviceFee,
+    addOnsFee
   );
 
   // Create order
   const order = await Order.create({
     customer: orderCustomerId,
+    customerId: orderCustomerRefId || undefined,
     orderSource: isOffline ? 'offline' : 'online',
     walkInCustomer: isOffline ? walkInCustomer : undefined,
     createdByStaff: isStaffRole ? req.user.id : undefined,
@@ -120,15 +142,18 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     serviceType,
     orderType: orderType || (isOffline ? 'walk-in' : undefined),
     items: pricedItems,
-    pickupAddress: orderType === 'pickup-delivery' ? pickupAddress : undefined,
-    deliveryAddress: orderType === 'pickup-delivery' ? deliveryAddress : undefined,
-    pickupDate,
-    scheduledPickupTime,
+    pickupAddress: pickupAddress || undefined,
+    deliveryAddress: deliveryAddress || undefined,
+    // PICKUP: store pickup date; DELIVERY: store delivery date; DROP_OFF: no schedule
+    pickupDate: pickupMethod && pickupMethod.toLowerCase() === 'pickup' ? pickupDate : undefined,
+    deliveryDate: pickupMethod && pickupMethod.toLowerCase() === 'delivery' ? (deliveryDate || pickupDate) : undefined,
+    scheduledPickupTime: pickupMethod && pickupMethod.toLowerCase() !== 'drop_off' ? scheduledPickupTime : undefined,
     specialInstructions,
     serviceLevel: serviceLevel || 'standard',
     pickupMethod: pickupMethod || undefined,
     rush: rush || false,
     stainRemoval: stainRemoval || false,
+    fragrance: fragrance || false,
     // Staff-created walk-in orders → auto-assigned + skip pending (go straight to confirmed)
     // Admin/manager-created and online orders → unassigned pending pool for staff to pick
     assignedStaff: (req.user.role === 'staff' && isOffline)
@@ -136,6 +161,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       : (assignedStaff || undefined),
     status: (req.user.role === 'staff' && isOffline) ? 'confirmed' : 'pending',
     pricing: orderPricing,
+    total: orderPricing.total,
     payment: {
       method: paymentMethod || 'cash',
       status: 'pending',
@@ -416,7 +442,9 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
       },
     })
     .populate('assignedStaff', 'name phone staffRole email avatar')
-    .populate('statusHistory.updatedBy', 'name role');
+    .populate('statusHistory.updatedBy', 'name role')
+    .populate('deliveryZoneId', 'name fee rushFee radiusKm')
+    .populate('pickupWindowId', 'startTime endTime dayOfWeek baseFee');
 
   if (!order) {
     return next(new AppError('Order not found', 404));

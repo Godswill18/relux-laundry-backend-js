@@ -40,6 +40,7 @@ const AddressSchema = new mongoose.Schema({
 
 const PricingSchema = new mongoose.Schema({
   subtotal: { type: Number, default: 0 },
+  serviceFee: { type: Number, default: 0 },
   pickupFee: { type: Number, default: 0 },
   deliveryFee: { type: Number, default: 0 },
   addOnsFee: { type: Number, default: 0 },
@@ -51,7 +52,7 @@ const PricingSchema = new mongoose.Schema({
 const PaymentSchema = new mongoose.Schema({
   method: {
     type: String,
-    enum: ['online', 'cash', 'pos', 'wallet', 'card', 'transfer'],
+    enum: ['online', 'cash', 'pos', 'wallet', 'card', 'transfer', 'pay-later'],
     default: 'cash',
   },
   status: {
@@ -161,6 +162,7 @@ const OrderSchema = new mongoose.Schema(
     },
     deliveryFee: { type: Number, default: 0 },
     rush: { type: Boolean, default: false },
+    fragrance: { type: Boolean, default: false },
     serviceLevel: {
       type: String,
       enum: ['standard', 'express', 'premium'],
@@ -208,7 +210,7 @@ OrderSchema.pre('validate', async function (next) {
 
   const now = new Date();
   const month = String(now.getMonth() + 1).padStart(2, '0');
-  const monthYear = `${month}${now.getFullYear()}`;
+  const monthYear = `${now.getFullYear()}${month}`;
   const prefix = `RLX-${monthYear}-`;
 
   // Count orders for this month to get the next sequence number
