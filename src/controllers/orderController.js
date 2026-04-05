@@ -512,6 +512,14 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     }
   });
 
+  // Keep payment.status in sync when paymentStatus (top-level) is updated
+  if (req.body.paymentStatus !== undefined) {
+    const syncMap = { unpaid: 'pending', paid: 'paid', partial: 'pending', refunded: 'refunded' };
+    if (syncMap[req.body.paymentStatus]) {
+      order.payment.status = syncMap[req.body.paymentStatus];
+    }
+  }
+
   // Recalculate total from pricing if pricing was updated
   if (req.body.pricing && req.body.pricing.total !== undefined) {
     order.total = req.body.pricing.total;
@@ -525,7 +533,11 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
 
   const io = req.app.get('io');
   if (io) {
-    io.to(`order-${order._id}`).emit('order:updated', { orderId: order._id });
+    io.to(`order-${order._id}`).emit('order:updated', {
+      orderId: order._id,
+      paymentStatus: order.paymentStatus,
+      paymentMethod: order.payment?.method,
+    });
   }
 
   res.status(200).json({
@@ -831,7 +843,20 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
     order.payment.paidAt = Date.now();
   }
 
+  // Keep top-level paymentStatus in sync so normalisation on the frontend is consistent
+  const paymentStatusMap = { pending: 'unpaid', paid: 'paid', failed: 'unpaid', refunded: 'refunded' };
+  if (paymentStatusMap[status]) order.paymentStatus = paymentStatusMap[status];
+
   await order.save();
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order:updated', {
+      orderId: order._id,
+      paymentStatus: order.payment.status,
+      paymentMethod: order.payment.method,
+    });
+  }
 
   res.status(200).json({
     success: true,
