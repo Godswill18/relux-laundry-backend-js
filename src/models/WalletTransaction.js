@@ -6,6 +6,7 @@ const WalletTransactionSchema = new mongoose.Schema(
     amount: { type: Number, required: true },
     type: { type: String, enum: ['credit', 'debit'], required: true },
     reason: { type: String },
+    balanceAfter: { type: Number },
   },
   { timestamps: true }
 );

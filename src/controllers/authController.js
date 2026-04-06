@@ -1,5 +1,6 @@
 const User = require('../models/User.js');
 const WorkShift = require('../models/WorkShift.js');
+const Referral = require('../models/Referral.js');
 // const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
@@ -12,7 +13,7 @@ const ensureCustomer = require('../utils/ensureCustomer.js');
 // @route   POST /api/v1/auth/register
 // @access  Public
 exports.register = asyncHandler(async (req, res, next) => {
-  const { name, email, phone, password, role } = req.body;
+  const { name, email, phone, password, role, referralCode } = req.body;
 
   // Validate required fields
   if (!name || !phone || !password) {
@@ -34,8 +35,32 @@ exports.register = asyncHandler(async (req, res, next) => {
     role: role || 'customer',
   });
 
+  // Auto-generate a unique referral code for this new user
+  user.referralCode = `REF-${user._id.toString().slice(-6).toUpperCase()}-${Date.now().toString(36).slice(-3).toUpperCase()}`;
+  await user.save({ validateBeforeSave: false });
+
   // Create linked Customer document for wallet/loyalty/orders
   await ensureCustomer(user);
+
+  // Apply referral code if provided — do this silently (never fail registration)
+  if (referralCode && referralCode.trim()) {
+    try {
+      const referrer = await User.findOne({ referralCode: referralCode.trim().toUpperCase() });
+
+      if (referrer && referrer._id.toString() !== user._id.toString()) {
+        const alreadyReferred = await Referral.findOne({ refereeUserId: user._id });
+        if (!alreadyReferred) {
+          await Referral.create({
+            referrerUserId: referrer._id,
+            refereeUserId: user._id,
+            status: 'pending',
+          });
+        }
+      }
+    } catch (_) {
+      // Silent — referral failure must not block registration
+    }
+  }
 
   await sendTokenResponse(user, 201, res);
 });

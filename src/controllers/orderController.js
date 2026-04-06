@@ -6,6 +6,7 @@ const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
 const ReferralSetting = require('../models/ReferralSetting.js');
+const LoyaltyLedger = require('../models/LoyaltyLedger.js');
 const User = require('../models/User.js');
 const ServiceCategory = require('../models/ServiceCategory.js');
 const LoyaltyTier = require('../models/LoyaltyTier.js');
@@ -21,6 +22,145 @@ const CARE_TYPE_MULTIPLIERS = {
   'iron-only': 0.6,
   'wash-iron': 1.5,
 };
+
+// ─── Referral auto-qualification helper ──────────────────────────────────────
+// Called after an order reaches the trigger status (completed or paid).
+// Checks every referral setting and credits wallet + loyalty points when earned.
+async function processReferralReward(order, triggerStatus, io) {
+  const settings = await ReferralSetting.findOne().sort('-createdAt').lean();
+  if (!settings || !settings.enabled) return;
+
+  // Only fire on the configured qualifying status
+  const qualifyOn = (settings.qualifyOnStatus || 'completed').toLowerCase();
+  if (triggerStatus.toLowerCase() !== qualifyOn) return;
+
+  // order.customer is a User._id — look up the User directly
+  const refereeUser = await User.findById(order.customer).select('_id customerId name').lean();
+  if (!refereeUser) return;
+
+  // Find the pending/qualified referral for this referee
+  const referral = await Referral.findOne({
+    refereeUserId: refereeUser._id,
+    status: { $in: ['pending', 'qualified'] },
+    rewardCredited: false,
+  });
+  if (!referral) return;
+
+  // Check maxRewardsPerReferrer
+  if (settings.maxRewardsPerReferrer && settings.maxRewardsPerReferrer > 0) {
+    const alreadyRewarded = await Referral.countDocuments({
+      referrerUserId: referral.referrerUserId,
+      status: 'rewarded',
+    });
+    if (alreadyRewarded >= settings.maxRewardsPerReferrer) return;
+  }
+
+  // Check minOrderCount — count orders that have reached the qualifying status
+  const minCount = settings.minOrderCount || 1;
+  const qualifiedOrdersQuery = qualifyOn === 'paid'
+    ? { customer: order.customer, paymentStatus: 'paid' }
+    : { customer: order.customer, status: 'completed' };
+  const qualifiedOrdersCount = await Order.countDocuments(qualifiedOrdersQuery);
+  if (qualifiedOrdersCount < minCount) return;
+
+  // Check minOrderAmount
+  if (settings.minOrderAmount && settings.minOrderAmount > 0) {
+    if ((order.total || 0) < settings.minOrderAmount) return;
+  }
+
+  // Resolve reward amounts from live settings
+  const referrerRewardAmount  = settings.referrerRewardAmount  ?? 0;
+  const refereeRewardAmount   = settings.refereeRewardAmount   ?? 0;
+  const referrerLoyaltyPoints = settings.referrerLoyaltyPoints ?? 0;
+  const refereeLoyaltyPoints  = settings.refereeLoyaltyPoints  ?? 0;
+
+  // --- Credit referrer wallet ---
+  const referrerUser = await User.findById(referral.referrerUserId).select('_id customerId name').lean();
+  if (referrerUser && referrerUser.customerId) {
+    if (referrerRewardAmount > 0) {
+      let referrerWallet = await Wallet.findOne({ customerId: referrerUser.customerId });
+      if (!referrerWallet) referrerWallet = await Wallet.create({ customerId: referrerUser.customerId, balance: 0 });
+      referrerWallet.balance += referrerRewardAmount;
+      await referrerWallet.save();
+      await WalletTransaction.create({
+        walletId: referrerWallet._id,
+        customerId: referrerUser.customerId,
+        type: 'credit',
+        amount: referrerRewardAmount,
+        reason: `Referral reward for ${refereeUser.name || 'a new customer'}`,
+        balanceAfter: referrerWallet.balance,
+      });
+      if (io) {
+        io.to(`user-${referrerUser.customerId}`).emit('wallet:balance-updated', {
+          balance: referrerWallet.balance,
+          transaction: { type: 'credit', amount: referrerRewardAmount, reason: `Referral reward` },
+        });
+        io.to(`user-${referrerUser.customerId}`).emit('referral:rewarded', {
+          referralId: referral._id,
+          amount: referrerRewardAmount,
+          refereeName: refereeUser.name,
+        });
+      }
+    }
+    // --- Credit referrer loyalty points ---
+    if (referrerLoyaltyPoints > 0) {
+      await LoyaltyLedger.create({
+        customerId: referrerUser.customerId,
+        points: referrerLoyaltyPoints,
+        type: 'earn',
+        reason: 'Referral loyalty bonus',
+      });
+      await Customer.findByIdAndUpdate(referrerUser.customerId, {
+        $inc: { loyaltyPointsBalance: referrerLoyaltyPoints, loyaltyLifetimePoints: referrerLoyaltyPoints },
+      });
+    }
+  }
+  referral.rewardCredited = true;
+  referral.rewardAmount = referrerRewardAmount;
+  referral.referrerLoyaltyPoints = referrerLoyaltyPoints;
+
+  // --- Credit referee wallet ---
+  if (refereeUser.customerId) {
+    if (refereeRewardAmount > 0) {
+      let refereeWallet = await Wallet.findOne({ customerId: refereeUser.customerId });
+      if (!refereeWallet) refereeWallet = await Wallet.create({ customerId: refereeUser.customerId, balance: 0 });
+      refereeWallet.balance += refereeRewardAmount;
+      await refereeWallet.save();
+      await WalletTransaction.create({
+        walletId: refereeWallet._id,
+        customerId: refereeUser.customerId,
+        type: 'credit',
+        amount: refereeRewardAmount,
+        reason: 'Welcome referral bonus',
+        balanceAfter: refereeWallet.balance,
+      });
+      if (io) {
+        io.to(`user-${refereeUser.customerId}`).emit('wallet:balance-updated', {
+          balance: refereeWallet.balance,
+          transaction: { type: 'credit', amount: refereeRewardAmount, reason: 'Welcome referral bonus' },
+        });
+      }
+    }
+    // --- Credit referee loyalty points ---
+    if (refereeLoyaltyPoints > 0) {
+      await LoyaltyLedger.create({
+        customerId: refereeUser.customerId,
+        points: refereeLoyaltyPoints,
+        type: 'earn',
+        reason: 'Welcome referral loyalty bonus',
+      });
+      await Customer.findByIdAndUpdate(refereeUser.customerId, {
+        $inc: { loyaltyPointsBalance: refereeLoyaltyPoints, loyaltyLifetimePoints: refereeLoyaltyPoints },
+      });
+    }
+  }
+  referral.refereeRewardCredited = true;
+  referral.refereeRewardAmount = refereeRewardAmount;
+  referral.refereeLoyaltyPoints = refereeLoyaltyPoints;
+  referral.status = 'rewarded';
+  await referral.save();
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // @desc    Create new order (online or offline walk-in)
 // @route   POST /api/v1/orders
@@ -205,7 +345,11 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     // Mark payment as paid
     order.payment.status = 'paid';
     order.payment.paidAt = new Date();
+    order.paymentStatus = 'paid';
     await order.save();
+
+    // Auto-disburse referral reward if qualifyOnStatus is 'paid'
+    await processReferralReward(order, 'paid', req.app.get('io'));
 
     // Emit Socket.io event for wallet update
     const io = req.app.get('io');
@@ -572,79 +716,9 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
-  // Handle referral rewards when order is completed
-  if (status && status.toLowerCase() === 'completed') {
-    // Check if this is the customer's first completed order
-    const completedOrdersCount = await Order.countDocuments({
-      customer: order.customer,
-      status: 'completed',
-    });
-
-    if (completedOrdersCount === 1) {
-      // This is the first completed order - check for referral
-      const orderCustomer = await Order.findById(order._id).populate('customer');
-      const customerId = orderCustomer.customer._id;
-
-      // Find referral where this customer is the referee
-      const referral = await Referral.findOne({
-        refereeUserId: customerId,
-        status: { $in: ['pending', 'qualified'] },
-      });
-
-      if (referral) {
-        // Get referral settings
-        const settings = await ReferralSetting.findOne();
-        const rewardAmount = settings?.referrerRewardAmount || 1000;
-
-        // Get referrer's customer ID
-        const referrerUser = await User.findById(referral.referrerUserId);
-        if (referrerUser && referrerUser.customerId) {
-          // Get referrer's wallet
-          const referrerWallet = await Wallet.findOne({ customerId: referrerUser.customerId });
-
-          if (referrerWallet) {
-            // Credit referrer's wallet
-            referrerWallet.balance += rewardAmount;
-            await referrerWallet.save();
-
-            // Create wallet transaction
-            await WalletTransaction.create({
-              walletId: referrerWallet._id,
-              customerId: referrerUser.customerId,
-              type: 'credit',
-              amount: rewardAmount,
-              reason: `Referral reward for ${orderCustomer.customer.name}`,
-              balanceAfter: referrerWallet.balance,
-            });
-
-            // Update referral status
-            referral.status = 'rewarded';
-            referral.rewardCredited = true;
-            referral.rewardAmount = rewardAmount;
-            await referral.save();
-
-            // Emit Socket.io event for referrer
-            const io = req.app.get('io');
-            if (io) {
-              io.to(`user-${referrerUser.customerId}`).emit('wallet:balance-updated', {
-                balance: referrerWallet.balance,
-                transaction: {
-                  type: 'credit',
-                  amount: rewardAmount,
-                  reason: `Referral reward for ${orderCustomer.customer.name}`,
-                },
-              });
-
-              io.to(`user-${referrerUser.customerId}`).emit('referral:rewarded', {
-                referralId: referral._id,
-                amount: rewardAmount,
-                refereeName: orderCustomer.customer.name,
-              });
-            }
-          }
-        }
-      }
-    }
+  // Handle referral auto-qualification — respects all referral settings
+  if (status) {
+    await processReferralReward(order, status, req.app.get('io'));
   }
 
   // Emit socket event
@@ -848,6 +922,11 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
   if (paymentStatusMap[status]) order.paymentStatus = paymentStatusMap[status];
 
   await order.save();
+
+  // Handle referral auto-qualification for qualifyOnStatus: 'paid'
+  if (status === 'paid') {
+    await processReferralReward(order, 'paid', req.app.get('io'));
+  }
 
   const io = req.app.get('io');
   if (io) {

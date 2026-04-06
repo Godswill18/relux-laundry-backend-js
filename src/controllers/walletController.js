@@ -70,6 +70,7 @@ exports.topUpWallet = asyncHandler(async (req, res, next) => {
     amount,
     type: 'credit',
     reason: reason || 'Wallet top-up',
+    balanceAfter: wallet.balance,
   });
 
   res.status(200).json({
