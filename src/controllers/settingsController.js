@@ -3,6 +3,7 @@ const NotificationSetting = require('../models/NotificationSetting.js');
 const ReferralSetting = require('../models/ReferralSetting.js');
 const LoyaltySetting = require('../models/LoyaltySetting.js');
 const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
+const StageDurationSetting = require('../models/StageDurationSetting.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 
@@ -212,5 +213,45 @@ exports.updateServiceLevelConfig = asyncHandler(async (req, res, next) => {
     success: true,
     message: 'Service level config updated successfully',
     data: { config },
+  });
+});
+
+// ========== STAGE DURATION SETTINGS ==========
+
+// @desc    Get stage duration settings
+// @route   GET /api/v1/settings/stage-durations
+// @access  Private (Admin/Manager/Staff — needed at runtime)
+exports.getStageDurationSettings = asyncHandler(async (req, res, next) => {
+  let settings = await StageDurationSetting.findOne();
+  if (!settings) {
+    settings = await StageDurationSetting.create({});
+  }
+  res.status(200).json({
+    success: true,
+    message: 'Stage duration settings fetched successfully',
+    data: { settings },
+  });
+});
+
+// @desc    Update stage duration settings
+// @route   PUT /api/v1/settings/stage-durations
+// @access  Private (Admin)
+exports.updateStageDurationSettings = asyncHandler(async (req, res, next) => {
+  const allowed = ['confirmed', 'picked-up', 'in_progress', 'washing', 'ironing', 'out-for-delivery'];
+  const update = {};
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      update[key] = Number(req.body[key]);
+    }
+  }
+  const settings = await StageDurationSetting.findOneAndUpdate({}, update, {
+    new: true,
+    upsert: true,
+    runValidators: true,
+  });
+  res.status(200).json({
+    success: true,
+    message: 'Stage duration settings updated successfully',
+    data: { settings },
   });
 });

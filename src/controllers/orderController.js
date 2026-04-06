@@ -6,6 +6,7 @@ const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
 const ReferralSetting = require('../models/ReferralSetting.js');
+const StageDurationSetting = require('../models/StageDurationSetting.js');
 const LoyaltyLedger = require('../models/LoyaltyLedger.js');
 const User = require('../models/User.js');
 const ServiceCategory = require('../models/ServiceCategory.js');
@@ -14,6 +15,34 @@ const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
 const { calculateOrderPricing, generateQRCode } = require('../utils/helpers.js');
+
+// Statuses that have a countdown timer
+const TIMED_STAGES = new Set(['confirmed', 'picked-up', 'in_progress', 'washing', 'ironing', 'out-for-delivery']);
+
+// Fallback durations (minutes) used when StageDurationSetting has no DB document yet
+const DEFAULT_STAGE_DURATIONS = {
+  'confirmed':          15,
+  'picked-up':          90,
+  'in_progress':        180,
+  'washing':            240,
+  'ironing':            90,
+  'out-for-delivery':   120,
+};
+
+/**
+ * Returns { stageDeadlineAt, stageDurationMinutes } for the given status.
+ * Always resolves — uses DB settings if available, falls back to hardcoded defaults.
+ */
+async function computeStageDeadline(status) {
+  if (!TIMED_STAGES.has(status)) return { stageDeadlineAt: null, stageDurationMinutes: null };
+  const durations = await StageDurationSetting.findOne().lean();
+  const minutes = (durations && durations[status]) ? durations[status] : DEFAULT_STAGE_DURATIONS[status];
+  if (!minutes || minutes <= 0) return { stageDeadlineAt: null, stageDurationMinutes: null };
+  return {
+    stageDurationMinutes: minutes,
+    stageDeadlineAt: new Date(Date.now() + minutes * 60 * 1000),
+  };
+}
 
 // Care-type multipliers — single source of truth on the backend
 const CARE_TYPE_MULTIPLIERS = {
@@ -624,56 +653,140 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Not authorized to edit orders', 403));
   }
 
-  // Only allow editing orders that are not yet completed/cancelled
+  // Block editing completed/delivered/cancelled orders
   if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
-  const allowedFields = [
-    'serviceType',
-    'orderType',
-    'items',
-    'pickupAddress',
-    'deliveryAddress',
-    'pickupDate',
-    'deliveryDate',
-    'scheduledPickupTime',
-    'specialInstructions',
-    'serviceLevel',
-    'pickupMethod',
-    'rush',
-    'stainRemoval',
-    'pricing',
-    'notes',
-    'walkInCustomer',
-    'assignedStaff',
-    'paymentStatus',
-  ];
+  const previousTotal = order.total || 0;
+  const previousPaymentMethod = order.payment?.method;
+  const previousPaymentStatus = order.paymentStatus;
 
-  allowedFields.forEach((field) => {
-    if (req.body[field] !== undefined) {
-      order[field] = req.body[field];
-    }
+  // ── Non-item fields ────────────────────────────────────────────────────────
+  const scalarFields = [
+    'serviceType', 'orderType', 'pickupAddress', 'deliveryAddress',
+    'pickupDate', 'deliveryDate', 'scheduledPickupTime', 'specialInstructions',
+    'serviceLevel', 'pickupMethod', 'rush', 'stainRemoval', 'fragrance',
+    'notes', 'walkInCustomer', 'assignedStaff', 'paymentStatus',
+  ];
+  scalarFields.forEach((field) => {
+    if (req.body[field] !== undefined) order[field] = req.body[field];
   });
 
-  // Keep payment.status in sync when paymentStatus (top-level) is updated
+  // Keep payment.status in sync when paymentStatus is updated
   if (req.body.paymentStatus !== undefined) {
     const syncMap = { unpaid: 'pending', paid: 'paid', partial: 'pending', refunded: 'refunded' };
-    if (syncMap[req.body.paymentStatus]) {
-      order.payment.status = syncMap[req.body.paymentStatus];
-    }
+    if (syncMap[req.body.paymentStatus]) order.payment.status = syncMap[req.body.paymentStatus];
   }
 
-  // Recalculate total from pricing if pricing was updated
-  if (req.body.pricing && req.body.pricing.total !== undefined) {
-    order.total = req.body.pricing.total;
+  // ── Items + price recalculation ────────────────────────────────────────────
+  let newTotal = previousTotal;
+
+  if (req.body.items !== undefined) {
+    // Re-price every item from DB — never trust frontend prices
+    const pricedItems = await Promise.all(
+      req.body.items.map(async (item) => {
+        if (!item.categoryId) return item;
+        const category = await ServiceCategory.findById(item.categoryId).select('basePrice').lean();
+        if (!category) return item;
+        const MULTIPLIERS = { 'wash-fold': 1, 'wash-only': 1, 'iron-only': 0.6, 'wash-iron': 1.5 };
+        const multiplier = MULTIPLIERS[item.serviceType] ?? 1;
+        const unitPrice = Math.round(category.basePrice * multiplier);
+        return { ...item, unitPrice, total: unitPrice * (item.quantity || 1) };
+      })
+    );
+    order.items = pricedItems;
+
+    // Recalculate full pricing
+    const currentServiceLevel = req.body.serviceLevel || order.serviceLevel || 'standard';
+    const SL_MULTIPLIERS = { standard: 1, express: 1.5, premium: 2 };
+    const slMultiplier = SL_MULTIPLIERS[currentServiceLevel.toLowerCase()] || 1;
+    const baseSubtotal = pricedItems.reduce((acc, i) => acc + (i.unitPrice || 0) * (i.quantity || 1), 0);
+    const serviceFee = Math.round(baseSubtotal * (slMultiplier - 1) * 100) / 100;
+
+    const rushVal     = req.body.rush      !== undefined ? req.body.rush      : order.rush;
+    const stainVal    = req.body.stainRemoval !== undefined ? req.body.stainRemoval : order.stainRemoval;
+    const fragranceVal = req.body.fragrance !== undefined ? req.body.fragrance : order.fragrance;
+    const addOnsFee   = (stainVal ? 300 : 0) + (fragranceVal ? 200 : 0);
+
+    const pickupFee   = order.pricing?.pickupFee   || 0;
+    const deliveryFee = order.pricing?.deliveryFee || 0;
+    const discount    = order.pricing?.discount    || 0;
+
+    const newPricing = calculateOrderPricing(pricedItems, pickupFee, deliveryFee, discount, serviceFee, addOnsFee);
+    order.pricing = newPricing;
+    order.total   = newPricing.total;
+    newTotal      = newPricing.total;
+  } else if (req.body.pricing && req.body.pricing.total !== undefined) {
+    // Manual pricing override (no items change)
+    order.pricing = { ...order.pricing, ...req.body.pricing };
+    order.total   = req.body.pricing.total;
+    newTotal      = req.body.pricing.total;
   }
 
   order.lastUpdatedById = req.user.id;
+
+  // ── Price-difference handling + wallet refund ──────────────────────────────
+  const difference = Math.round((previousTotal - newTotal) * 100) / 100; // positive = overpaid → refund
+  let refundIssued = false;
+  let refundAmount = 0;
+
+  if (difference > 0 && previousPaymentStatus === 'paid' && previousPaymentMethod === 'wallet') {
+    // Customer overpaid — refund the difference to their wallet
+    const orderUser = await User.findById(order.customer).select('customerId').lean();
+    if (orderUser?.customerId) {
+      const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+      if (wallet) {
+        wallet.balance += difference;
+        await wallet.save();
+        await WalletTransaction.create({
+          walletId: wallet._id,
+          customerId: orderUser.customerId,
+          type: 'credit',
+          amount: difference,
+          reason: `Order Adjustment Refund — ${order.orderNumber}`,
+          balanceAfter: wallet.balance,
+        });
+        refundIssued = true;
+        refundAmount = difference;
+
+        // Reduce the recorded payment amount to match the new lower total
+        order.payment.amount = newTotal;
+
+        const io = req.app.get('io');
+        if (io) {
+          io.to(`user-${orderUser.customerId}`).emit('wallet:balance-updated', {
+            balance: wallet.balance,
+            transaction: { type: 'credit', amount: difference, reason: `Order Adjustment Refund` },
+          });
+        }
+      }
+    }
+  } else if (difference < 0 && previousPaymentStatus === 'paid') {
+    // New total is higher — keep payment.amount as what was actually paid, mark partial
+    order.paymentStatus = 'partial';
+    order.payment.status = 'pending';
+    // payment.amount stays as previousTotal (what was actually paid — do NOT change it)
+  }
+
+  // ── Audit trail ────────────────────────────────────────────────────────────
+  if (req.body.items !== undefined || (req.body.pricing && req.body.pricing.total !== undefined)) {
+    order.editHistory.push({
+      editedBy: req.user.id,
+      previousTotal,
+      newTotal,
+      difference,
+      refundIssued,
+      refundAmount,
+      notes: req.body.editNote || undefined,
+    });
+  }
+
   await order.save();
 
   await order.populate('customer', 'name phone email');
   await order.populate('assignedStaff', 'name phone staffRole');
+  await order.populate('editHistory.editedBy', 'name role');
 
   const io = req.app.get('io');
   if (io) {
@@ -681,13 +794,14 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       paymentStatus: order.paymentStatus,
       paymentMethod: order.payment?.method,
+      total: order.total,
     });
   }
 
   res.status(200).json({
     success: true,
     message: 'Order updated successfully',
-    data: { order },
+    data: { order, priceDifference: difference, refundIssued, refundAmount },
   });
 });
 
@@ -706,6 +820,12 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   // Update status
   order.status = status;
   if (notes) order.notes = notes;
+
+  // Compute stageDeadlineAt — always uses defaults if no DB document exists yet
+  const { stageDeadlineAt, stageDurationMinutes } = await computeStageDeadline(status);
+  // null clears the field in MongoDB; undefined is ignored by Mongoose save
+  order.stageDeadlineAt     = stageDeadlineAt;
+  order.stageDurationMinutes = stageDurationMinutes;
 
   // Add to status history
   order.statusHistory.push({
@@ -728,6 +848,15 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       status,
       notes,
+      stageDeadlineAt,
+      stageDurationMinutes,
+    });
+    // Also broadcast to admin/staff rooms for list-view countdown updates
+    io.emit('order:timer-updated', {
+      orderId: order._id,
+      status,
+      stageDeadlineAt,
+      stageDurationMinutes,
     });
   }
 
@@ -866,6 +995,12 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
 
   order.assignedStaff = req.user.id;
   order.status = 'confirmed';
+
+  // Set stage countdown for the confirmed stage
+  const { stageDeadlineAt: acceptDeadline, stageDurationMinutes: acceptDuration } = await computeStageDeadline('confirmed');
+  order.stageDeadlineAt      = acceptDeadline;
+  order.stageDurationMinutes = acceptDuration;
+
   order.statusHistory.push({
     status: 'confirmed',
     updatedBy: req.user.id,
@@ -882,11 +1017,19 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       status: 'confirmed',
       assignedStaff: req.user.id,
+      stageDeadlineAt: acceptDeadline,
+      stageDurationMinutes: acceptDuration,
     });
     io.to(`user-${order.customer?._id || order.customer}`).emit('order:accepted', {
       orderId: order._id,
       orderNumber: order.orderNumber,
       staffName: req.user.name,
+    });
+    io.emit('order:timer-updated', {
+      orderId: order._id,
+      status: 'confirmed',
+      stageDeadlineAt: acceptDeadline,
+      stageDurationMinutes: acceptDuration,
     });
   }
 
@@ -944,6 +1087,83 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Pay remaining balance from customer wallet (for partial-payment orders)
+// @route   POST /api/v1/orders/:id/pay-balance
+// @access  Private (Staff/Admin/Manager)
+exports.payBalanceFromWallet = asyncHandler(async (req, res, next) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return next(new AppError('Order not found', 404));
+
+  if (order.paymentStatus !== 'partial') {
+    return next(new AppError('Order does not have a partial payment balance', 400));
+  }
+
+  // Balance due = new total − what was already paid
+  const alreadyPaid = order.payment?.amount || 0;
+  const balanceDue = Math.round((order.total - alreadyPaid) * 100) / 100;
+
+  if (balanceDue <= 0) {
+    return next(new AppError('No outstanding balance on this order', 400));
+  }
+
+  // Resolve customer wallet
+  const orderUser = await User.findById(order.customer).select('customerId').lean();
+  if (!orderUser?.customerId) {
+    return next(new AppError('Customer wallet not found', 404));
+  }
+
+  const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+  if (!wallet) return next(new AppError('Customer does not have a wallet', 404));
+
+  if (wallet.balance < balanceDue) {
+    return next(new AppError(
+      `Insufficient wallet balance. Balance: ₦${wallet.balance.toLocaleString()}, Required: ₦${balanceDue.toLocaleString()}`,
+      400
+    ));
+  }
+
+  // Deduct from wallet
+  wallet.balance -= balanceDue;
+  await wallet.save();
+
+  await WalletTransaction.create({
+    walletId: wallet._id,
+    customerId: orderUser.customerId,
+    type: 'debit',
+    amount: balanceDue,
+    reason: `Balance payment for order ${order.orderNumber}`,
+    balanceAfter: wallet.balance,
+  });
+
+  // Mark order as fully paid
+  order.paymentStatus = 'paid';
+  order.payment.status = 'paid';
+  order.payment.amount = order.total; // now reflects full amount
+  order.payment.paidAt = new Date();
+  await order.save();
+
+  // Trigger referral check for qualifyOnStatus: 'paid'
+  await processReferralReward(order, 'paid', req.app.get('io'));
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${orderUser.customerId}`).emit('wallet:balance-updated', {
+      balance: wallet.balance,
+      transaction: { type: 'debit', amount: balanceDue, reason: `Balance payment for order ${order.orderNumber}` },
+    });
+    io.to(`order-${order._id}`).emit('order:updated', {
+      orderId: order._id,
+      paymentStatus: 'paid',
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `₦${balanceDue.toLocaleString()} charged from wallet. Order fully paid.`,
+    data: { order, amountCharged: balanceDue, walletBalance: wallet.balance },
+  });
+});
+
 // @desc    Cancel order
 // @route   PUT /api/v1/orders/:id/cancel
 // @access  Private
@@ -980,10 +1200,47 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
+  // Auto-refund wallet if paid via wallet
+  const paidViaWallet = order.payment?.method === 'wallet' && order.paymentStatus === 'paid';
+  const refundAmount = order.payment?.amount || order.total || 0;
+  let walletRefundIssued = false;
+
+  if (paidViaWallet && refundAmount > 0) {
+    const orderUser = await User.findById(order.customer).select('customerId').lean();
+    if (orderUser?.customerId) {
+      const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+      if (wallet) {
+        wallet.balance += refundAmount;
+        await wallet.save();
+        await WalletTransaction.create({
+          walletId: wallet._id,
+          customerId: orderUser.customerId,
+          type: 'credit',
+          amount: refundAmount,
+          reason: `Order Cancellation Refund — ${order.orderNumber}`,
+          balanceAfter: wallet.balance,
+        });
+        // Update payment status to refunded
+        order.paymentStatus = 'refunded';
+        order.payment.status = 'refunded';
+        await order.save();
+        walletRefundIssued = true;
+
+        const io = req.app.get('io');
+        if (io) {
+          io.to(`user-${orderUser.customerId}`).emit('wallet:balance-updated', {
+            balance: wallet.balance,
+            transaction: { type: 'credit', amount: refundAmount, reason: `Order Cancellation Refund` },
+          });
+        }
+      }
+    }
+  }
+
   res.status(200).json({
     success: true,
     message: 'Order cancelled successfully',
-    data: { order },
+    data: { order, walletRefundIssued, refundAmount: walletRefundIssued ? refundAmount : 0 },
   });
 });
 

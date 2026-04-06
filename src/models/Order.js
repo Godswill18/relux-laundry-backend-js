@@ -38,6 +38,17 @@ const AddressSchema = new mongoose.Schema({
   state: String,
 });
 
+const EditHistorySchema = new mongoose.Schema({
+  editedAt: { type: Date, default: Date.now },
+  editedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  previousTotal: { type: Number, required: true },
+  newTotal: { type: Number, required: true },
+  difference: { type: Number, required: true }, // positive = refund, negative = extra owed
+  refundIssued: { type: Boolean, default: false },
+  refundAmount: { type: Number, default: 0 },
+  notes: String,
+});
+
 const PricingSchema = new mongoose.Schema({
   subtotal: { type: Number, default: 0 },
   serviceFee: { type: Number, default: 0 },
@@ -195,6 +206,10 @@ const OrderSchema = new mongoose.Schema(
     },
     notes: String,
     qrCode: String,
+    editHistory: [EditHistorySchema],
+    // Countdown timer fields — set each time status changes to a timed stage
+    stageDeadlineAt: { type: Date },
+    stageDurationMinutes: { type: Number },
   },
   {
     timestamps: true,

@@ -12,6 +12,8 @@ const {
   getServiceLevelConfigs,
   createServiceLevelConfig,
   updateServiceLevelConfig,
+  getStageDurationSettings,
+  updateStageDurationSettings,
 } = require('../controllers/settingsController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
@@ -20,6 +22,10 @@ const { protect, authorize } = require('../middleware/auth.js');
 router.get('/service-levels', protect, getServiceLevelConfigs);
 router.post('/service-levels', protect, authorize('admin'), createServiceLevelConfig);
 router.put('/service-levels/:id', protect, authorize('admin'), updateServiceLevelConfig);
+
+// Stage duration settings (readable by staff/admin for countdown logic)
+router.get('/stage-durations', protect, authorize('admin', 'manager', 'staff', 'receptionist'), getStageDurationSettings);
+router.put('/stage-durations', protect, authorize('admin'), updateStageDurationSettings);
 
 // Admin-only settings
 router.use(protect);
