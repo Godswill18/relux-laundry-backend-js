@@ -2,6 +2,8 @@ const LoyaltyTier = require('../models/LoyaltyTier.js');
 const LoyaltyLedger = require('../models/LoyaltyLedger.js');
 const LoyaltySetting = require('../models/LoyaltySetting.js');
 const Customer = require('../models/Customer.js');
+const Wallet = require('../models/Wallet.js');
+const WalletTransaction = require('../models/WalletTransaction.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 
@@ -138,8 +140,11 @@ exports.deleteTier = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/loyalty/me
 // @access  Private
 exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
-  const customer = await Customer.findById(req.user.customerId)
-    .populate('loyaltyTierId', 'name rank multiplierPercent freePickup freeDelivery priorityTurnaround');
+  const [customer, settings] = await Promise.all([
+    Customer.findById(req.user.customerId)
+      .populate('loyaltyTierId', 'name rank multiplierPercent freePickup freeDelivery priorityTurnaround'),
+    LoyaltySetting.findOne().lean(),
+  ]);
 
   if (!customer) {
     return next(new AppError('Customer not found', 404));
@@ -152,6 +157,10 @@ exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
       pointsBalance: customer.loyaltyPointsBalance,
       lifetimePoints: customer.loyaltyLifetimePoints,
       tier: customer.loyaltyTierId,
+      conversionEnabled: settings?.walletConversionEnabled !== false,
+      walletConversionRate: settings?.walletConversionRate || 100,
+      minConvertPoints: settings?.minConvertPoints || 100,
+      pointsPerCurrency: settings?.pointsPerCurrency || 1,
     },
   });
 });
@@ -399,6 +408,107 @@ exports.getTransactions = asyncHandler(async (req, res, next) => {
       limit,
       total,
       pages: Math.ceil(total / limit),
+    },
+  });
+});
+
+// ============================================================================
+// CONVERT POINTS TO WALLET MONEY
+// ============================================================================
+
+// @desc    Convert loyalty points to wallet balance
+// @route   POST /api/v1/loyalty/convert
+// @access  Private (Customer)
+exports.convertPointsToWallet = asyncHandler(async (req, res, next) => {
+  if (!req.user.customerId) {
+    return next(new AppError('No customer profile linked to this account', 400));
+  }
+
+  const points = parseInt(req.body.points, 10);
+  if (!points || points <= 0) {
+    return next(new AppError('Points must be a positive number', 400));
+  }
+
+  // Load loyalty settings
+  const settings = await LoyaltySetting.findOne().lean();
+  if (!settings || !settings.enabled) {
+    return next(new AppError('Loyalty program is currently disabled', 400));
+  }
+  if (settings.walletConversionEnabled === false) {
+    return next(new AppError('Points-to-wallet conversion is currently disabled', 400));
+  }
+
+  const conversionRate = settings.walletConversionRate || 100; // X points = ₦1
+  const minConvert     = settings.minConvertPoints     || 100;
+
+  if (points < minConvert) {
+    return next(new AppError(`Minimum ${minConvert} points required to convert`, 400));
+  }
+
+  const walletAmount = Math.floor(points / conversionRate);
+  if (walletAmount <= 0) {
+    return next(new AppError(`Not enough points. ${conversionRate} points = ₦1`, 400));
+  }
+
+  // Atomic deduction — prevents race condition double-spend
+  const updatedCustomer = await Customer.findOneAndUpdate(
+    { _id: req.user.customerId, loyaltyPointsBalance: { $gte: points } },
+    { $inc: { loyaltyPointsBalance: -points } },
+    { new: true }
+  );
+  if (!updatedCustomer) {
+    return next(new AppError('Insufficient points balance', 400));
+  }
+
+  // Credit wallet
+  let wallet = await Wallet.findOne({ customerId: req.user.customerId });
+  if (!wallet) {
+    wallet = await Wallet.create({ customerId: req.user.customerId, balance: 0 });
+  }
+  wallet.balance += walletAmount;
+  await wallet.save();
+
+  await WalletTransaction.create({
+    walletId: wallet._id,
+    customerId: req.user.customerId,
+    type: 'credit',
+    amount: walletAmount,
+    reason: `Points Conversion (${points.toLocaleString()} pts)`,
+    balanceAfter: wallet.balance,
+  });
+
+  // Record in loyalty ledger
+  await LoyaltyLedger.create({
+    customerId: req.user.customerId,
+    points: -points,
+    type: 'convert',
+    source: 'conversion',
+    reason: `Converted ${points.toLocaleString()} pts → ₦${walletAmount.toLocaleString()} wallet credit`,
+    balanceAfter: updatedCustomer.loyaltyPointsBalance,
+  });
+
+  // Real-time updates
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${req.user.customerId}`).emit('loyalty:points-updated', {
+      balance: updatedCustomer.loyaltyPointsBalance,
+      transaction: { points: -points, type: 'convert', reason: 'Points Conversion' },
+    });
+    io.to(`user-${req.user.customerId}`).emit('wallet:credited', {
+      balance: wallet.balance,
+      amount: walletAmount,
+      reason: 'Points Conversion',
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `Successfully converted ${points.toLocaleString()} points to ₦${walletAmount.toLocaleString()}`,
+    data: {
+      pointsDeducted:   points,
+      walletCredited:   walletAmount,
+      newPointsBalance: updatedCustomer.loyaltyPointsBalance,
+      newWalletBalance: wallet.balance,
     },
   });
 });

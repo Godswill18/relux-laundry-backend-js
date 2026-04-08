@@ -9,7 +9,11 @@ const socketAuth = require('./middleware/socketAuth.js');
 const { startShiftScheduler } = require('./utils/shiftScheduler.js');
 const allowedOrigins = require('./config/allowedOrigins.js');
 const PaystackTransaction = require('./models/PaystackTransaction.js');
-const { backgroundVerifyAndCredit } = require('./controllers/paymentController.js');
+const {
+  backgroundVerifyAndCredit,
+  paystackRequest,
+  processSuccessfulPaystackPayment,
+} = require('./controllers/paymentController.js');
 
 // Connect to database
 connectDB();
@@ -127,33 +131,81 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-// ─── Startup recovery: resume background retries for any pending Paystack
-// transactions that were interrupted by a server restart.
+// ─── Pending transaction recovery & cleanup ──────────────────────────────────
+//
+// Called on startup and every 15 minutes while the server runs.
+//
+// Two buckets:
+//   1. Recent (< 30 min old): restart the background verify/credit loop in case
+//      the server restarted mid-flight.
+//   2. Old (30 min – 24 h old): do a single Paystack check; if the payment
+//      still isn't confirmed, mark the transaction as failed so it doesn't sit
+//      in "pending" forever.  Transactions this old are almost certainly
+//      abandoned (user closed the Paystack popup without paying).
 async function recoverPendingPaystackTransactions(io) {
   try {
-    // Only recover transactions created in the last 24 hours to avoid
-    // wasting time on very old failed/abandoned transactions.
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const now      = new Date();
+    const cutoff24 = new Date(now - 24 * 60 * 60 * 1000); // 24 h ago
+    const cutoff30 = new Date(now -      30 * 60 * 1000);  // 30 min ago
+
     const pending = await PaystackTransaction.find({
       status: 'pending',
       webhookProcessed: false,
-      createdAt: { $gte: cutoff },
-    }).select('_id reference createdAt').lean();
+      createdAt: { $gte: cutoff24 },
+    }).select('_id reference amount createdAt').lean();
 
     if (pending.length === 0) {
-      logger.info('[startup] No pending Paystack transactions to recover');
+      logger.info('[pendingCleanup] No pending Paystack transactions');
       return;
     }
 
-    logger.info(`[startup] Recovering ${pending.length} pending Paystack transaction(s)…`);
+    logger.info(`[pendingCleanup] ${pending.length} pending transaction(s) found`);
+
     for (const tx of pending) {
-      logger.info(`[startup] Resuming background verify for ${tx.reference} (created ${tx.createdAt})`);
-      backgroundVerifyAndCredit(tx._id, io).catch((err) =>
-        logger.error(`[startup] Recovery error for ${tx._id}: ${err.message}`)
-      );
+      const age = now - new Date(tx.createdAt);
+
+      if (age < 30 * 60 * 1000) {
+        // Recent: resume background retry loop (handles server-restart interruption)
+        logger.info(`[pendingCleanup] Resuming bgVerify for ${tx.reference} (age ${Math.round(age / 1000)}s)`);
+        backgroundVerifyAndCredit(tx._id, io).catch((err) =>
+          logger.error(`[pendingCleanup] Recovery error for ${tx._id}: ${err.message}`)
+        );
+      } else {
+        // Old (>30 min): quick single Paystack check then fail if still unconfirmed
+        logger.info(`[pendingCleanup] Checking stale transaction ${tx.reference} (age ${Math.round(age / 60000)} min)`);
+        (async () => {
+          try {
+            const res = await paystackRequest('GET', `/transaction/verify/${tx.reference}`, null);
+            if (res.status && res.data?.status === 'success') {
+              const fullTx = await PaystackTransaction.findById(tx._id);
+              if (fullTx && !fullTx.webhookProcessed) {
+                await processSuccessfulPaystackPayment(fullTx, res.data, io);
+                logger.info(`[pendingCleanup] Late-credited stale transaction ${tx.reference}`);
+              }
+            } else if (!res.status || ['failed', 'abandoned', 'reversed'].includes(res.data?.status)) {
+              await PaystackTransaction.findByIdAndUpdate(tx._id, {
+                status: 'failed',
+                failureReason: res.data?.gateway_response || 'Payment abandoned or not confirmed',
+              });
+              logger.warn(`[pendingCleanup] Marked stale ${tx.reference} as failed (Paystack: ${res.data?.status})`);
+              if (io) {
+                io.to('payments').emit('payment:paystack-failed', {
+                  transactionId: tx._id,
+                  reference: tx.reference,
+                  amount: tx.amount,
+                  reason: 'Payment abandoned or not confirmed',
+                });
+              }
+            }
+            // status=pending/processing on a 30+ min old tx → leave for next cycle
+          } catch (err) {
+            logger.error(`[pendingCleanup] Error checking stale ${tx.reference}: ${err.message}`);
+          }
+        })();
+      }
     }
   } catch (err) {
-    logger.error(`[startup] Failed to recover pending transactions: ${err.message}`);
+    logger.error(`[pendingCleanup] Failed: ${err.message}`);
   }
 }
 
@@ -169,9 +221,11 @@ mongoose.connection.once('open', () => {
     console.log(`🔗 Health check: GET /`);
     console.log('─'.repeat(50));
 
-    // Resume any background retries that were killed by the last server restart.
-    // Runs 5 seconds after boot to give the server time to fully initialize.
+    // On boot: resume retries killed by server restart (5s delay for full init)
     setTimeout(() => recoverPendingPaystackTransactions(io), 5000);
+
+    // Every 15 minutes: auto-fail abandoned transactions and catch anything missed
+    setInterval(() => recoverPendingPaystackTransactions(io), 15 * 60 * 1000);
   });
 });
 

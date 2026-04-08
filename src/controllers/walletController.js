@@ -143,6 +143,18 @@ exports.getTransactions = asyncHandler(async (req, res, next) => {
   let query = { walletId: wallet._id };
   if (req.query.type) query.type = req.query.type;
 
+  if (req.query.dateFrom || req.query.dateTo) {
+    query.createdAt = {};
+    if (req.query.dateFrom) {
+      query.createdAt.$gte = new Date(req.query.dateFrom);
+    }
+    if (req.query.dateTo) {
+      const end = new Date(req.query.dateTo);
+      end.setHours(23, 59, 59, 999);
+      query.createdAt.$lte = end;
+    }
+  }
+
   const total = await WalletTransaction.countDocuments(query);
 
   const transactions = await WalletTransaction.find(query)

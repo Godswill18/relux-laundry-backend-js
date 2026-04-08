@@ -7,10 +7,13 @@ const LoyaltyLedgerSchema = new mongoose.Schema(
     points: { type: Number, required: true },
     type: {
       type: String,
-      enum: ['earn', 'redeem', 'adjust', 'reversal'],
+      enum: ['earn', 'redeem', 'adjust', 'reversal', 'convert'],
       required: true,
     },
     reason: { type: String },
+    referenceId: { type: mongoose.Schema.Types.ObjectId },  // referral _id or other ref
+    source: { type: String, enum: ['order', 'referral', 'manual', 'conversion'], default: 'manual' },
+    balanceAfter: { type: Number },
   },
   { timestamps: true }
 );

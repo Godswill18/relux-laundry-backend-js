@@ -314,7 +314,39 @@ async function backgroundVerifyAndCredit(transactionId, io) {
     }
   }
 
-  logger.error(`[bgVerify] Gave up after ${BG_MAX_ATTEMPTS} attempts for transactionId=${transactionId}`);
+  // Exhausted all retries — do one final Paystack check and mark failed if
+  // the payment never went through. This prevents transactions from sitting
+  // in "pending" forever after the user abandoned the payment or something
+  // went wrong on Paystack's side.
+  logger.error(`[bgVerify] Gave up after ${BG_MAX_ATTEMPTS} attempts for transactionId=${transactionId} — marking failed`);
+  try {
+    const tx = await PaystackTransaction.findById(transactionId);
+    if (tx && !tx.webhookProcessed && tx.status === 'pending') {
+      // One last Paystack check before giving up
+      try {
+        const finalRes = await paystackRequest('GET', `/transaction/verify/${tx.reference}`, null);
+        if (finalRes.status && finalRes.data?.status === 'success') {
+          logger.info(`[bgVerify] Final check: payment confirmed for ${tx.reference} — processing`);
+          await processSuccessfulPaystackPayment(tx, finalRes.data, io);
+          return;
+        }
+      } catch (_) { /* ignore — still mark failed below */ }
+      tx.status = 'failed';
+      tx.failureReason = 'Payment not confirmed by Paystack after 10 minutes — assumed abandoned';
+      await tx.save();
+      logger.warn(`[bgVerify] Marked ${tx.reference} as failed (abandoned/unconfirmed)`);
+      if (io) {
+        io.to('payments').emit('payment:paystack-failed', {
+          transactionId: tx._id,
+          reference: tx.reference,
+          amount: tx.amount,
+          reason: tx.failureReason,
+        });
+      }
+    }
+  } catch (err) {
+    logger.error(`[bgVerify] Error marking transaction as failed: ${err.message}`);
+  }
 }
 
 // @desc    Verify Paystack transaction (called from inline popup onSuccess)
@@ -442,6 +474,17 @@ exports.getPaystackTransactions = asyncHandler(async (req, res, next) => {
   const query = {};
   if (req.query.status) query.status = req.query.status;
   if (req.query.type)   query.type   = req.query.type;
+  if (req.query.search) query.reference = { $regex: req.query.search, $options: 'i' };
+
+  if (req.query.dateFrom || req.query.dateTo) {
+    query.createdAt = {};
+    if (req.query.dateFrom) query.createdAt.$gte = new Date(req.query.dateFrom);
+    if (req.query.dateTo) {
+      const end = new Date(req.query.dateTo);
+      end.setHours(23, 59, 59, 999);
+      query.createdAt.$lte = end;
+    }
+  }
 
   const [transactions, total] = await Promise.all([
     PaystackTransaction.find(query)
@@ -651,3 +694,4 @@ exports.retryPaystackTransaction = asyncHandler(async (req, res, next) => {
 exports.processSuccessfulPaystackPayment = processSuccessfulPaystackPayment;
 exports.getPaystackSecretKey = getPaystackSecretKey;
 exports.backgroundVerifyAndCredit = backgroundVerifyAndCredit;
+exports.paystackRequest = paystackRequest;

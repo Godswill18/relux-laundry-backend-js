@@ -2,6 +2,8 @@ const Order = require('../models/Order.js');
 const User = require('../models/User.js');
 const PayrollPeriod = require('../models/PayrollPeriod.js');
 const PayrollEntry = require('../models/PayrollEntry.js');
+const WorkShift = require('../models/WorkShift.js');
+const Attendance = require('../models/Attendance.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 
 // @desc    Get dashboard stats
@@ -255,47 +257,136 @@ exports.getPayrollStats = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/admin/stats/staff-productivity
 // @access  Private (Admin/Manager)
 exports.getStaffProductivity = asyncHandler(async (req, res, next) => {
-  // Orders per staff member
-  const staffOrders = await Order.aggregate([
-    { $match: { assignedTo: { $ne: null } } },
+  // Optional date range
+  const dateFilter = {};
+  if (req.query.startDate) dateFilter.$gte = new Date(req.query.startDate);
+  if (req.query.endDate) {
+    const end = new Date(req.query.endDate);
+    end.setHours(23, 59, 59, 999);
+    dateFilter.$lte = end;
+  }
+  const hasDate = Object.keys(dateFilter).length > 0;
+  const orderDateMatch = hasDate ? { createdAt: dateFilter } : {};
+
+  // 1. Orders assigned to each staff member
+  const assignedOrdersPipeline = [
+    { $match: { assignedStaff: { $ne: null }, ...orderDateMatch } },
     {
       $group: {
-        _id: '$assignedTo',
+        _id: '$assignedStaff',
         orderCount: { $sum: 1 },
         totalRevenue: { $sum: '$pricing.total' },
-        completedOrders: {
-          $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] },
+        completedOrders: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+        inProgressOrders: {
+          $sum: {
+            $cond: [
+              { $in: ['$status', ['washing', 'drying', 'ironing', 'folding', 'processing', 'ready']] },
+              1,
+              0,
+            ],
+          },
         },
+        cancelledOrders: { $sum: { $cond: [{ $eq: ['$status', 'cancelled'] }, 1, 0] } },
       },
     },
+  ];
+
+  // 2. Status updates performed by staff (from statusHistory)
+  const statusUpdatesPipeline = [
+    { $match: { 'statusHistory.0': { $exists: true }, ...orderDateMatch } },
+    { $unwind: '$statusHistory' },
+    ...(hasDate ? [{ $match: { 'statusHistory.timestamp': dateFilter } }] : []),
+    { $match: { 'statusHistory.updatedBy': { $ne: null } } },
+    { $group: { _id: '$statusHistory.updatedBy', statusUpdates: { $sum: 1 } } },
+  ];
+
+  // 3. Walk-in orders created by staff at the counter
+  const walkinPipeline = [
+    { $match: { createdByStaff: { $ne: null }, ...orderDateMatch } },
+    { $group: { _id: '$createdByStaff', walkinOrders: { $sum: 1 } } },
+  ];
+
+  // 4. Shifts worked (completed or scheduled)
+  const shiftMatch = {};
+  if (hasDate) {
+    if (req.query.startDate) shiftMatch.endDate = { $gte: req.query.startDate };
+    if (req.query.endDate) shiftMatch.startDate = { $lte: req.query.endDate };
+  }
+  const shiftsPipeline = [
+    { $match: { status: { $in: ['completed', 'scheduled'] }, ...shiftMatch } },
+    { $group: { _id: '$userId', shiftsWorked: { $sum: 1 } } },
+  ];
+
+  // 5. Attendance records
+  const attendanceMatch = hasDate ? { clockInAt: dateFilter } : {};
+  const attendancePipeline = [
+    { $match: attendanceMatch },
     {
-      $lookup: {
-        from: 'users',
-        localField: '_id',
-        foreignField: '_id',
-        as: 'staff',
+      $group: {
+        _id: '$userId',
+        attendanceCount: { $sum: 1 },
+        presentCount: { $sum: { $cond: [{ $eq: ['$status', 'present'] }, 1, 0] } },
+        lateCount: { $sum: { $cond: [{ $eq: ['$status', 'late'] }, 1, 0] } },
       },
     },
-    { $unwind: '$staff' },
-    {
-      $project: {
-        name: '$staff.name',
-        role: '$staff.role',
-        orderCount: 1,
-        totalRevenue: 1,
-        completedOrders: 1,
-        completionRate: {
-          $cond: [
-            { $eq: ['$orderCount', 0] },
-            0,
-            { $multiply: [{ $divide: ['$completedOrders', '$orderCount'] }, 100] },
-          ],
-        },
-      },
-    },
-    { $sort: { orderCount: -1 } },
-    { $limit: 20 },
-  ]);
+  ];
+
+  // Run all aggregations + user fetch in parallel
+  const [assignedOrders, statusUpdates, walkinOrders, shifts, attendance, staffUsers] =
+    await Promise.all([
+      Order.aggregate(assignedOrdersPipeline),
+      Order.aggregate(statusUpdatesPipeline),
+      Order.aggregate(walkinPipeline),
+      WorkShift.aggregate(shiftsPipeline),
+      Attendance.aggregate(attendancePipeline),
+      User.find(
+        { role: { $in: ['staff', 'manager', 'admin', 'receptionist'] } },
+        '_id name role email'
+      ).lean(),
+    ]);
+
+  // Build lookup maps keyed by user id string
+  const toMap = (arr, key = '_id') =>
+    Object.fromEntries(arr.map((r) => [r[key].toString(), r]));
+
+  const assignedMap   = toMap(assignedOrders);
+  const statusMap     = toMap(statusUpdates);
+  const walkinMap     = toMap(walkinOrders);
+  const shiftMap      = toMap(shifts);
+  const attendanceMap = toMap(attendance);
+
+  // Merge all data per staff member
+  const staffOrders = staffUsers.map((user) => {
+    const id = user._id.toString();
+    const a  = assignedMap[id]   || {};
+    const orderCount      = a.orderCount      || 0;
+    const completedOrders = a.completedOrders || 0;
+
+    return {
+      _id: id,
+      name: user.name,
+      role: user.role,
+      email: user.email,
+      orderCount,
+      totalRevenue:    a.totalRevenue    || 0,
+      completedOrders,
+      inProgressOrders: a.inProgressOrders || 0,
+      cancelledOrders:  a.cancelledOrders  || 0,
+      completionRate:   orderCount > 0 ? Math.round((completedOrders / orderCount) * 100) : 0,
+      statusUpdates:    statusMap[id]?.statusUpdates    || 0,
+      walkinOrders:     walkinMap[id]?.walkinOrders     || 0,
+      shiftsWorked:     shiftMap[id]?.shiftsWorked      || 0,
+      attendanceCount:  attendanceMap[id]?.attendanceCount || 0,
+      presentCount:     attendanceMap[id]?.presentCount    || 0,
+      lateCount:        attendanceMap[id]?.lateCount       || 0,
+    };
+  });
+
+  // Sort by most active (orders + status updates + walk-ins) descending
+  staffOrders.sort(
+    (a, b) => (b.orderCount + b.statusUpdates + b.walkinOrders) -
+              (a.orderCount + a.statusUpdates + a.walkinOrders)
+  );
 
   res.status(200).json({
     success: true,

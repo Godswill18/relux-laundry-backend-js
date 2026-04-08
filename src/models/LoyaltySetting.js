@@ -26,6 +26,10 @@ const LoyaltySettingSchema = new mongoose.Schema(
     bonusStainRemoval: { type: Number, default: 0 },
     bonusRush: { type: Number, default: 0 },
     bonusPickupDelivery: { type: Number, default: 0 },
+    // Wallet conversion
+    walletConversionEnabled: { type: Boolean, default: true },
+    walletConversionRate: { type: Number, default: 100 },   // X points = ₦1
+    minConvertPoints: { type: Number, default: 100 },
   },
   { timestamps: true }
 );

@@ -186,6 +186,7 @@ const OrderSchema = new mongoose.Schema(
     total: { type: Number, default: 0 },
     discountAmount: { type: Number, default: 0 },
     loyaltyPointsEarned: { type: Number, default: 0 },
+    loyaltyPointsAwarded: { type: Boolean, default: false },
     loyaltyPointsRedeemed: { type: Number, default: 0 },
     loyaltyDiscountAmount: { type: Number, default: 0 },
     usedSubscription: { type: Boolean, default: false },

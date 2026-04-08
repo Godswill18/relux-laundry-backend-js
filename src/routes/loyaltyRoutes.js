@@ -14,6 +14,7 @@ const {
   getSettings,
   updateSettings,
   getTransactions,
+  convertPointsToWallet,
 } = require('../controllers/loyaltyController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
@@ -40,7 +41,10 @@ router.get('/me/ledger', protect, getLedger);
 router.get('/customer/:customerId', protect, authorize('admin', 'manager'), getCustomerLoyalty);
 router.post('/adjust', protect, authorize('admin', 'manager'), adjustPoints);
 
-// Redeem points
+// Redeem points (for order discount)
 router.post('/redeem', protect, redeemPoints);
+
+// Convert points to wallet money
+router.post('/convert', protect, convertPointsToWallet);
 
 module.exports = router;

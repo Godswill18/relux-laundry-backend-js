@@ -8,6 +8,7 @@ const Referral = require('../models/Referral.js');
 const ReferralSetting = require('../models/ReferralSetting.js');
 const StageDurationSetting = require('../models/StageDurationSetting.js');
 const LoyaltyLedger = require('../models/LoyaltyLedger.js');
+const LoyaltySetting = require('../models/LoyaltySetting.js');
 const User = require('../models/User.js');
 const ServiceCategory = require('../models/ServiceCategory.js');
 const LoyaltyTier = require('../models/LoyaltyTier.js');
@@ -137,7 +138,9 @@ async function processReferralReward(order, triggerStatus, io) {
         customerId: referrerUser.customerId,
         points: referrerLoyaltyPoints,
         type: 'earn',
-        reason: 'Referral loyalty bonus',
+        source: 'referral',
+        referenceId: referral._id,
+        reason: `Referral points bonus for referring ${refereeUser.name || 'a new customer'}`,
       });
       await Customer.findByIdAndUpdate(referrerUser.customerId, {
         $inc: { loyaltyPointsBalance: referrerLoyaltyPoints, loyaltyLifetimePoints: referrerLoyaltyPoints },
@@ -176,6 +179,8 @@ async function processReferralReward(order, triggerStatus, io) {
         customerId: refereeUser.customerId,
         points: refereeLoyaltyPoints,
         type: 'earn',
+        source: 'referral',
+        referenceId: referral._id,
         reason: 'Welcome referral loyalty bonus',
       });
       await Customer.findByIdAndUpdate(refereeUser.customerId, {
@@ -188,6 +193,88 @@ async function processReferralReward(order, triggerStatus, io) {
   referral.refereeLoyaltyPoints = refereeLoyaltyPoints;
   referral.status = 'rewarded';
   await referral.save();
+}
+
+// ─── Auto-award loyalty points when an order is completed / delivered ─────────
+// Idempotent: uses atomic findOneAndUpdate + unique DB index to prevent duplicates.
+async function awardOrderPoints(order, io) {
+  if (order.loyaltyPointsAwarded) return;
+
+  // Only award for orders linked to a real customer (not anonymous walk-ins)
+  const customerUser = await User.findById(order.customer).select('customerId').lean();
+  if (!customerUser?.customerId) return;
+  const customerId = customerUser.customerId;
+
+  // Load loyalty settings
+  const settings = await LoyaltySetting.findOne().lean();
+  if (!settings || !settings.enabled) return;
+
+  // Get customer's tier multiplier
+  const customer = await Customer.findById(customerId)
+    .populate('loyaltyTierId', 'multiplierPercent')
+    .lean();
+  const tierMultiplier = customer?.loyaltyTierId?.multiplierPercent
+    ? customer.loyaltyTierId.multiplierPercent / 100
+    : 1;
+
+  // Base points: pointsPerCurrency * order total * tier multiplier
+  const orderAmount = order.pricing?.total || order.total || 0;
+  let points = Math.floor(orderAmount * (settings.pointsPerCurrency || 1) * tierMultiplier);
+
+  if (settings.maxPointsPerOrder && points > settings.maxPointsPerOrder) {
+    points = settings.maxPointsPerOrder;
+  }
+  if (points <= 0) return;
+
+  // Atomic claim — prevents race conditions and double-awarding
+  const claimed = await Order.findOneAndUpdate(
+    { _id: order._id, loyaltyPointsAwarded: { $ne: true } },
+    { loyaltyPointsAwarded: true, 'pricing.loyaltyPointsEarned': points },
+    { new: false }
+  );
+  if (!claimed) return; // Already awarded
+
+  // Create ledger entry (unique index orderId+type is a second safety net)
+  try {
+    await LoyaltyLedger.create({
+      customerId,
+      orderId: order._id,
+      points,
+      type: 'earn',
+      source: 'order',
+      reason: `Points earned from Order #${order.orderNumber || order._id.toString().slice(-6).toUpperCase()}`,
+    });
+  } catch (e) {
+    if (e.code === 11000) return; // Duplicate key — already in ledger
+    throw e;
+  }
+
+  // Credit customer balance
+  const updatedCustomer = await Customer.findByIdAndUpdate(
+    customerId,
+    { $inc: { loyaltyPointsBalance: points, loyaltyLifetimePoints: points } },
+    { new: true }
+  ).lean();
+
+  // Tier upgrade check
+  if (updatedCustomer) {
+    const allTiers = await LoyaltyTier.find({ active: true }).sort('rank').lean();
+    const eligible = allTiers.filter(t => t.pointsRequired <= (updatedCustomer.loyaltyLifetimePoints || 0)).pop();
+    const currentTierId = updatedCustomer.loyaltyTierId?.toString();
+    if (eligible && eligible._id.toString() !== currentTierId) {
+      await Customer.findByIdAndUpdate(customerId, { loyaltyTierId: eligible._id });
+    }
+  }
+
+  // Real-time update
+  if (io) {
+    io.to(`user-${customerId}`).emit('loyalty:points-earned', {
+      points,
+      balance: updatedCustomer?.loyaltyPointsBalance ?? 0,
+      orderId: order._id,
+      reason: `Points earned from order`,
+    });
+  }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -841,6 +928,11 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     await processReferralReward(order, status, req.app.get('io'));
   }
 
+  // Auto-award loyalty points on completion or delivery
+  if (['completed', 'delivered'].includes(status)) {
+    await awardOrderPoints(order, req.app.get('io'));
+  }
+
   // Emit socket event
   const io = req.app.get('io');
   if (io) {
@@ -931,6 +1023,10 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
   await order.save();
 
   const io = req.app.get('io');
+
+  // Auto-award loyalty points for scan delivery
+  await awardOrderPoints(order, io);
+
   if (io) {
     io.to(`order-${order._id}`).emit('order-status-updated', {
       orderId: order._id,
