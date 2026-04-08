@@ -8,6 +8,8 @@ const {
   confirmPayment,
   initializePaystack,
   verifyPaystack,
+  getPaystackTransactions,
+  retryPaystackTransaction,
 } = require('../controllers/paymentController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
@@ -15,6 +17,11 @@ const { protect, authorize } = require('../middleware/auth.js');
 // Paystack routes (customer-facing)
 router.post('/paystack/initialize', protect, initializePaystack);
 router.get('/paystack/verify/:reference', protect, verifyPaystack);
+
+// Paystack transactions (admin)
+router.get('/paystack/transactions', protect, authorize('admin', 'manager'), getPaystackTransactions);
+// Admin retry for stuck pending transactions
+router.post('/paystack/retry/:reference', protect, authorize('admin', 'manager'), retryPaystackTransaction);
 
 // Order payment lookup
 router.get('/order/:orderId', protect, getPaymentByOrder);

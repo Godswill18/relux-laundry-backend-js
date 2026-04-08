@@ -13,16 +13,33 @@ const AppError = require('../utils/appError.js');
 // @route   GET /api/v1/settings/payment
 // @access  Private (Admin)
 exports.getPaymentSettings = asyncHandler(async (req, res, next) => {
-  let settings = await PaymentSetting.findOne();
+  // Select secret key fields only to check if they are set (never expose them)
+  let settings = await PaymentSetting.findOne()
+    .select('+paystackSecretKey +lencoSecretKey +flutterwaveSecretKey');
 
   if (!settings) {
     settings = await PaymentSetting.create({});
   }
 
+  const paystackSecretKeySet     = !!settings.paystackSecretKey;
+  const lencoSecretKeySet        = !!settings.lencoSecretKey;
+  const flutterwaveSecretKeySet  = !!settings.flutterwaveSecretKey;
+
+  // Convert to plain object and strip actual secret values
+  const settingsObj = settings.toObject();
+  delete settingsObj.paystackSecretKey;
+  delete settingsObj.lencoSecretKey;
+  delete settingsObj.flutterwaveSecretKey;
+
   res.status(200).json({
     success: true,
     message: 'Payment settings fetched successfully',
-    data: { settings },
+    data: {
+      settings: settingsObj,
+      paystackSecretKeySet,
+      lencoSecretKeySet,
+      flutterwaveSecretKeySet,
+    },
   });
 });
 
@@ -30,7 +47,14 @@ exports.getPaymentSettings = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/settings/payment
 // @access  Private (Admin)
 exports.updatePaymentSettings = asyncHandler(async (req, res, next) => {
-  const settings = await PaymentSetting.findOneAndUpdate({}, req.body, {
+  const update = { ...req.body };
+
+  // Never overwrite a secret key with an empty string — only update if value provided
+  if (!update.paystackSecretKey)    delete update.paystackSecretKey;
+  if (!update.lencoSecretKey)       delete update.lencoSecretKey;
+  if (!update.flutterwaveSecretKey) delete update.flutterwaveSecretKey;
+
+  const settings = await PaymentSetting.findOneAndUpdate({}, update, {
     new: true,
     upsert: true,
     runValidators: true,

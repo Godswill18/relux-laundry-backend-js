@@ -1,5 +1,8 @@
+const crypto = require('crypto');
 const { Webhook } = require('svix');
 const User = require('../models/User.js');
+const PaystackTransaction = require('../models/PaystackTransaction.js');
+const { processSuccessfulPaystackPayment, getPaystackSecretKey } = require('./paymentController.js');
 const logger = require('../utils/logger.js');
 
 // Clerk webhook handler
@@ -122,4 +125,100 @@ exports.handleClerkWebhook = async (req, res) => {
   }
 
   res.status(200).json({ received: true });
+};
+
+// ============================================================================
+// PAYSTACK WEBHOOK HANDLER
+// POST /api/webhooks/paystack
+// Paystack sends raw JSON with X-Paystack-Signature header (HMAC-SHA512)
+// ============================================================================
+
+exports.handlePaystackWebhook = async (req, res) => {
+  // Always acknowledge quickly — Paystack retries on non-200
+  res.status(200).json({ received: true });
+
+  // Prefer DB-stored key over env var (same logic as payment controller)
+  const secret = await getPaystackSecretKey();
+  if (!secret || secret === 'your-paystack-secret-key') {
+    logger.warn('Paystack webhook received but secret key is not configured');
+    return;
+  }
+
+  // Verify HMAC-SHA512 signature
+  const signature = req.headers['x-paystack-signature'];
+  const rawBody   = req.body; // Buffer (express.raw middleware)
+  const expected  = crypto
+    .createHmac('sha512', secret)
+    .update(rawBody)
+    .digest('hex');
+
+  if (signature !== expected) {
+    logger.warn('Paystack webhook: invalid signature — request ignored');
+    return;
+  }
+
+  let event;
+  try {
+    event = JSON.parse(rawBody.toString());
+  } catch (err) {
+    logger.error('Paystack webhook: failed to parse body', err.message);
+    return;
+  }
+
+  const { event: eventType, data } = event;
+  logger.info(`Paystack webhook received: ${eventType} | ref: ${data?.reference}`);
+
+  try {
+    if (eventType === 'charge.success') {
+      const { reference, amount, status, gateway_response } = data;
+
+      const transaction = await PaystackTransaction.findOne({ reference });
+      if (!transaction) {
+        logger.warn(`Paystack webhook: no transaction for reference ${reference}`);
+        return;
+      }
+
+      if (transaction.webhookProcessed) {
+        logger.info(`Paystack webhook: ${reference} already processed — skipped`);
+        return;
+      }
+
+      // Verify amount matches (Paystack sends kobo; our DB stores NGN)
+      const expectedKobo = Math.round(transaction.amount * 100);
+      if (amount !== expectedKobo) {
+        logger.error(`Paystack webhook: amount mismatch for ${reference} — expected ${expectedKobo} kobo, got ${amount}`);
+        return;
+      }
+
+      const io = req.app ? req.app.get('io') : null;
+      await processSuccessfulPaystackPayment(transaction, data, io);
+      logger.info(`Paystack webhook: successfully processed ${reference}`);
+
+    } else if (eventType === 'charge.failed') {
+      const { reference, gateway_response } = data;
+      const transaction = await PaystackTransaction.findOne({ reference });
+      if (transaction && !transaction.webhookProcessed) {
+        transaction.status = 'failed';
+        transaction.failureReason = gateway_response || 'Payment failed';
+        transaction.paystackData = data;
+        await transaction.save();
+        logger.info(`Paystack webhook: marked ${reference} as failed`);
+
+        // Notify admin
+        const io = req.app ? req.app.get('io') : null;
+        if (io) {
+          io.to('payments').emit('payment:paystack-failed', {
+            transactionId: transaction._id,
+            reference,
+            amount: transaction.amount,
+            reason: transaction.failureReason,
+          });
+        }
+      }
+    } else {
+      logger.info(`Paystack webhook: unhandled event type ${eventType}`);
+    }
+  } catch (err) {
+    logger.error(`Paystack webhook processing error for ${data?.reference}: ${err.message}`);
+  }
 };

@@ -1,10 +1,14 @@
 const express = require('express');
 const router = express.Router();
-const { handleClerkWebhook } = require('../controllers/webhookController.js');
+const { handleClerkWebhook, handlePaystackWebhook } = require('../controllers/webhookController.js');
 
 // POST /api/webhooks/clerk
-// Raw body is required for Svix signature verification.
-// This route is mounted before express.json() in app.js.
+// Raw body required for Svix signature verification.
 router.post('/clerk', handleClerkWebhook);
+
+// POST /api/webhooks/paystack
+// Raw body required for HMAC-SHA512 signature verification.
+// This route is already mounted under express.raw() in app.js.
+router.post('/paystack', handlePaystackWebhook);
 
 module.exports = router;

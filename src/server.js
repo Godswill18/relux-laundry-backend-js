@@ -7,6 +7,9 @@ const logger = require('./utils/logger.js');
 const mongoose = require('mongoose');
 const socketAuth = require('./middleware/socketAuth.js');
 const { startShiftScheduler } = require('./utils/shiftScheduler.js');
+const allowedOrigins = require('./config/allowedOrigins.js');
+const PaystackTransaction = require('./models/PaystackTransaction.js');
+const { backgroundVerifyAndCredit } = require('./controllers/paymentController.js');
 
 // Connect to database
 connectDB();
@@ -17,9 +20,18 @@ const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
 // Socket.io setup for real-time updates
+// Use the same allowed-origins list as the REST API so any front-end origin
+// that can make HTTP requests can also open a WebSocket connection.
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    origin: (origin, callback) => {
+      const normalizedOrigin = origin ? origin.replace(/\/$/, '') : origin;
+      if (allowedOrigins.indexOf(normalizedOrigin) !== -1 || !origin) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Socket CORS: origin not allowed — ${origin}`));
+      }
+    },
     credentials: true,
   },
 });
@@ -115,6 +127,36 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+// ─── Startup recovery: resume background retries for any pending Paystack
+// transactions that were interrupted by a server restart.
+async function recoverPendingPaystackTransactions(io) {
+  try {
+    // Only recover transactions created in the last 24 hours to avoid
+    // wasting time on very old failed/abandoned transactions.
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const pending = await PaystackTransaction.find({
+      status: 'pending',
+      webhookProcessed: false,
+      createdAt: { $gte: cutoff },
+    }).select('_id reference createdAt').lean();
+
+    if (pending.length === 0) {
+      logger.info('[startup] No pending Paystack transactions to recover');
+      return;
+    }
+
+    logger.info(`[startup] Recovering ${pending.length} pending Paystack transaction(s)…`);
+    for (const tx of pending) {
+      logger.info(`[startup] Resuming background verify for ${tx.reference} (created ${tx.createdAt})`);
+      backgroundVerifyAndCredit(tx._id, io).catch((err) =>
+        logger.error(`[startup] Recovery error for ${tx._id}: ${err.message}`)
+      );
+    }
+  } catch (err) {
+    logger.error(`[startup] Failed to recover pending transactions: ${err.message}`);
+  }
+}
+
 mongoose.connection.once('open', () => {
   console.log('✅ MongoDB Connected Successfully');
   console.log(`🚀 Server Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -126,6 +168,10 @@ mongoose.connection.once('open', () => {
     console.log(`📍 Server URL: http://localhost:${PORT}`);
     console.log(`🔗 Health check: GET /`);
     console.log('─'.repeat(50));
+
+    // Resume any background retries that were killed by the last server restart.
+    // Runs 5 seconds after boot to give the server time to fully initialize.
+    setTimeout(() => recoverPendingPaystackTransactions(io), 5000);
   });
 });
 

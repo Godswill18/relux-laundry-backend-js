@@ -21,6 +21,14 @@ const PaystackTransactionSchema = new mongoose.Schema(
     autoRenew: { type: Boolean },
     metadata: { type: mongoose.Schema.Types.Mixed },
     paidAt: { type: Date },
+    // Idempotency: true once webhook has fully processed this transaction
+    webhookProcessed: { type: Boolean, default: false },
+    // Paystack-returned payload stored for audit
+    paystackData: { type: mongoose.Schema.Types.Mixed },
+    // Reason stored on failure
+    failureReason: { type: String },
+    // Customer's User._id (for socket delivery) — set at initialize time
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }
 );

@@ -13,6 +13,8 @@ const PaymentSettingSchema = new mongoose.Schema(
     paystackSecretKey: { type: String, select: false },
     lencoPublicKey: { type: String },
     lencoSecretKey: { type: String, select: false },
+    flutterwavePublicKey: { type: String },
+    flutterwaveSecretKey: { type: String, select: false },
     walletMinTopUp: { type: Number, default: 0 },
     walletMaxTopUp: { type: Number },
     walletAutoPayEnabled: { type: Boolean, default: true },
