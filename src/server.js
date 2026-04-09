@@ -63,6 +63,13 @@ io.on('connection', (socket) => {
     logger.info(`Auto-joined customer room: user-${customerId}`);
   }
 
+  // Admin/manager/staff/receptionist automatically join the 'admin' broadcast room
+  const staffRoles = ['admin', 'manager', 'staff', 'receptionist'];
+  if (staffRoles.includes(socket.user.role)) {
+    socket.join('admin');
+    logger.info(`Auto-joined admin room: ${socket.user.role} ${userName}`);
+  }
+
   // Join payments room for admin real-time payment updates
   socket.on('join-payments', () => {
     socket.join('payments');

@@ -6,6 +6,25 @@ const WorkShift = require('../models/WorkShift.js');
 const Attendance = require('../models/Attendance.js');
 const logger = require('./logger.js');
 const { getNowWAT } = require('./helpers.js');
+const notify = require('./notify.js');
+const { purgeOldReadNotifications } = require('../controllers/notificationController.js');
+
+// Run notification cleanup once per day (at most)
+let lastNotifCleanup = null;
+
+// Track which shift-end warnings have been sent this session
+// Key: `${shiftId}:${minutes}` → true
+const warningSentCache = new Set();
+
+/**
+ * Convert "HH:MM" time string on a given "YYYY-MM-DD" date to a UTC Date.
+ * Assumes WAT (UTC+1).
+ */
+function watTimeToDate(dateStr, timeStr) {
+  const [yr, mo, dy] = dateStr.split('-').map(Number);
+  const [hr, mn] = timeStr.split(':').map(Number);
+  return new Date(Date.UTC(yr, mo - 1, dy, hr - 1, mn, 0, 0)); // WAT = UTC+1
+}
 
 /**
  * Start the shift scheduler that auto-activates/deactivates shifts
@@ -44,6 +63,34 @@ function startShiftScheduler(io) {
             endTime: shift.endTime,
           });
           logger.info(`Shift ${shift._id} activated for user ${userId}`);
+        }
+
+        // SHIFT-END WARNINGS: 5-min and 2-min before endTime for active shifts
+        if (shift.isActive && todayDate === shift.endDate) {
+          const shiftEndUTC = watTimeToDate(shift.endDate, shift.endTime);
+          const nowUTC = new Date();
+          const minsLeft = (shiftEndUTC - nowUTC) / 60000;
+
+          for (const warnMins of [5, 2]) {
+            const cacheKey = `${shift._id}:${warnMins}`;
+            if (minsLeft > 0 && minsLeft <= warnMins && !warningSentCache.has(cacheKey)) {
+              warningSentCache.add(cacheKey);
+              await notify(io, {
+                type: 'shift_ending_soon',
+                title: 'Shift Ending Soon',
+                body: `Your shift ends in ${warnMins} minute${warnMins > 1 ? 's' : ''} (at ${shift.endTime} WAT).`,
+                userId: String(userId),
+                metadata: { shiftId: shift._id, endTime: shift.endTime, minsLeft: warnMins },
+              });
+              logger.info(`Shift-end ${warnMins}-min warning sent to user ${userId} for shift ${shift._id}`);
+            }
+          }
+
+          // Clear cache entries for this shift after it ends (prevent memory leak)
+          if (minsLeft <= 0) {
+            warningSentCache.delete(`${shift._id}:5`);
+            warningSentCache.delete(`${shift._id}:2`);
+          }
         }
 
         // DEACTIVATE: should NOT be active but is, and not emergency-controlled
@@ -96,6 +143,18 @@ function startShiftScheduler(io) {
           $set: { status: 'completed', isActive: false, emergencyActivated: false },
         }
       );
+
+      // 3. Purge old read notifications once per day
+      const now = Date.now();
+      if (!lastNotifCleanup || now - lastNotifCleanup > 24 * 60 * 60 * 1000) {
+        lastNotifCleanup = now;
+        try {
+          const deleted = await purgeOldReadNotifications();
+          if (deleted > 0) logger.info(`[NotifCleanup] Deleted ${deleted} old read notifications`);
+        } catch (cleanupErr) {
+          logger.error('[NotifCleanup] Failed:', cleanupErr.message);
+        }
+      }
     } catch (error) {
       logger.error('Shift scheduler error:', error.message);
     }

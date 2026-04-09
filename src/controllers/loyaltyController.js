@@ -6,6 +6,7 @@ const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const notify = require('../utils/notify.js');
 
 // @desc    Get all loyalty tiers
 // @route   GET /api/v1/loyalty/tiers
@@ -500,6 +501,14 @@ exports.convertPointsToWallet = asyncHandler(async (req, res, next) => {
       reason: 'Points Conversion',
     });
   }
+
+  await notify(io, {
+    type: 'wallet_credited',
+    title: 'Wallet Credited',
+    body: `₦${walletAmount.toLocaleString()} has been added to your wallet from converting ${points.toLocaleString()} loyalty points.`,
+    customerId: String(req.user.customerId),
+    metadata: { points, walletAmount },
+  });
 
   res.status(200).json({
     success: true,

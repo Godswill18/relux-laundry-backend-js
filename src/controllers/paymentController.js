@@ -10,6 +10,7 @@ const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const logger = require('../utils/logger.js');
+const notify = require('../utils/notify.js');
 
 // ─── Resolve active Paystack secret key ──────────────────────────────────────
 // Prefers the key saved in admin Payment Settings over the env var so that
@@ -593,6 +594,17 @@ async function processSuccessfulPaystackPayment(transaction, paystackData, io) {
             });
           } else {
             logger.warn(`[processSuccessful] No io instance — wallet:credited socket event NOT emitted for ref=${transaction.reference}`);
+          }
+
+          // Persist in-app notification for wallet credit
+          if (customerId) {
+            await notify(io, {
+              type: 'wallet_credited',
+              title: 'Wallet Credited',
+              body: `₦${transaction.amount.toLocaleString()} has been added to your wallet via Paystack.`,
+              customerId: String(customerId),
+              metadata: { amount: transaction.amount, reference: transaction.reference },
+            });
           }
         }
       }

@@ -16,6 +16,7 @@ const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
 const { calculateOrderPricing, generateQRCode } = require('../utils/helpers.js');
+const notify = require('../utils/notify.js');
 
 // Statuses that have a countdown timer
 const TIMED_STAGES = new Set(['confirmed', 'picked-up', 'in_progress', 'washing', 'ironing', 'out-for-delivery']);
@@ -131,6 +132,13 @@ async function processReferralReward(order, triggerStatus, io) {
           refereeName: refereeUser.name,
         });
       }
+      await notify(io, {
+        type: 'referral_rewarded',
+        title: 'Referral Reward Received',
+        body: `You earned ₦${referrerRewardAmount.toLocaleString()} for referring ${refereeUser.name || 'a new customer'}!`,
+        customerId: String(referrerUser.customerId),
+        metadata: { referralId: referral._id, amount: referrerRewardAmount },
+      });
     }
     // --- Credit referrer loyalty points ---
     if (referrerLoyaltyPoints > 0) {
@@ -172,6 +180,13 @@ async function processReferralReward(order, triggerStatus, io) {
           transaction: { type: 'credit', amount: refereeRewardAmount, reason: 'Welcome referral bonus' },
         });
       }
+      await notify(io, {
+        type: 'wallet_credited',
+        title: 'Welcome Bonus Received',
+        body: `₦${refereeRewardAmount.toLocaleString()} referral welcome bonus has been added to your wallet.`,
+        customerId: String(refereeUser.customerId),
+        metadata: { amount: refereeRewardAmount },
+      });
     }
     // --- Credit referee loyalty points ---
     if (refereeLoyaltyPoints > 0) {
@@ -481,11 +496,31 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     }
   }
 
-  // Emit socket event for real-time update
+  // Emit socket event for real-time update + notifications
   const io = req.app.get('io');
   if (io) {
     io.emit('order-created', order);
     io.to(`user-${orderCustomerRefId || orderCustomerId}`).emit('order:created', order);
+  }
+
+  // Notify admin room: new order
+  await notify(io, {
+    type: 'order_created',
+    title: 'New Order Received',
+    body: `Order ${order.orderNumber} has been placed${order.orderSource === 'online' ? ' online' : ' (walk-in)'}.`,
+    room: 'admin',
+    metadata: { orderId: order._id, orderNumber: order.orderNumber, total: order.total },
+  });
+
+  // Notify customer: order confirmed
+  if (orderCustomerRefId || orderCustomerId) {
+    await notify(io, {
+      type: 'order_created',
+      title: 'Order Confirmed',
+      body: `Your order ${order.orderNumber} has been received and is being processed.`,
+      customerId: String(orderCustomerRefId || orderCustomerId),
+      metadata: { orderId: order._id, orderNumber: order.orderNumber },
+    });
   }
 
   res.status(201).json({
@@ -952,6 +987,43 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     });
   }
 
+  // Notify customer of status change
+  {
+    const orderCustomerId = order.customerId || (order.customer ? String(order.customer) : null);
+    // Resolve customerId from User if only customer (User._id) is stored
+    let resolvedCustomerId = orderCustomerId;
+    if (!resolvedCustomerId && order.customer) {
+      const orderUser = await User.findById(order.customer).select('customerId').lean();
+      resolvedCustomerId = orderUser?.customerId ? String(orderUser.customerId) : null;
+    }
+    const statusLabels = {
+      confirmed: 'confirmed', 'picked-up': 'picked up', in_progress: 'in progress',
+      washing: 'being washed', ironing: 'being ironed', 'out-for-delivery': 'out for delivery',
+      ready: 'ready for pickup', delivered: 'delivered', completed: 'completed',
+      cancelled: 'cancelled',
+    };
+    const label = statusLabels[status] || status;
+    if (resolvedCustomerId) {
+      await notify(io, {
+        type: 'order_status_updated',
+        title: 'Order Update',
+        body: `Your order ${order.orderNumber} is now ${label}.`,
+        customerId: resolvedCustomerId,
+        metadata: { orderId: order._id, orderNumber: order.orderNumber, status },
+      });
+    }
+    // Notify admin room on cancellation
+    if (status === 'cancelled') {
+      await notify(io, {
+        type: 'order_cancelled',
+        title: 'Order Cancelled',
+        body: `Order ${order.orderNumber} has been cancelled.`,
+        room: 'admin',
+        metadata: { orderId: order._id, orderNumber: order.orderNumber },
+      });
+    }
+  }
+
   res.status(200).json({
     success: true,
     message: 'Order status updated successfully',
@@ -1331,6 +1403,38 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
         }
       }
     }
+  }
+
+  // Notifications
+  const cancelIo = req.app.get('io');
+  // Resolve customer's customerId for notification room
+  let cancelCustomerId = null;
+  if (order.customer) {
+    const cancelUser = await User.findById(order.customer).select('customerId').lean();
+    cancelCustomerId = cancelUser?.customerId ? String(cancelUser.customerId) : null;
+  }
+
+  // Notify admin room
+  await notify(cancelIo, {
+    type: 'order_cancelled',
+    title: 'Order Cancelled',
+    body: `Order ${order.orderNumber} has been cancelled. Reason: ${reason || 'not specified'}.`,
+    room: 'admin',
+    metadata: { orderId: order._id, orderNumber: order.orderNumber, reason },
+  });
+
+  // Notify customer
+  if (cancelCustomerId) {
+    const cancelBody = walletRefundIssued
+      ? `Your order ${order.orderNumber} has been cancelled. A refund of ₦${refundAmount.toLocaleString()} has been credited to your wallet.`
+      : `Your order ${order.orderNumber} has been cancelled.`;
+    await notify(cancelIo, {
+      type: 'order_cancelled',
+      title: 'Order Cancelled',
+      body: cancelBody,
+      customerId: cancelCustomerId,
+      metadata: { orderId: order._id, orderNumber: order.orderNumber, refundAmount: walletRefundIssued ? refundAmount : 0 },
+    });
   }
 
   res.status(200).json({

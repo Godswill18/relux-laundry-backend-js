@@ -6,7 +6,12 @@ const NotificationSchema = new mongoose.Schema(
     customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer' },
     type: {
       type: String,
-      enum: ['order_created', 'order_status_updated', 'order_due_soon', 'site_announcement', 'chat_message'],
+      enum: [
+        'order_created', 'order_status_updated', 'order_cancelled', 'order_due_soon',
+        'wallet_credited', 'referral_rewarded', 'points_earned', 'points_converted',
+        'shift_ending_soon',
+        'site_announcement', 'chat_message',
+      ],
       required: true,
     },
     channel: {
