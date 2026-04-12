@@ -12,6 +12,9 @@ const AttendanceSchema = new mongoose.Schema(
     deviceId: { type: String },
     geoLat: { type: Number },
     geoLng: { type: Number },
+    geoAccuracy: { type: Number },          // GPS accuracy in metres (reported by device)
+    distanceFromLocation: { type: Number }, // Calculated distance from work location (metres)
+    geofenceValid: { type: Boolean },       // true = within radius, false = outside, null = not checked
     autoClockOut: { type: Boolean, default: false },
   },
   { timestamps: true }

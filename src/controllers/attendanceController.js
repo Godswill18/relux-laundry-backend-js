@@ -1,12 +1,24 @@
 const Attendance = require('../models/Attendance.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { validateGeofence } = require('../utils/geofenceHelper.js');
 
 // @desc    Clock in
 // @route   POST /api/v1/attendance/clock-in
 // @access  Private
 exports.clockIn = asyncHandler(async (req, res, next) => {
-  const { shiftId, source, ipAddress, deviceId, geoLat, geoLng } = req.body;
+  const { shiftId, source, ipAddress, deviceId, geoLat, geoLng, geoAccuracy } = req.body;
+
+  // ── Geofence validation ───────────────────────────────────────────────────
+  const fence = await validateGeofence(
+    geoLat != null ? Number(geoLat) : null,
+    geoLng != null ? Number(geoLng) : null,
+    geoAccuracy != null ? Number(geoAccuracy) : null
+  );
+
+  if (!fence.allowed) {
+    return next(new AppError(fence.reason, 403, 'GEOFENCE_VIOLATION'));
+  }
 
   // Check if already clocked in without clocking out (ignore auto clock-outs —
   // those are treated as closed so the staff member can clock in again)
@@ -27,14 +39,17 @@ exports.clockIn = asyncHandler(async (req, res, next) => {
     source: source || 'app',
     ipAddress,
     deviceId,
-    geoLat,
-    geoLng,
+    geoLat: geoLat != null ? Number(geoLat) : undefined,
+    geoLng: geoLng != null ? Number(geoLng) : undefined,
+    geoAccuracy: geoAccuracy != null ? Number(geoAccuracy) : undefined,
+    distanceFromLocation: fence.distance ?? undefined,
+    geofenceValid: fence.geofenceConfigured ? true : undefined,
   });
 
   res.status(201).json({
     success: true,
     message: 'Clocked in successfully',
-    data: { attendance },
+    data: { attendance, distance: fence.distance },
   });
 });
 
@@ -42,6 +57,19 @@ exports.clockIn = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/attendance/clock-out
 // @access  Private
 exports.clockOut = asyncHandler(async (req, res, next) => {
+  const { geoLat, geoLng, geoAccuracy } = req.body;
+
+  // ── Geofence validation ───────────────────────────────────────────────────
+  const fence = await validateGeofence(
+    geoLat != null ? Number(geoLat) : null,
+    geoLng != null ? Number(geoLng) : null,
+    geoAccuracy != null ? Number(geoAccuracy) : null
+  );
+
+  if (!fence.allowed) {
+    return next(new AppError(fence.reason, 403, 'GEOFENCE_VIOLATION'));
+  }
+
   // First try to find a genuinely open attendance record
   let attendance = await Attendance.findOne({
     userId: req.user.id,
@@ -68,13 +96,18 @@ exports.clockOut = asyncHandler(async (req, res, next) => {
   }
 
   attendance.clockOutAt = new Date();
-  attendance.autoClockOut = false; // Staff manually confirmed clock-out
+  attendance.autoClockOut = false;
+  if (geoLat != null) attendance.geoLat = Number(geoLat);
+  if (geoLng != null) attendance.geoLng = Number(geoLng);
+  if (geoAccuracy != null) attendance.geoAccuracy = Number(geoAccuracy);
+  if (fence.distance != null) attendance.distanceFromLocation = fence.distance;
+  if (fence.geofenceConfigured) attendance.geofenceValid = true;
   await attendance.save();
 
   res.status(200).json({
     success: true,
     message: 'Clocked out successfully',
-    data: { attendance },
+    data: { attendance, distance: fence.distance },
   });
 });
 
