@@ -6,6 +6,7 @@ const {
   createService,
   updateService,
   deleteService,
+  reorderServices,
   getServiceCategories,
   createServiceCategory,
   updateServiceCategory,
@@ -61,6 +62,7 @@ router.delete('/delivery-zones/:id', protect, authorize('admin'), deleteDelivery
 // Services CRUD
 router.get('/', protect, getServices);
 router.post('/', protect, authorize('admin', 'manager'), createService);
+router.put('/reorder', protect, authorize('admin', 'manager'), reorderServices);
 router.get('/:id', protect, getService);
 router.put('/:id', protect, authorize('admin', 'manager'), updateService);
 router.delete('/:id', protect, authorize('admin'), deleteService);

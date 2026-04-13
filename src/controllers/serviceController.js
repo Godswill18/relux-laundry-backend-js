@@ -16,7 +16,7 @@ exports.getServices = asyncHandler(async (req, res, next) => {
     query.active = req.query.active === 'true';
   }
 
-  const services = await Service.find(query).sort('name');
+  const services = await Service.find(query).sort({ position: 1, createdAt: 1 });
 
   // Enrich each service with its active categories
   const serviceIds = services.map((s) => s._id);
@@ -75,12 +75,50 @@ exports.createService = asyncHandler(async (req, res, next) => {
     return next(new AppError('Service name already exists', 400));
   }
 
-  const service = await Service.create({ name, description, icon });
+  // Place new service at the bottom of the list
+  const last = await Service.findOne({}).sort({ position: -1 }).select('position');
+  const position = last ? last.position + 1 : 0;
+
+  const service = await Service.create({ name, description, icon, position });
 
   res.status(201).json({
     success: true,
     message: 'Service created successfully',
     data: { service },
+  });
+});
+
+// @desc    Reorder services
+// @route   PUT /api/v1/services/reorder
+// @access  Private (Admin/Manager)
+exports.reorderServices = asyncHandler(async (req, res, next) => {
+  const { order } = req.body; // [{ id, position }, ...]
+
+  if (!Array.isArray(order) || order.length === 0) {
+    return next(new AppError('order must be a non-empty array', 400));
+  }
+
+  // Validate no duplicate positions
+  const positions = order.map((o) => o.position);
+  if (new Set(positions).size !== positions.length) {
+    return next(new AppError('Duplicate positions in reorder request', 400));
+  }
+
+  await Service.bulkWrite(
+    order.map(({ id, position }) => ({
+      updateOne: {
+        filter: { _id: id },
+        update: { $set: { position } },
+      },
+    }))
+  );
+
+  // Return updated list in order
+  const services = await Service.find({}).sort({ position: 1, createdAt: 1 });
+  res.status(200).json({
+    success: true,
+    message: 'Services reordered',
+    data: { services },
   });
 });
 
@@ -125,8 +163,12 @@ exports.deleteService = asyncHandler(async (req, res, next) => {
     return next(new AppError('Service not found', 404));
   }
 
+  const deletedPosition = service.position;
   await ServiceCategory.deleteMany({ serviceId: service._id });
   await service.deleteOne();
+
+  // Re-compact: shift all services that were after the deleted one down by 1
+  await Service.updateMany({ position: { $gt: deletedPosition } }, { $inc: { position: -1 } });
 
   res.status(200).json({
     success: true,

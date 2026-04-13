@@ -6,6 +6,7 @@ const ServiceSchema = new mongoose.Schema(
     description: { type: String },
     icon: { type: String },
     active: { type: Boolean, default: true },
+    position: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
