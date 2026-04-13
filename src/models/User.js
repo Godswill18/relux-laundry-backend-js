@@ -54,12 +54,12 @@ const UserSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['customer', 'staff', 'admin', 'manager', 'receptionist'],
+      enum: ['customer', 'staff', 'admin', 'manager', 'delivery'],
       default: 'customer',
     },
     staffRole: {
       type: String,
-      enum: ['receptionist', 'washer', 'delivery', null],
+      enum: [,'washer', 'delivery', null],
     },
     address: String,
     city: String,

@@ -13,7 +13,7 @@ const AppError = require('../utils/appError.js');
 // @route   GET /api/v1/staff
 // @access  Private (Admin/Manager)
 exports.getStaff = asyncHandler(async (req, res, next) => {
-  let query = { role: { $in: ['staff', 'admin', 'manager'] } };
+  let query = { role: { $in: ['staff', 'admin', 'manager', 'delivery'] } };
 
   if (req.query.role && req.query.role !== 'all') {
     query.role = req.query.role;

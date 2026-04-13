@@ -59,6 +59,10 @@ const DEFAULT_ROLE_PERMISSIONS = {
     'VIEW_OWN_PAYSLIP',
     'VIEW_CHAT', 'RESPOND_CHAT',
   ],
+
+  delivery: [
+    'VIEW_ORDERS', 'UPDATE_ORDER_STATUS',
+  ],
 };
 
 /**
