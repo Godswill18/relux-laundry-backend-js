@@ -939,6 +939,10 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
+  if (order.status === 'cancelled') {
+    return next(new AppError('Cannot update status of a cancelled order', 400));
+  }
+
   // Update status
   order.status = status;
   if (notes) order.notes = notes;
@@ -1050,10 +1054,18 @@ exports.lookupByQR = asyncHandler(async (req, res, next) => {
     return next(new AppError('Invalid or unrecognized QR code', 404));
   }
 
+  const isCancelled = order.status === 'cancelled';
+
+  // Tell the frontend exactly what actions are permitted for this order.
+  // An empty array means the UI must show no action buttons at all.
+  const allowedActions = isCancelled
+    ? []
+    : ['updateStatus', 'updatePayment', 'assignStaff'];
+
   res.status(200).json({
     success: true,
-    message: 'Order found',
-    data: { order },
+    message: isCancelled ? 'This order has been cancelled' : 'Order found',
+    data: { order, allowedActions, isCancelled },
   });
 });
 
@@ -1218,6 +1230,10 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
 
   if (!order) {
     return next(new AppError('Order not found', 404));
+  }
+
+  if (order.status === 'cancelled') {
+    return next(new AppError('Cannot update payment on a cancelled order', 400));
   }
 
   order.payment.status = status;
