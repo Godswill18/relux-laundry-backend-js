@@ -588,10 +588,16 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
         }
       } else {
         query.status = st;
-        // Staff only see orders assigned to them — covers orders they created,
-        // orders they picked, and orders admin assigned to them
-        if (!isAdminRole) {
-          query.assignedStaff = req.user.id;
+        // Non-pending: all staff see ALL orders globally (full visibility).
+        // When ?myOrders=true: filter to only orders this staff is involved with.
+        if (!isAdminRole && req.query.myOrders === 'true') {
+          const staffId = req.user.id;
+          query.$or = [
+            { assignedStaff: staffId },
+            { pickupStaffId: staffId },
+            { deliveredBy: staffId },
+            { lastUpdatedById: staffId },
+          ];
         }
       }
     } else {
@@ -654,6 +660,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     .populate('assignedStaff', 'name phone staffRole email')
     .populate('pickupStaffId', 'name phone')
     .populate('deliveredBy', 'name phone')
+    .populate('lastUpdatedById', 'name')
     .populate('statusHistory.updatedBy', 'name')
     .sort('-createdAt')
     .skip(startIndex)
@@ -677,6 +684,9 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
 // @access  Private (staff, admin, manager)
 exports.getStaffCounts = asyncHandler(async (req, res) => {
   const staffId = req.user.id;
+  // scope=all → total orders per status across all staff
+  // scope=mine (default) → orders this staff is involved with
+  const scope = req.query.scope || 'mine';
 
   const STATUSES = [
     'pending', 'confirmed', 'picked-up', 'in_progress',
@@ -697,9 +707,20 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
           ],
         });
       }
-      // Count orders strictly by assignedStaff — covers staff-created (auto-assigned),
-      // picked orders, and admin-assigned orders
-      return Order.countDocuments({ status: s, assignedStaff: staffId });
+      if (scope === 'all') {
+        // Global count — all orders at this status regardless of assignment
+        return Order.countDocuments({ status: s });
+      }
+      // scope=mine: orders this staff is assigned to or has touched
+      return Order.countDocuments({
+        status: s,
+        $or: [
+          { assignedStaff: staffId },
+          { pickupStaffId: staffId },
+          { deliveredBy: staffId },
+          { lastUpdatedById: staffId },
+        ],
+      });
     })
   );
 
@@ -964,6 +985,9 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   order.status = status;
   if (notes) order.notes = notes;
 
+  // Track who last updated this order (for "Handled by" display)
+  order.lastUpdatedById = req.user.id;
+
   // Track who picked up / delivered the order
   if (status === 'picked-up') {
     order.actualPickupDate = order.actualPickupDate || new Date();
@@ -1010,7 +1034,12 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       stageDurationMinutes,
     });
     // Global broadcast so all connected clients (delivery, staff, admin) get live updates
-    io.emit('order:status-updated', { orderId: order._id, status });
+    io.emit('order:status-updated', {
+      orderId: order._id,
+      status,
+      updatedById: String(req.user.id),
+      updatedByName: req.user.name || '',
+    });
     io.emit('order:timer-updated', {
       orderId: order._id,
       status,
