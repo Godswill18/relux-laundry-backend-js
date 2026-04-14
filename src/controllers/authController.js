@@ -20,19 +20,35 @@ exports.register = asyncHandler(async (req, res, next) => {
     return next(new AppError('Please provide name, phone and password', 400));
   }
 
+  if (!email) {
+    return next(new AppError('Please provide your email address', 400));
+  }
+
   // Check if user already exists
   const existingUser = await User.findOne({ phone });
   if (existingUser) {
     return next(new AppError('Phone number already registered', 400));
   }
 
-  // Create user (convert empty strings to undefined for sparse unique fields)
+  const existingEmail = await User.findOne({ email: email.toLowerCase() });
+  if (existingEmail) {
+    return next(new AppError('Email address already registered', 400));
+  }
+
+  // Generate email verification OTP before creating the user
+  const otp = generateOTP();
+  const otpExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+  // Create user with emailVerified = false
   const user = await User.create({
     name,
-    email: email || undefined,
+    email: email.toLowerCase(),
     phone,
     password,
     role: role || 'customer',
+    emailVerified: false,
+    otp,
+    otpExpires,
   });
 
   // Auto-generate a unique referral code for this new user
@@ -62,7 +78,117 @@ exports.register = asyncHandler(async (req, res, next) => {
     }
   }
 
-  await sendTokenResponse(user, 201, res);
+  // Send verification OTP
+  const verifyHtml = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px;">
+      <h2 style="color:#1d4ed8;margin-bottom:8px;">Relux Laundry</h2>
+      <h3 style="margin-bottom:16px;">Verify Your Email</h3>
+      <p>Hi ${user.name},</p>
+      <p>Thanks for signing up! Use the code below to verify your email address. It expires in <strong>10 minutes</strong>.</p>
+      <div style="text-align:center;margin:32px 0;">
+        <span style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#1d4ed8;">${otp}</span>
+      </div>
+      <p>If you did not create this account, you can safely ignore this email.</p>
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
+      <p style="font-size:12px;color:#6b7280;">Relux Laundry &mdash; Your Trusted Laundry Partner</p>
+    </div>
+  `;
+
+  try {
+    await sendEmail({ to: user.email, subject: 'Verify your Relux Laundry email', html: verifyHtml });
+  } catch (_) {
+    // Don't block signup if email fails — user can resend
+  }
+
+  // Return pending state — no token until email is verified
+  res.status(201).json({
+    success: true,
+    message: 'Account created! Please check your email for a 6-digit verification code.',
+    data: {
+      email: user.email,
+      pendingVerification: true,
+      ...(process.env.NODE_ENV === 'development' && { otp }),
+    },
+  });
+});
+
+// @desc    Send (or resend) email verification OTP
+// @route   POST /api/v1/auth/resend-email-verification
+// @access  Public
+exports.resendEmailVerification = asyncHandler(async (req, res, next) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return next(new AppError('Please provide your email address', 400));
+  }
+
+  const user = await User.findOne({ email: email.toLowerCase() });
+
+  // Always respond success to prevent email enumeration
+  if (!user || user.emailVerified) {
+    return res.status(200).json({ success: true, message: 'If that email is pending verification, a new code has been sent.' });
+  }
+
+  const otp = generateOTP();
+  user.otp = otp;
+  user.otpExpires = Date.now() + 10 * 60 * 1000;
+  await user.save({ validateBeforeSave: false });
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px;">
+      <h2 style="color:#1d4ed8;margin-bottom:8px;">Relux Laundry</h2>
+      <h3 style="margin-bottom:16px;">Your New Verification Code</h3>
+      <p>Hi ${user.name},</p>
+      <p>Here is your new email verification code. It expires in <strong>10 minutes</strong>.</p>
+      <div style="text-align:center;margin:32px 0;">
+        <span style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#1d4ed8;">${otp}</span>
+      </div>
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
+      <p style="font-size:12px;color:#6b7280;">Relux Laundry</p>
+    </div>
+  `;
+
+  try {
+    await sendEmail({ to: user.email, subject: 'Your Relux Laundry verification code', html });
+  } catch (_) {
+    return next(new AppError('Email could not be sent. Please try again later.', 500));
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'If that email is pending verification, a new code has been sent.',
+    ...(process.env.NODE_ENV === 'development' && { otp }),
+  });
+});
+
+// @desc    Verify email with OTP
+// @route   POST /api/v1/auth/verify-email
+// @access  Public
+exports.verifyEmail = asyncHandler(async (req, res, next) => {
+  const { email, otp } = req.body;
+
+  if (!email || !otp) {
+    return next(new AppError('Please provide email and verification code', 400));
+  }
+
+  const user = await User.findOne({
+    email: email.toLowerCase(),
+    otp,
+    otpExpires: { $gt: Date.now() },
+  });
+
+  if (!user) {
+    return next(new AppError('Invalid or expired verification code', 400));
+  }
+
+  // Mark email as verified and clear OTP
+  user.emailVerified = true;
+  user.otp = undefined;
+  user.otpExpires = undefined;
+  await user.save({ validateBeforeSave: false });
+
+  // Now log the user in by returning a token
+  await sendTokenResponse(user, 200, res);
 });
 
 // @desc    Sync Clerk user to MongoDB (create if not exists)
@@ -173,7 +299,7 @@ exports.login = asyncHandler(async (req, res, next) => {
     return next(new AppError('Your account has been deactivated. Contact an administrator.', 403, ERROR_CODES.ACCOUNT_DEACTIVATED));
   }
 
-  // Shift-based login restriction for staff role only
+// Shift-based login restriction for staff role only
   // Admin and manager bypass shift checks entirely
   if (user.role === 'staff') {
     const today = getTodayWAT();
@@ -389,8 +515,9 @@ exports.forgotPassword = asyncHandler(async (req, res, next) => {
         <span style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#1d4ed8;">${otp}</span>
       </div>
       <p>If you did not request this, you can safely ignore this email.</p>
+      <p><b>Do not reply to this email.</b></p>
       <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
-      <p style="font-size:12px;color:#6b7280;">Relux Laundry &mdash; Admin Dashboard</p>
+      <p style="font-size:12px;color:#6b7280;">Relux Laundry &mdash;</p>
     </div>
   `;
 

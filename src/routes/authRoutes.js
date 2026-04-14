@@ -10,6 +10,8 @@ const {
   logout,
   requestOTP,
   verifyOTP,
+  verifyEmail,
+  resendEmailVerification,
   addAddress,
   forgotPassword,
   resetPassword,
@@ -24,6 +26,8 @@ router.post('/login', authLimiter, login);
 // router.post('/clerk-sync', clerkSync); // Clerk disabled
 router.post('/request-otp', authLimiter, requestOTP);
 router.post('/verify-otp', authLimiter, verifyOTP);
+router.post('/verify-email', authLimiter, verifyEmail);
+router.post('/resend-email-verification', authLimiter, resendEmailVerification);
 router.post('/forgot-password', authLimiter, forgotPassword);
 router.post('/reset-password', authLimiter, resetPassword);
 
