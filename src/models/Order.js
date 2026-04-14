@@ -199,6 +199,14 @@ const OrderSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
     },
+    pickupStaffId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    deliveredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
     pricing: {
       type: PricingSchema,
     },

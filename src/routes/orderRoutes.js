@@ -11,6 +11,9 @@ const {
   updateOrderStatus,
   assignStaff,
   acceptOrder,
+  acceptPickup,
+  acceptDelivery,
+  scanPickup,
   updatePayment,
   payBalanceFromWallet,
   cancelOrder,
@@ -36,16 +39,19 @@ router.route('/')
 router.get('/counts',       authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
 router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
 router.get('/my-stats',     authorize('customer'), getMyStats);
-router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager'), lookupByQR);
-router.post('/scan-delivery', authorize('staff', 'admin', 'manager'), scanDelivery);
+router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager', 'delivery'), lookupByQR);
+router.post('/scan-delivery', authorize('staff', 'admin', 'manager', 'delivery'), scanDelivery);
+router.post('/scan-pickup',   authorize('staff', 'admin', 'manager', 'delivery'), scanPickup);
 
 router.route('/:id')
   .get(getOrder)
   .put(authorize('staff', 'admin', 'manager'), updateOrder);
 
-router.patch('/:id/status', authorize('staff', 'admin', 'manager'), updateOrderStatus);
-router.patch('/:id/accept', authorize('staff', 'admin', 'manager'), acceptOrder);
-router.patch('/:id/assign', authorize('admin', 'manager'), assignStaff);
+router.patch('/:id/status',           authorize('staff', 'admin', 'manager', 'delivery'), updateOrderStatus);
+router.patch('/:id/accept',           authorize('staff', 'admin', 'manager'), acceptOrder);
+router.patch('/:id/accept-pickup',    authorize('delivery', 'admin', 'manager'), acceptPickup);
+router.patch('/:id/accept-delivery',  authorize('delivery', 'admin', 'manager'), acceptDelivery);
+router.patch('/:id/assign',           authorize('admin', 'manager'), assignStaff);
 router.put('/:id/payment', authorize('staff', 'admin', 'manager'), updatePayment);
 router.post('/:id/pay-balance', authorize('staff', 'admin', 'manager'), payBalanceFromWallet);
 router.put('/:id/cancel', cancelOrder);

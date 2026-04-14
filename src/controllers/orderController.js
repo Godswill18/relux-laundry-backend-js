@@ -616,6 +616,21 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       if (req.query.unassigned === 'true') {
         query.assignedStaff = { $exists: false };
       }
+
+      // Filter by who delivered
+      if (req.query.deliveredBy === 'me') {
+        query.deliveredBy = req.user.id;
+      } else if (req.query.deliveredBy) {
+        query.deliveredBy = req.query.deliveredBy;
+      }
+    }
+
+    // Delivery-role: restrict to delivery-type orders only
+    if (req.user.role === 'delivery') {
+      query.$or = [
+        { orderType: 'pickup-delivery' },
+        { deliveryAddress: { $exists: true, $ne: null } },
+      ];
     }
   }
 
@@ -637,6 +652,8 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       },
     })
     .populate('assignedStaff', 'name phone staffRole email')
+    .populate('pickupStaffId', 'name phone')
+    .populate('deliveredBy', 'name phone')
     .populate('statusHistory.updatedBy', 'name')
     .sort('-createdAt')
     .skip(startIndex)
@@ -947,6 +964,16 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   order.status = status;
   if (notes) order.notes = notes;
 
+  // Track who picked up / delivered the order
+  if (status === 'picked-up') {
+    order.actualPickupDate = order.actualPickupDate || new Date();
+    if (!order.pickupStaffId) order.pickupStaffId = req.user.id;
+  }
+  if (status === 'delivered') {
+    order.actualDeliveryDate = order.actualDeliveryDate || new Date();
+    order.deliveredBy = req.user.id;
+  }
+
   // Compute stageDeadlineAt — always uses defaults if no DB document exists yet
   const { stageDeadlineAt, stageDurationMinutes } = await computeStageDeadline(status);
   // null clears the field in MongoDB; undefined is ignored by Mongoose save
@@ -982,7 +1009,8 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       stageDeadlineAt,
       stageDurationMinutes,
     });
-    // Also broadcast to admin/staff rooms for list-view countdown updates
+    // Global broadcast so all connected clients (delivery, staff, admin) get live updates
+    io.emit('order:status-updated', { orderId: order._id, status });
     io.emit('order:timer-updated', {
       orderId: order._id,
       status,
@@ -1095,8 +1123,18 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
     return next(new AppError('This order has been cancelled and cannot be delivered', 400));
   }
 
+  // Only the assigned delivery staff (or admin/manager) can confirm delivery
+  const isAdminRole = ['admin', 'manager'].includes(req.user.role);
+  if (!isAdminRole && order.deliveredBy) {
+    const assignedId = String(order.deliveredBy._id || order.deliveredBy);
+    if (assignedId !== String(req.user.id)) {
+      return next(new AppError('Only the assigned delivery staff can confirm this delivery', 403));
+    }
+  }
+
   order.status = 'delivered';
   order.actualDeliveryDate = new Date();
+  order.deliveredBy = req.user.id;
   order.statusHistory.push({
     status: 'delivered',
     updatedBy: req.user.id,
@@ -1216,6 +1254,156 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Order accepted successfully',
+    data: { order },
+  });
+});
+
+// @desc    Delivery staff claims an order for PICKUP (atomic lock)
+// @route   PATCH /api/v1/orders/:id/accept-pickup
+// @access  Private (delivery, admin, manager)
+exports.acceptPickup = asyncHandler(async (req, res, next) => {
+  // Atomic findOneAndUpdate prevents two staff claiming simultaneously
+  const order = await Order.findOneAndUpdate(
+    {
+      _id: req.params.id,
+      status: 'confirmed',
+      pickupStaffId: { $exists: false },
+    },
+    {
+      $set: { pickupStaffId: req.user.id },
+    },
+    { new: true }
+  )
+    .populate('customer', 'name phone email')
+    .populate('pickupStaffId', 'name phone');
+
+  if (!order) {
+    // Either not found or already claimed
+    const existing = await Order.findById(req.params.id).select('pickupStaffId status').lean();
+    if (!existing) return next(new AppError('Order not found', 404));
+    if (existing.pickupStaffId) return next(new AppError('This pickup has already been claimed by another staff member', 409));
+    return next(new AppError('Order is not available for pickup', 400));
+  }
+
+  order.statusHistory.push({
+    status: order.status,
+    updatedBy: req.user.id,
+    notes: `Pickup claimed by delivery staff: ${req.user.name}`,
+  });
+  await order.save();
+
+  const io = req.app.get('io');
+  if (io) {
+    io.emit('order:pickup-claimed', {
+      orderId: order._id,
+      pickupStaffId: req.user.id,
+      pickupStaffName: req.user.name,
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Pickup claimed successfully',
+    data: { order },
+  });
+});
+
+// @desc    Delivery staff claims an order for DELIVERY (atomic lock)
+// @route   PATCH /api/v1/orders/:id/accept-delivery
+// @access  Private (delivery, admin, manager)
+exports.acceptDelivery = asyncHandler(async (req, res, next) => {
+  // Atomic findOneAndUpdate prevents two staff claiming simultaneously
+  const order = await Order.findOneAndUpdate(
+    {
+      _id: req.params.id,
+      status: 'ready',
+      deliveredBy: { $exists: false },
+    },
+    {
+      $set: { deliveredBy: req.user.id, status: 'out-for-delivery' },
+    },
+    { new: true }
+  )
+    .populate('customer', 'name phone email')
+    .populate('deliveredBy', 'name phone');
+
+  if (!order) {
+    const existing = await Order.findById(req.params.id).select('deliveredBy status').lean();
+    if (!existing) return next(new AppError('Order not found', 404));
+    if (existing.deliveredBy) return next(new AppError('This delivery has already been claimed by another staff member', 409));
+    return next(new AppError('Order is not available for delivery', 400));
+  }
+
+  order.statusHistory.push({
+    status: 'out-for-delivery',
+    updatedBy: req.user.id,
+    notes: `Delivery accepted and marked out-for-delivery by: ${req.user.name}`,
+  });
+  await order.save();
+
+  const io = req.app.get('io');
+  if (io) {
+    io.emit('order:delivery-claimed', {
+      orderId: order._id,
+      deliveredBy: req.user.id,
+      deliveryStaffName: req.user.name,
+    });
+    io.emit('order:status-updated', { orderId: order._id, status: 'out-for-delivery' });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Delivery claimed successfully',
+    data: { order },
+  });
+});
+
+// @desc    Confirm pickup via barcode scan → status: picked-up
+// @route   POST /api/v1/orders/scan-pickup
+// @access  Private (delivery, staff, admin, manager)
+exports.scanPickup = asyncHandler(async (req, res, next) => {
+  const { qrCode } = req.body;
+  if (!qrCode) return next(new AppError('QR code is required', 400));
+
+  const order = await Order.findOne({ qrCode })
+    .populate('customer', 'name phone email')
+    .populate('pickupStaffId', 'name');
+
+  if (!order) return next(new AppError('Invalid or unrecognized QR code', 404));
+  if (order.status === 'cancelled') return next(new AppError('This order has been cancelled', 400));
+  if (!['confirmed', 'pending'].includes(order.status)) {
+    return next(new AppError(`Cannot confirm pickup: order is currently "${order.status}"`, 400));
+  }
+
+  // Only the assigned pickup staff (or admin/manager) can scan
+  const isAdminRole = ['admin', 'manager'].includes(req.user.role);
+  if (!isAdminRole && order.pickupStaffId) {
+    const assignedId = String(order.pickupStaffId._id || order.pickupStaffId);
+    if (assignedId !== String(req.user.id)) {
+      return next(new AppError('Only the assigned pickup staff can confirm this pickup', 403));
+    }
+  }
+
+  order.status = 'picked-up';
+  order.actualPickupDate = new Date();
+  if (!order.pickupStaffId) order.pickupStaffId = req.user.id;
+  order.statusHistory.push({
+    status: 'picked-up',
+    updatedBy: req.user.id,
+    notes: 'Pickup confirmed via barcode scan',
+    timestamp: new Date(),
+  });
+  await order.save();
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: 'picked-up' });
+    io.emit('order:status-updated', { orderId: order._id, status: 'picked-up' });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Order picked up successfully',
     data: { order },
   });
 });
