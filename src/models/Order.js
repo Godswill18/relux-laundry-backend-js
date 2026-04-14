@@ -174,11 +174,18 @@ const OrderSchema = new mongoose.Schema(
     deliveryFee: { type: Number, default: 0 },
     rush: { type: Boolean, default: false },
     fragrance: { type: Boolean, default: false },
+    // Legacy string field kept for backward compat — use serviceLevelId for new orders
     serviceLevel: {
       type: String,
-      enum: ['standard', 'express', 'premium'],
       default: 'standard',
     },
+    // Dynamic service level reference + snapshots (new orders use these)
+    serviceLevelId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ServiceLevelConfig',
+    },
+    serviceLevelName: { type: String },         // snapshot — name at time of order creation
+    serviceLevelPercentage: { type: Number, default: 0 }, // snapshot — percentage at time of order creation
     serviceLevelStartedAt: Date,
     serviceLevelDueAt: Date,
     priorityHandling: { type: Boolean, default: false },

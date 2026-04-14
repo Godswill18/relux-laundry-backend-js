@@ -216,9 +216,23 @@ async function recoverPendingPaystackTransactions(io) {
   }
 }
 
+// Drop stale indexes left over from schema migrations
+async function dropLegacyIndexes() {
+  try {
+    const col = mongoose.connection.collection('servicelevelconfigs');
+    await col.dropIndex('level_1');
+    logger.info('[migration] Dropped legacy index: servicelevelconfigs.level_1');
+  } catch (e) {
+    // Index doesn't exist — nothing to do
+  }
+}
+
 mongoose.connection.once('open', () => {
   console.log('✅ MongoDB Connected Successfully');
   console.log(`🚀 Server Environment: ${process.env.NODE_ENV || 'development'}`);
+
+  // Clean up stale indexes from previous schema versions
+  dropLegacyIndexes();
 
   server.listen(PORT, () => {
     logger.info(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);

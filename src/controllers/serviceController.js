@@ -398,7 +398,7 @@ exports.getServiceLevels = asyncHandler(async (req, res, next) => {
     query.active = req.query.active === 'true';
   }
 
-  const levels = await ServiceLevelConfig.find(query).sort('displayOrder');
+  const levels = await ServiceLevelConfig.find(query).sort({ displayOrder: 1, createdAt: 1 });
 
   res.status(200).json({
     success: true,
@@ -411,15 +411,26 @@ exports.getServiceLevels = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/services/levels
 // @access  Private (Admin/Manager)
 exports.createServiceLevel = asyncHandler(async (req, res, next) => {
-  const { name, code, multiplier, description, turnaroundTime, displayOrder } = req.body;
+  const { name, percentageAdjustment, description, displayOrder } = req.body;
+
+  if (!name || !name.trim()) {
+    return next(new AppError('Service level name is required', 400));
+  }
+
+  if (percentageAdjustment == null || isNaN(Number(percentageAdjustment)) || Number(percentageAdjustment) < 0) {
+    return next(new AppError('Percentage adjustment must be a non-negative number', 400));
+  }
+
+  const existing = await ServiceLevelConfig.findOne({ name: name.trim() });
+  if (existing) {
+    return next(new AppError(`A service level named "${name.trim()}" already exists`, 400));
+  }
 
   const level = await ServiceLevelConfig.create({
-    name,
-    code,
-    multiplier,
-    description,
-    turnaroundTime,
-    displayOrder,
+    name: name.trim(),
+    percentageAdjustment: Number(percentageAdjustment),
+    description: description || '',
+    displayOrder: displayOrder ?? 0,
   });
 
   res.status(201).json({
@@ -433,33 +444,35 @@ exports.createServiceLevel = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/services/levels/:id
 // @access  Private (Admin/Manager)
 exports.updateServiceLevel = asyncHandler(async (req, res, next) => {
-  const fieldsToUpdate = {
-    name: req.body.name,
-    code: req.body.code,
-    multiplier: req.body.multiplier,
-    description: req.body.description,
-    turnaroundTime: req.body.turnaroundTime,
-    displayOrder: req.body.displayOrder,
-    active: req.body.active,
-  };
-
-  Object.keys(fieldsToUpdate).forEach(
-    (key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]
-  );
-
-  const level = await ServiceLevelConfig.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
-    new: true,
-    runValidators: true,
-  });
-
+  const level = await ServiceLevelConfig.findById(req.params.id);
   if (!level) {
     return next(new AppError('Service level not found', 404));
   }
 
+  // Duplicate name check (exclude self)
+  if (req.body.name && req.body.name.trim() !== level.name) {
+    const dup = await ServiceLevelConfig.findOne({ name: req.body.name.trim() });
+    if (dup) {
+      return next(new AppError(`A service level named "${req.body.name.trim()}" already exists`, 400));
+    }
+  }
+
+  const fieldsToUpdate = {};
+  if (req.body.name               !== undefined) fieldsToUpdate.name                = req.body.name.trim();
+  if (req.body.percentageAdjustment !== undefined) fieldsToUpdate.percentageAdjustment = Number(req.body.percentageAdjustment);
+  if (req.body.description        !== undefined) fieldsToUpdate.description         = req.body.description;
+  if (req.body.displayOrder       !== undefined) fieldsToUpdate.displayOrder        = req.body.displayOrder;
+  if (req.body.active             !== undefined) fieldsToUpdate.active              = req.body.active;
+
+  const updated = await ServiceLevelConfig.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
+    new: true,
+    runValidators: true,
+  });
+
   res.status(200).json({
     success: true,
     message: 'Service level updated successfully',
-    data: { level },
+    data: { level: updated },
   });
 });
 
@@ -467,10 +480,20 @@ exports.updateServiceLevel = asyncHandler(async (req, res, next) => {
 // @route   DELETE /api/v1/services/levels/:id
 // @access  Private (Admin)
 exports.deleteServiceLevel = asyncHandler(async (req, res, next) => {
-  const level = await ServiceLevelConfig.findById(req.params.id);
+  const Order = require('../models/Order.js');
 
+  const level = await ServiceLevelConfig.findById(req.params.id);
   if (!level) {
     return next(new AppError('Service level not found', 404));
+  }
+
+  // Guard: prevent deletion if orders reference this level
+  const inUse = await Order.countDocuments({ serviceLevelId: level._id });
+  if (inUse > 0) {
+    return next(new AppError(
+      `Cannot delete "${level.name}" — it is used by ${inUse} order(s). Deactivate it instead.`,
+      400
+    ));
   }
 
   await level.deleteOne();

@@ -2,15 +2,31 @@ const mongoose = require('mongoose');
 
 const ServiceLevelConfigSchema = new mongoose.Schema(
   {
-    level: {
+    name: {
       type: String,
-      enum: ['standard', 'express', 'premium'],
       required: true,
       unique: true,
+      trim: true,
     },
-    priceMultiplier: { type: Number, default: 100 },
-    durationHours: { type: Number, default: 48 },
-    active: { type: Boolean, default: true },
+    // Percentage added to the base order total.
+    // 0 = no adjustment (normal service), 20 = +20%, 50 = +50%, etc.
+    percentageAdjustment: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    description: {
+      type: String,
+      default: '',
+    },
+    displayOrder: {
+      type: Number,
+      default: 0,
+    },
+    active: {
+      type: Boolean,
+      default: true,
+    },
   },
   { timestamps: true }
 );

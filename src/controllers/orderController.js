@@ -2,6 +2,7 @@ const Order = require('../models/Order.js');
 const OrderItem = require('../models/OrderItem.js');
 const OrderMedia = require('../models/OrderMedia.js');
 const Customer = require('../models/Customer.js');
+const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
 const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
@@ -314,6 +315,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     customerId: bodyCustomerId,
     assignedStaff,
     serviceLevel,
+    serviceLevelId,
     pickupMethod,
     rush,
     stainRemoval,
@@ -377,11 +379,32 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // Service-level surcharge: EXPRESS = +50% of subtotal, PREMIUM = +100%
-  const SERVICE_LEVEL_MULTIPLIERS = { standard: 1, express: 1.5, premium: 2 };
-  const slMultiplier = SERVICE_LEVEL_MULTIPLIERS[(serviceLevel || 'standard').toLowerCase()] || 1;
+  // Service-level surcharge: look up percentage from DB (dynamic, admin-controlled)
+  let resolvedServiceLevelId   = null;
+  let resolvedServiceLevelName = serviceLevel || 'standard';
+  let serviceLevelPct          = 0; // percentage adjustment, e.g. 20 = +20%
+
+  if (serviceLevelId) {
+    const slDoc = await ServiceLevelConfig.findById(serviceLevelId).lean();
+    if (slDoc) {
+      resolvedServiceLevelId   = slDoc._id;
+      resolvedServiceLevelName = slDoc.name;
+      serviceLevelPct          = slDoc.percentageAdjustment || 0;
+    }
+  } else if (serviceLevel) {
+    // Fallback: match by name (case-insensitive) for backward compat
+    const slDoc = await ServiceLevelConfig.findOne({
+      name: { $regex: new RegExp(`^${serviceLevel}$`, 'i') },
+    }).lean();
+    if (slDoc) {
+      resolvedServiceLevelId   = slDoc._id;
+      resolvedServiceLevelName = slDoc.name;
+      serviceLevelPct          = slDoc.percentageAdjustment || 0;
+    }
+  }
+
   const baseSubtotal = pricedItems.reduce((acc, item) => acc + (item.unitPrice || 0) * (item.quantity || 1), 0);
-  const serviceFee = Math.round(baseSubtotal * (slMultiplier - 1) * 100) / 100;
+  const serviceFee   = Math.round(baseSubtotal * serviceLevelPct / 100 * 100) / 100;
 
   // Add-ons fee: stain removal ₦300, fragrance ₦200
   const addOnsFee = (stainRemoval ? 300 : 0) + (fragrance ? 200 : 0);
@@ -420,7 +443,10 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     deliveryDate: pickupMethod && pickupMethod.toLowerCase() === 'delivery' ? (deliveryDate || pickupDate) : undefined,
     scheduledPickupTime: pickupMethod && pickupMethod.toLowerCase() !== 'drop_off' ? scheduledPickupTime : undefined,
     specialInstructions,
-    serviceLevel: serviceLevel || 'standard',
+    serviceLevel: resolvedServiceLevelName,
+    serviceLevelId: resolvedServiceLevelId || undefined,
+    serviceLevelName: resolvedServiceLevelName,
+    serviceLevelPercentage: serviceLevelPct,
     pickupMethod: pickupMethod || undefined,
     rush: rush || false,
     stainRemoval: stainRemoval || false,
@@ -661,6 +687,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     .populate('pickupStaffId', 'name phone')
     .populate('deliveredBy', 'name phone')
     .populate('lastUpdatedById', 'name')
+    .populate('serviceLevelId', 'name percentageAdjustment')
     .populate('statusHistory.updatedBy', 'name')
     .sort('-createdAt')
     .skip(startIndex)
@@ -775,6 +802,7 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
       },
     })
     .populate('assignedStaff', 'name phone staffRole email avatar')
+    .populate('serviceLevelId', 'name percentageAdjustment')
     .populate('statusHistory.updatedBy', 'name role')
     .populate('deliveryZoneId', 'name fee rushFee radiusKm')
     .populate('pickupWindowId', 'startTime endTime dayOfWeek baseFee');
@@ -826,7 +854,8 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
   const scalarFields = [
     'serviceType', 'orderType', 'pickupAddress', 'deliveryAddress',
     'pickupDate', 'deliveryDate', 'scheduledPickupTime', 'specialInstructions',
-    'serviceLevel', 'pickupMethod', 'rush', 'stainRemoval', 'fragrance',
+    'serviceLevel', 'serviceLevelId', 'serviceLevelName', 'serviceLevelPercentage',
+    'pickupMethod', 'rush', 'stainRemoval', 'fragrance',
     'notes', 'walkInCustomer', 'assignedStaff', 'paymentStatus',
   ];
   scalarFields.forEach((field) => {
@@ -857,12 +886,21 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     );
     order.items = pricedItems;
 
-    // Recalculate full pricing
-    const currentServiceLevel = req.body.serviceLevel || order.serviceLevel || 'standard';
-    const SL_MULTIPLIERS = { standard: 1, express: 1.5, premium: 2 };
-    const slMultiplier = SL_MULTIPLIERS[currentServiceLevel.toLowerCase()] || 1;
+    // Recalculate full pricing — look up service level from DB
+    const currentSLId = req.body.serviceLevelId || order.serviceLevelId;
+    const currentSLName = req.body.serviceLevel || order.serviceLevel || 'standard';
+    let updateSLPct = order.serviceLevelPercentage || 0;
+    if (currentSLId) {
+      const slDoc = await ServiceLevelConfig.findById(currentSLId).lean();
+      if (slDoc) updateSLPct = slDoc.percentageAdjustment || 0;
+    } else {
+      const slDoc = await ServiceLevelConfig.findOne({
+        name: { $regex: new RegExp(`^${currentSLName}$`, 'i') },
+      }).lean();
+      if (slDoc) updateSLPct = slDoc.percentageAdjustment || 0;
+    }
     const baseSubtotal = pricedItems.reduce((acc, i) => acc + (i.unitPrice || 0) * (i.quantity || 1), 0);
-    const serviceFee = Math.round(baseSubtotal * (slMultiplier - 1) * 100) / 100;
+    const serviceFee = Math.round(baseSubtotal * updateSLPct / 100 * 100) / 100;
 
     const rushVal     = req.body.rush      !== undefined ? req.body.rush      : order.rush;
     const stainVal    = req.body.stainRemoval !== undefined ? req.body.stainRemoval : order.stainRemoval;
