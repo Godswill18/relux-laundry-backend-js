@@ -40,7 +40,11 @@ const { apiLimiter } = require('./middleware/rateLimiter.js');
 const app = express();
 
 // Serve uploaded files (images, etc.)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Set CORP header so browsers allow cross-origin image loads from the frontend
+app.use('/uploads', (req, res, next) => {
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}, express.static(path.join(__dirname, 'uploads')));
 
 // Webhook routes (must be before body parsers - needs raw body for Svix signature verification)
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRoutes);
