@@ -3,6 +3,7 @@ const OrderItem = require('../models/OrderItem.js');
 const OrderMedia = require('../models/OrderMedia.js');
 const Customer = require('../models/Customer.js');
 const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
+const Addon = require('../models/Addon.js');
 const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
@@ -320,6 +321,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     rush,
     stainRemoval,
     fragrance,
+    addons: addonsPayload,
     pickupFee: bodyPickupFee,
     discount: bodyDiscount,
   } = req.body;
@@ -406,8 +408,27 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   const baseSubtotal = pricedItems.reduce((acc, item) => acc + (item.unitPrice || 0) * (item.quantity || 1), 0);
   const serviceFee   = Math.round(baseSubtotal * serviceLevelPct / 100 * 100) / 100;
 
-  // Add-ons fee: stain removal ₦300, fragrance ₦200
-  const addOnsFee = (stainRemoval ? 300 : 0) + (fragrance ? 200 : 0);
+  // Add-ons fee: resolve from DB — dynamic, admin-controlled
+  let addOnsFee = 0;
+  const resolvedAddons = [];
+  if (Array.isArray(addonsPayload) && addonsPayload.length > 0) {
+    for (const a of addonsPayload) {
+      if (!a.addonId) continue;
+      const addonDoc = await Addon.findById(a.addonId).lean();
+      if (!addonDoc || !addonDoc.active) continue;
+      const calculatedAmount = addonDoc.type === 'fixed'
+        ? addonDoc.value
+        : Math.round(baseSubtotal * addonDoc.value / 100);
+      addOnsFee += calculatedAmount;
+      resolvedAddons.push({
+        addonId: addonDoc._id,
+        name: addonDoc.name,
+        type: addonDoc.type,
+        value: addonDoc.value,
+        calculatedAmount,
+      });
+    }
+  }
 
   // pickupFee: frontend passes it at top-level or inside pricing object
   const resolvedPickupFee = bodyPickupFee || (pricing && pricing.pickupFee) || 0;
@@ -451,6 +472,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     rush: rush || false,
     stainRemoval: stainRemoval || false,
     fragrance: fragrance || false,
+    addons: resolvedAddons,
     // Staff-created walk-in orders → auto-assigned + skip pending (go straight to confirmed)
     // Admin/manager-created and online orders → unassigned pending pool for staff to pick
     assignedStaff: (req.user.role === 'staff' && isOffline)
@@ -902,10 +924,32 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     const baseSubtotal = pricedItems.reduce((acc, i) => acc + (i.unitPrice || 0) * (i.quantity || 1), 0);
     const serviceFee = Math.round(baseSubtotal * updateSLPct / 100 * 100) / 100;
 
-    const rushVal     = req.body.rush      !== undefined ? req.body.rush      : order.rush;
-    const stainVal    = req.body.stainRemoval !== undefined ? req.body.stainRemoval : order.stainRemoval;
-    const fragranceVal = req.body.fragrance !== undefined ? req.body.fragrance : order.fragrance;
-    const addOnsFee   = (stainVal ? 300 : 0) + (fragranceVal ? 200 : 0);
+    // Resolve add-ons fee from DB (or fall back to existing if not provided)
+    let addOnsFee = 0;
+    if (Array.isArray(req.body.addons)) {
+      const addonsForUpdate = [];
+      for (const a of req.body.addons) {
+        if (!a.addonId) continue;
+        const addonDoc = await Addon.findById(a.addonId).lean();
+        if (!addonDoc || !addonDoc.active) continue;
+        const base = pricedItems.reduce((acc, i) => acc + (i.unitPrice || 0) * (i.quantity || 1), 0);
+        const calculatedAmount = addonDoc.type === 'fixed'
+          ? addonDoc.value
+          : Math.round(base * addonDoc.value / 100);
+        addOnsFee += calculatedAmount;
+        addonsForUpdate.push({
+          addonId: addonDoc._id,
+          name: addonDoc.name,
+          type: addonDoc.type,
+          value: addonDoc.value,
+          calculatedAmount,
+        });
+      }
+      order.addons = addonsForUpdate;
+    } else {
+      // No addons change — preserve existing add-ons fee from pricing
+      addOnsFee = order.pricing?.addOnsFee || 0;
+    }
 
     const pickupFee   = order.pricing?.pickupFee   || 0;
     const deliveryFee = order.pricing?.deliveryFee || 0;

@@ -27,6 +27,10 @@ const {
   createDeliveryZone,
   updateDeliveryZone,
   deleteDeliveryZone,
+  getAddons,
+  createAddon,
+  updateAddon,
+  deleteAddon,
 } = require('../controllers/serviceController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
@@ -56,6 +60,12 @@ router.get('/delivery-zones', protect, getDeliveryZones);
 router.post('/delivery-zones', protect, authorize('admin', 'manager'), createDeliveryZone);
 router.put('/delivery-zones/:id', protect, authorize('admin', 'manager'), updateDeliveryZone);
 router.delete('/delivery-zones/:id', protect, authorize('admin'), deleteDeliveryZone);
+
+// Add-on routes
+router.get('/addons', protect, getAddons);
+router.post('/addons', protect, authorize('admin', 'manager'), createAddon);
+router.put('/addons/:id', protect, authorize('admin', 'manager'), updateAddon);
+router.delete('/addons/:id', protect, authorize('admin'), deleteAddon);
 
 // ---- Parameterized routes come after static routes ----
 

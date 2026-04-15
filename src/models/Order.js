@@ -1,5 +1,15 @@
 const mongoose = require('mongoose');
 
+// Snapshot of a selected add-on at the time of order creation.
+// Stored inline so future edits to the Addon doc don't change past orders.
+const OrderAddonSchema = new mongoose.Schema({
+  addonId:         { type: mongoose.Schema.Types.ObjectId, ref: 'Addon' },
+  name:            { type: String },   // snapshot
+  type:            { type: String },   // 'fixed' | 'percentage' snapshot
+  value:           { type: Number },   // snapshot value (₦ or %)
+  calculatedAmount:{ type: Number, default: 0 }, // resolved ₦ amount for this order
+}, { _id: false });
+
 const OrderItemSchema = new mongoose.Schema({
   itemType: { type: String, required: true },
   // Per-item service type (e.g. wash-fold, wash-iron, iron-only, dry-clean)
@@ -174,6 +184,8 @@ const OrderSchema = new mongoose.Schema(
     deliveryFee: { type: Number, default: 0 },
     rush: { type: Boolean, default: false },
     fragrance: { type: Boolean, default: false },
+    // Dynamic add-ons: snapshots of selected add-ons at time of order creation
+    addons: { type: [OrderAddonSchema], default: [] },
     // Legacy string field kept for backward compat — use serviceLevelId for new orders
     serviceLevel: {
       type: String,

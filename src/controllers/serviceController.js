@@ -3,6 +3,7 @@ const ServiceCategory = require('../models/ServiceCategory.js');
 const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
 const PickupWindow = require('../models/PickupWindow.js');
 const DeliveryZone = require('../models/DeliveryZone.js');
+const Addon = require('../models/Addon.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 
@@ -689,6 +690,125 @@ exports.deleteDeliveryZone = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Delivery zone deleted successfully',
+    data: {},
+  });
+});
+
+// ============================================================================
+// ADD-ONS
+// ============================================================================
+
+// @desc    Get all add-ons
+// @route   GET /api/v1/services/addons
+// @access  Private
+exports.getAddons = asyncHandler(async (req, res) => {
+  let query = {};
+  if (req.query.active !== undefined) {
+    query.active = req.query.active === 'true';
+  }
+  const addons = await Addon.find(query).sort({ displayOrder: 1, createdAt: 1 });
+  res.status(200).json({
+    success: true,
+    message: 'Add-ons fetched successfully',
+    data: { addons },
+  });
+});
+
+// @desc    Create add-on
+// @route   POST /api/v1/services/addons
+// @access  Private (Admin/Manager)
+exports.createAddon = asyncHandler(async (req, res, next) => {
+  const { name, type, value, description, displayOrder } = req.body;
+
+  if (!name || !name.trim()) return next(new AppError('Name is required', 400));
+  if (!['fixed', 'percentage'].includes(type)) {
+    return next(new AppError('Type must be "fixed" or "percentage"', 400));
+  }
+  if (value == null || isNaN(value) || Number(value) < 0) {
+    return next(new AppError('Value must be 0 or positive', 400));
+  }
+  if (type === 'percentage' && Number(value) > 100) {
+    return next(new AppError('Percentage value cannot exceed 100', 400));
+  }
+
+  const existing = await Addon.findOne({ name: name.trim() });
+  if (existing) {
+    return next(new AppError(`Add-on "${name.trim()}" already exists`, 400));
+  }
+
+  const addon = await Addon.create({
+    name: name.trim(),
+    type,
+    value: Number(value),
+    description: description || '',
+    displayOrder: displayOrder != null ? Number(displayOrder) : 0,
+  });
+
+  res.status(201).json({
+    success: true,
+    message: 'Add-on created successfully',
+    data: { addon },
+  });
+});
+
+// @desc    Update add-on
+// @route   PUT /api/v1/services/addons/:id
+// @access  Private (Admin/Manager)
+exports.updateAddon = asyncHandler(async (req, res, next) => {
+  const addon = await Addon.findById(req.params.id);
+  if (!addon) return next(new AppError('Add-on not found', 404));
+
+  const { name, type, value, description, displayOrder, active } = req.body;
+
+  if (name !== undefined) {
+    const dup = await Addon.findOne({ name: name.trim(), _id: { $ne: addon._id } });
+    if (dup) return next(new AppError(`Add-on "${name.trim()}" already exists`, 400));
+    addon.name = name.trim();
+  }
+  if (type !== undefined) {
+    if (!['fixed', 'percentage'].includes(type)) {
+      return next(new AppError('Type must be "fixed" or "percentage"', 400));
+    }
+    addon.type = type;
+  }
+  if (value !== undefined) addon.value = Number(value);
+  if (description !== undefined) addon.description = description;
+  if (displayOrder !== undefined) addon.displayOrder = Number(displayOrder);
+  if (active !== undefined) addon.active = Boolean(active);
+
+  await addon.save();
+  res.status(200).json({
+    success: true,
+    message: 'Add-on updated successfully',
+    data: { addon },
+  });
+});
+
+// @desc    Delete add-on
+// @route   DELETE /api/v1/services/addons/:id
+// @access  Private (Admin)
+exports.deleteAddon = asyncHandler(async (req, res, next) => {
+  const Order = require('../models/Order.js');
+  const addon = await Addon.findById(req.params.id);
+  if (!addon) return next(new AppError('Add-on not found', 404));
+
+  // Check if this add-on is referenced by any orders
+  const inUse = await Order.countDocuments({ 'addons.addonId': addon._id });
+  if (inUse > 0) {
+    // Soft-delete: deactivate so it no longer appears in selection UIs
+    addon.active = false;
+    await addon.save();
+    return res.status(200).json({
+      success: true,
+      message: `"${addon.name}" is used by ${inUse} order(s) and has been deactivated instead of deleted.`,
+      data: { addon },
+    });
+  }
+
+  await addon.deleteOne();
+  res.status(200).json({
+    success: true,
+    message: 'Add-on deleted successfully',
     data: {},
   });
 });
