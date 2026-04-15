@@ -412,7 +412,7 @@ exports.getServiceLevels = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/services/levels
 // @access  Private (Admin/Manager)
 exports.createServiceLevel = asyncHandler(async (req, res, next) => {
-  const { name, percentageAdjustment, description, displayOrder } = req.body;
+  const { name, percentageAdjustment, description, displayOrder, priorityLevel } = req.body;
 
   if (!name || !name.trim()) {
     return next(new AppError('Service level name is required', 400));
@@ -427,11 +427,14 @@ exports.createServiceLevel = asyncHandler(async (req, res, next) => {
     return next(new AppError(`A service level named "${name.trim()}" already exists`, 400));
   }
 
+  const resolvedPriority = Math.min(10, Math.max(1, Number(priorityLevel) || 1));
+
   const level = await ServiceLevelConfig.create({
     name: name.trim(),
     percentageAdjustment: Number(percentageAdjustment),
     description: description || '',
     displayOrder: displayOrder ?? 0,
+    priorityLevel: resolvedPriority,
   });
 
   res.status(201).json({
@@ -464,6 +467,7 @@ exports.updateServiceLevel = asyncHandler(async (req, res, next) => {
   if (req.body.description        !== undefined) fieldsToUpdate.description         = req.body.description;
   if (req.body.displayOrder       !== undefined) fieldsToUpdate.displayOrder        = req.body.displayOrder;
   if (req.body.active             !== undefined) fieldsToUpdate.active              = req.body.active;
+  if (req.body.priorityLevel      !== undefined) fieldsToUpdate.priorityLevel       = Math.min(10, Math.max(1, Number(req.body.priorityLevel) || 1));
 
   const updated = await ServiceLevelConfig.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
     new: true,

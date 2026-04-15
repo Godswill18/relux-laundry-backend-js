@@ -742,7 +742,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     .populate('pickupStaffId', 'name phone')
     .populate('deliveredBy', 'name phone')
     .populate('lastUpdatedById', 'name')
-    .populate('serviceLevelId', 'name percentageAdjustment')
+    .populate('serviceLevelId', 'name percentageAdjustment priorityLevel')
     .populate('statusHistory.updatedBy', 'name')
     .sort('-createdAt')
     .skip(startIndex)
@@ -857,7 +857,7 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
       },
     })
     .populate('assignedStaff', 'name phone staffRole email avatar')
-    .populate('serviceLevelId', 'name percentageAdjustment')
+    .populate('serviceLevelId', 'name percentageAdjustment priorityLevel')
     .populate('statusHistory.updatedBy', 'name role')
     .populate('deliveryZoneId', 'name fee rushFee radiusKm')
     .populate('pickupWindowId', 'startTime endTime dayOfWeek baseFee');

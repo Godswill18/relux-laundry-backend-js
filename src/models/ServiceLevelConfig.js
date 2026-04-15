@@ -23,6 +23,14 @@ const ServiceLevelConfigSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Priority level 1–10: staff/admin urgency indicator shown as badge on orders
+    // 1-3 = Low, 4-6 = Medium, 7-8 = High, 9-10 = Critical
+    priorityLevel: {
+      type: Number,
+      default: 1,
+      min: 1,
+      max: 10,
+    },
     active: {
       type: Boolean,
       default: true,
