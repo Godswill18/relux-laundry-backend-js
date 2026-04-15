@@ -560,6 +560,18 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     metadata: { orderId: order._id, orderNumber: order.orderNumber, total: order.total },
   });
 
+  // Notify delivery agents: new order that requires pickup + delivery
+  const needsDelivery = order.orderType === 'pickup-delivery' || !!order.deliveryAddress;
+  if (needsDelivery) {
+    await notify(io, {
+      type: 'order_needs_pickup',
+      title: '🚚 New Delivery Order',
+      body: `Order ${order.orderNumber} requires pickup and delivery.`,
+      room: 'delivery',
+      metadata: { orderId: order._id, orderNumber: order.orderNumber },
+    });
+  }
+
   // Notify customer: order confirmed
   if (orderCustomerRefId || orderCustomerId) {
     await notify(io, {
@@ -1162,6 +1174,17 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
         title: 'Order Cancelled',
         body: `Order ${order.orderNumber} has been cancelled.`,
         room: 'admin',
+        metadata: { orderId: order._id, orderNumber: order.orderNumber },
+      });
+    }
+
+    // Notify delivery agents when an order is ready to be delivered
+    if (status === 'ready') {
+      await notify(io, {
+        type: 'order_ready_for_delivery',
+        title: '📦 Order Ready for Delivery',
+        body: `Order ${order.orderNumber} has been processed and is ready for delivery.`,
+        room: 'delivery',
         metadata: { orderId: order._id, orderNumber: order.orderNumber },
       });
     }

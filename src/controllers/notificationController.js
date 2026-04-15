@@ -6,6 +6,9 @@ const AppError = require('../utils/appError.js');
 // Staff/admin broadcast types — saved without userId/customerId, visible to all staff
 const BROADCAST_TYPES = ['order_created', 'order_cancelled', 'order_status_updated'];
 
+// Delivery-specific broadcast types — visible to delivery agents
+const DELIVERY_BROADCAST_TYPES = ['order_ready_for_delivery', 'order_needs_pickup'];
+
 /**
  * Build the Mongoose query for a given user's notifications.
  * Staff/admin roles see:
@@ -28,6 +31,14 @@ function buildNotifQuery(user) {
       $or: [
         { userId: user.id },
         { userId: null, customerId: null, type: { $in: BROADCAST_TYPES } },
+      ],
+    };
+  }
+  if (user.role === 'delivery') {
+    return {
+      $or: [
+        { userId: user.id },
+        { userId: null, customerId: null, type: { $in: DELIVERY_BROADCAST_TYPES } },
       ],
     };
   }

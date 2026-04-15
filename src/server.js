@@ -70,6 +70,13 @@ io.on('connection', (socket) => {
     logger.info(`Auto-joined admin room: ${socket.user.role} ${userName}`);
   }
 
+  // Delivery agents join the 'delivery' broadcast room so they receive
+  // real-time notifications about new delivery orders and ready-for-delivery orders.
+  if (socket.user.role === 'delivery') {
+    socket.join('delivery');
+    logger.info(`Auto-joined delivery room: ${userName}`);
+  }
+
   // Join payments room for admin real-time payment updates
   socket.on('join-payments', () => {
     socket.join('payments');

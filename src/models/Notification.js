@@ -11,6 +11,8 @@ const NotificationSchema = new mongoose.Schema(
         'wallet_credited', 'referral_rewarded', 'points_earned', 'points_converted',
         'shift_ending_soon',
         'site_announcement', 'chat_message',
+        // Delivery-agent targeted notifications
+        'order_ready_for_delivery', 'order_needs_pickup',
       ],
       required: true,
     },
