@@ -14,6 +14,8 @@ const LoyaltySetting = require('../models/LoyaltySetting.js');
 const User = require('../models/User.js');
 const ServiceCategory = require('../models/ServiceCategory.js');
 const LoyaltyTier = require('../models/LoyaltyTier.js');
+const PromoCode = require('../models/PromoCode.js');
+const PromoRedemption = require('../models/PromoRedemption.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
@@ -324,6 +326,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     addons: addonsPayload,
     pickupFee: bodyPickupFee,
     discount: bodyDiscount,
+    promoCode: bodyPromoCode,
   } = req.body;
 
   const isStaffRole = ['staff', 'admin', 'manager'].includes(req.user.role);
@@ -491,6 +494,24 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   // Generate QR code
   order.qrCode = generateQRCode(order.orderNumber);
   await order.save();
+
+  // Record promo code redemption (fire-and-forget — don't block the response)
+  if (bodyPromoCode) {
+    try {
+      const promoDoc = await PromoCode.findOne({ code: bodyPromoCode.toUpperCase(), active: true });
+      if (promoDoc) {
+        await PromoRedemption.create({
+          promoCodeId: promoDoc._id,
+          orderId: order._id,
+          customerId: orderCustomerRefId || null,
+          amount: orderPricing.discount,
+        });
+      }
+    } catch (err) {
+      // Non-fatal: log but don't fail the order
+      console.error('Promo redemption recording failed:', err.message);
+    }
+  }
 
   // Handle wallet payment if payment method is 'wallet'
   if (paymentMethod && paymentMethod.toLowerCase() === 'wallet') {

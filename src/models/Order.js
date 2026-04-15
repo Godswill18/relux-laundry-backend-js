@@ -14,6 +14,8 @@ const OrderItemSchema = new mongoose.Schema({
   itemType: { type: String, required: true },
   // Per-item service type (e.g. wash-fold, wash-iron, iron-only, dry-clean)
   serviceType: { type: String },
+  // Human-readable service name for display grouping (e.g. "Washing", "Dry Cleaning")
+  serviceName: { type: String },
   quantity: { type: Number, required: true, min: 1 },
   unitPrice: { type: Number, default: 0 },
   total: { type: Number, default: 0 },
