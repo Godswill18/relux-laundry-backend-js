@@ -1,4 +1,5 @@
 const express = require('express');
+const path    = require('path');
 const cors = require('cors');
 const helmet = require('helmet');
 const mongoSanitize = require('express-mongo-sanitize');
@@ -31,11 +32,15 @@ const workLocationRoutes = require('./routes/workLocationRoutes.js');
 const payrollRoutes = require('./routes/payrollRoutes.js');
 const settingsRoutes = require('./routes/settingsRoutes.js');
 const auditRoutes = require('./routes/auditRoutes.js');
+const announcementRoutes = require('./routes/announcementRoutes.js');
 
 // Middleware imports
 const errorHandler = require('./middleware/errorHandler.js');
 const { apiLimiter } = require('./middleware/rateLimiter.js');
 const app = express();
+
+// Serve uploaded files (images, etc.)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Webhook routes (must be before body parsers - needs raw body for Svix signature verification)
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRoutes);
@@ -106,6 +111,7 @@ app.use(`/api/${API_VERSION}/work-location`, workLocationRoutes);
 app.use(`/api/${API_VERSION}/payroll`, payrollRoutes);
 app.use(`/api/${API_VERSION}/settings`, settingsRoutes);
 app.use(`/api/${API_VERSION}/audit-logs`, auditRoutes);
+app.use(`/api/${API_VERSION}/announcements`, announcementRoutes);
 
 // 404 handler
 app.all('*', (req, res) => {
