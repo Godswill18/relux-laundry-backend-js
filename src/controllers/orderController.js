@@ -984,9 +984,9 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
       addOnsFee = order.pricing?.addOnsFee || 0;
     }
 
-    const pickupFee   = order.pricing?.pickupFee   || 0;
-    const deliveryFee = order.pricing?.deliveryFee || 0;
-    const discount    = order.pricing?.discount    || 0;
+    const pickupFee   = req.body.pickupFee   !== undefined ? Number(req.body.pickupFee)   : (order.pricing?.pickupFee   || 0);
+    const deliveryFee = req.body.deliveryFee !== undefined ? Number(req.body.deliveryFee) : (order.pricing?.deliveryFee || 0);
+    const discount    = req.body.discount    !== undefined ? Number(req.body.discount)    : (order.pricing?.discount    || 0);
 
     const newPricing = calculateOrderPricing(pricedItems, pickupFee, deliveryFee, discount, serviceFee, addOnsFee);
     order.pricing = newPricing;
