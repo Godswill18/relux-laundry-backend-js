@@ -1621,12 +1621,16 @@ exports.payBalanceFromWallet = asyncHandler(async (req, res, next) => {
   const order = await Order.findById(req.params.id);
   if (!order) return next(new AppError('Order not found', 404));
 
-  if (order.paymentStatus !== 'partial') {
-    return next(new AppError('Order does not have a partial payment balance', 400));
+  if (!['partial', 'unpaid'].includes(order.paymentStatus)) {
+    return next(new AppError('Order is already paid or cannot be charged', 400));
   }
 
-  // Balance due = new total − what was already paid
-  const alreadyPaid = order.payment?.amount || 0;
+  if (order.paymentStatus === 'unpaid' && !['pay-later', 'wallet'].includes(order.payment?.method)) {
+    return next(new AppError('Only pay-later or wallet orders can be charged via wallet when unpaid', 400));
+  }
+
+  // For pay-later (unpaid) orders, no real payment has been made yet — treat as 0
+  const alreadyPaid = order.paymentStatus === 'unpaid' ? 0 : (order.payment?.amount || 0);
   const balanceDue = Math.round((order.total - alreadyPaid) * 100) / 100;
 
   if (balanceDue <= 0) {
