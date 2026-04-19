@@ -21,6 +21,7 @@ const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
 const { calculateOrderPricing, generateQRCode } = require('../utils/helpers.js');
 const notify = require('../utils/notify.js');
+const normalizePhone = require('../utils/normalizePhone.js');
 
 // Statuses that have a countdown timer
 const TIMED_STAGES = new Set(['confirmed', 'picked-up', 'in_progress', 'washing', 'ironing', 'out-for-delivery']);
@@ -338,13 +339,26 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   let orderCustomerRefId = null;
 
   if (isOffline && isStaffRole) {
-    // Offline walk-in order created by staff — no customer User account required
-    // walkInCustomer.name and walkInCustomer.phone are used instead
+    // Offline walk-in order — phone is the identity bridge to customer accounts
     if (!walkInCustomer || !walkInCustomer.name) {
       return next(new AppError('Walk-in customer name is required for offline orders', 400));
     }
-    // Use the staff member's own ID as a placeholder to satisfy the schema
-    orderCustomerId = req.user.id;
+    if (!walkInCustomer.phone) {
+      return next(new AppError('Walk-in customer phone number is required for offline orders', 400));
+    }
+
+    // Normalize phone to E.164 before storing
+    const normalized = normalizePhone(walkInCustomer.phone);
+    if (normalized) walkInCustomer.phone = normalized;
+
+    // If a registered user has this phone, link the order to their account immediately
+    const matchedUser = await User.findOne({ phone: walkInCustomer.phone })
+      .select('_id customerId').lean();
+    if (matchedUser) {
+      orderCustomerId = matchedUser._id;
+      orderCustomerRefId = matchedUser.customerId;
+    }
+    // If no account: customer and customerId remain null — linked when they sign up
   } else {
     // Online order
     orderCustomerId = req.user.id;
@@ -623,9 +637,18 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
 exports.getOrders = asyncHandler(async (req, res, next) => {
   let query;
 
-  // Customers only see their own orders
+  // Customers see their own orders + any walk-in orders linked by phone
   if (req.user.role === 'customer') {
-    query = { customer: req.user.id };
+    const normalizedPhone = normalizePhone(req.user.phone);
+    const phoneConditions = [];
+    if (normalizedPhone) phoneConditions.push({ 'walkInCustomer.phone': normalizedPhone, orderSource: 'offline' });
+    // Also match un-normalized legacy phone as a fallback until backfill runs
+    if (req.user.phone && req.user.phone !== normalizedPhone) {
+      phoneConditions.push({ 'walkInCustomer.phone': req.user.phone, orderSource: 'offline' });
+    }
+    query = phoneConditions.length
+      ? { $or: [{ customer: req.user.id }, ...phoneConditions] }
+      : { customer: req.user.id };
   } else {
     query = {};
 
@@ -866,12 +889,17 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
-  // Check if user has access to this order
-  if (
-    req.user.role === 'customer' &&
-    order.customer._id.toString() !== req.user.id
-  ) {
-    return next(new AppError('Not authorized to access this order', 403));
+  // Check if customer has access — either directly linked or via phone match (walk-in)
+  if (req.user.role === 'customer') {
+    const linkedByUserId = order.customer && order.customer._id?.toString() === req.user.id;
+    const userPhone = normalizePhone(req.user.phone) || req.user.phone;
+    const orderPhone = order.walkInCustomer?.phone;
+    const linkedByPhone = order.orderSource === 'offline' && orderPhone &&
+      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
+
+    if (!linkedByUserId && !linkedByPhone) {
+      return next(new AppError('Not authorized to access this order', 403));
+    }
   }
 
   res.status(200).json({
@@ -1981,5 +2009,63 @@ exports.getMyStats = asyncHandler(async (req, res, next) => {
         : null,
       tiers: tiers.map((t) => ({ name: t.name, minSpend: t.minSpend, rank: t.rank })),
     },
+  });
+});
+
+// @desc    Backfill walk-in order phone normalization and user linking
+// @route   POST /api/v1/orders/backfill-walkin
+// @access  Private (Admin only)
+exports.backfillWalkIn = asyncHandler(async (req, res) => {
+  const walkInOrders = await Order.find({
+    orderSource: 'offline',
+    'walkInCustomer.phone': { $exists: true, $ne: null, $ne: '' },
+  }).lean();
+
+  const bulkOps = [];
+  let normalizedCount = 0;
+  let linkedCount = 0;
+
+  // Build a phone → user map for efficient lookups
+  const rawPhones = [...new Set(walkInOrders.map((o) => o.walkInCustomer?.phone).filter(Boolean))];
+  const normalizedMap = new Map(); // rawPhone → normalized
+  const userMap = new Map();       // normalized → { _id, customerId }
+
+  for (const raw of rawPhones) {
+    const normalized = normalizePhone(raw) || raw;
+    normalizedMap.set(raw, normalized);
+  }
+
+  const uniqueNormalized = [...new Set(normalizedMap.values())];
+  const matchedUsers = await User.find({ phone: { $in: uniqueNormalized } })
+    .select('_id customerId phone').lean();
+  for (const u of matchedUsers) userMap.set(u.phone, u);
+
+  for (const order of walkInOrders) {
+    const raw = order.walkInCustomer?.phone;
+    const normalized = normalizedMap.get(raw) || raw;
+    const matchedUser = userMap.get(normalized);
+    const update = {};
+
+    if (normalized !== raw) {
+      update['walkInCustomer.phone'] = normalized;
+      normalizedCount++;
+    }
+    if (matchedUser && order.customer?.toString() !== matchedUser._id.toString()) {
+      update.customer = matchedUser._id;
+      update.customerId = matchedUser.customerId;
+      linkedCount++;
+    }
+
+    if (Object.keys(update).length > 0) {
+      bulkOps.push({ updateOne: { filter: { _id: order._id }, update: { $set: update } } });
+    }
+  }
+
+  if (bulkOps.length > 0) await Order.bulkWrite(bulkOps);
+
+  res.status(200).json({
+    success: true,
+    message: `Backfill complete. Phones normalized: ${normalizedCount}, Orders linked to accounts: ${linkedCount}`,
+    data: { normalizedCount, linkedCount, totalProcessed: walkInOrders.length },
   });
 });

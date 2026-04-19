@@ -1,4 +1,5 @@
 const User = require('../models/User.js');
+const Order = require('../models/Order.js');
 const WorkShift = require('../models/WorkShift.js');
 const Referral = require('../models/Referral.js');
 // const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
@@ -8,21 +9,25 @@ const ERROR_CODES = require('../utils/errorCodes.js');
 const { generateOTP, splitName, sendTokenResponse, getTodayWAT } = require('../utils/helpers.js');
 const sendEmail = require('../utils/sendEmail.js');
 const ensureCustomer = require('../utils/ensureCustomer.js');
+const normalizePhone = require('../utils/normalizePhone.js');
 
 // @desc    Register user
 // @route   POST /api/v1/auth/register
 // @access  Public
 exports.register = asyncHandler(async (req, res, next) => {
-  const { name, email, phone, password, role, referralCode } = req.body;
+  const { name, email, phone: rawPhone, password, role, referralCode } = req.body;
 
   // Validate required fields
-  if (!name || !phone || !password) {
+  if (!name || !rawPhone || !password) {
     return next(new AppError('Please provide name, phone and password', 400));
   }
 
   if (!email) {
     return next(new AppError('Please provide your email address', 400));
   }
+
+  // Normalize phone to E.164 format (+234XXXXXXXXXX)
+  const phone = normalizePhone(rawPhone) || rawPhone.trim();
 
   // Check if user already exists
   const existingUser = await User.findOne({ phone });
@@ -57,6 +62,14 @@ exports.register = asyncHandler(async (req, res, next) => {
 
   // Create linked Customer document for wallet/loyalty/orders
   await ensureCustomer(user);
+
+  // Link any past walk-in orders whose phone matches this new account (fire-and-forget)
+  if (phone) {
+    Order.updateMany(
+      { orderSource: 'offline', 'walkInCustomer.phone': phone },
+      { $set: { customer: user._id, customerId: user.customerId } }
+    ).catch(() => {});
+  }
 
   // Apply referral code if provided — do this silently (never fail registration)
   if (referralCode && referralCode.trim()) {

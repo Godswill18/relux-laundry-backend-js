@@ -8,6 +8,7 @@ const mongoose = require('mongoose');
 const socketAuth = require('./middleware/socketAuth.js');
 const { startShiftScheduler } = require('./utils/shiftScheduler.js');
 const allowedOrigins = require('./config/allowedOrigins.js');
+const backfillWalkIn = require('./utils/backfillWalkIn.js');
 const PaystackTransaction = require('./models/PaystackTransaction.js');
 const {
   backgroundVerifyAndCredit,
@@ -251,6 +252,9 @@ mongoose.connection.once('open', () => {
 
     // On boot: resume retries killed by server restart (5s delay for full init)
     setTimeout(() => recoverPendingPaystackTransactions(io), 5000);
+
+    // On boot: normalize walk-in phones and link orders to registered accounts
+    setTimeout(() => backfillWalkIn(), 8000);
 
     // Every 15 minutes: auto-fail abandoned transactions and catch anything missed
     setInterval(() => recoverPendingPaystackTransactions(io), 15 * 60 * 1000);

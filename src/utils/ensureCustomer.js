@@ -1,19 +1,24 @@
 const Customer = require('../models/Customer.js');
+const normalizePhone = require('./normalizePhone.js');
 
 // Ensure a Customer document exists for the given User and link them.
 // Idempotent — safe to call on every login/register/request.
 const ensureCustomer = async (user) => {
   if (user.customerId) return user;
 
-  // Try to find existing Customer by phone or email
+  // Try to find existing Customer by normalized phone or email
   let customer;
-  if (user.phone) customer = await Customer.findOne({ phone: user.phone });
+  const normalizedPhone = normalizePhone(user.phone);
+  if (normalizedPhone) {
+    customer = await Customer.findOne({ phone: normalizedPhone });
+    if (!customer) customer = await Customer.findOne({ phone: user.phone }); // legacy fallback
+  }
   if (!customer && user.email) customer = await Customer.findOne({ email: user.email });
 
   if (!customer) {
     customer = await Customer.create({
       name: user.name,
-      phone: user.phone || undefined,
+      phone: normalizedPhone || user.phone || undefined,
       email: user.email || undefined,
       status: 'active',
     });

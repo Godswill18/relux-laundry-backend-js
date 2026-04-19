@@ -23,6 +23,7 @@ const {
   removeOrderItem,
   addOrderMedia,
   getOrderMedia,
+  backfillWalkIn,
 } = require('../controllers/orderController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
@@ -38,7 +39,8 @@ router.route('/')
 // Must be before /:id to avoid route conflict
 router.get('/counts',       authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
 router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
-router.get('/my-stats',     authorize('customer'), getMyStats);
+router.get('/my-stats',         authorize('customer'), getMyStats);
+router.post('/backfill-walkin', authorize('admin'), backfillWalkIn);
 router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager', 'delivery'), lookupByQR);
 router.post('/scan-delivery', authorize('staff', 'admin', 'manager', 'delivery'), scanDelivery);
 router.post('/scan-pickup',   authorize('staff', 'admin', 'manager', 'delivery'), scanPickup);
