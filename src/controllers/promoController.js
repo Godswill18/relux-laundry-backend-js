@@ -22,10 +22,22 @@ exports.getPromoCodes = asyncHandler(async (req, res, next) => {
     .skip(startIndex)
     .limit(limit);
 
+  // Attach live usage counts in one aggregation query
+  const redemptionCounts = await PromoRedemption.aggregate([
+    { $match: { promoCodeId: { $in: promoCodes.map((p) => p._id) } } },
+    { $group: { _id: '$promoCodeId', count: { $sum: 1 } } },
+  ]);
+  const countMap = new Map(redemptionCounts.map((r) => [r._id.toString(), r.count]));
+
+  const promoCodesWithCount = promoCodes.map((p) => ({
+    ...p.toObject(),
+    usageCount: countMap.get(p._id.toString()) || 0,
+  }));
+
   res.status(200).json({
     success: true,
     message: 'Promo codes fetched successfully',
-    data: { promoCodes },
+    data: { promoCodes: promoCodesWithCount },
     pagination: {
       page,
       limit,
@@ -56,7 +68,7 @@ exports.getPromoCode = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/promos
 // @access  Private (Admin/Manager)
 exports.createPromoCode = asyncHandler(async (req, res, next) => {
-  const { code, type, value, usageLimit, expiresAt } = req.body;
+  const { code, type, value, usageLimit, usagePerUser, expiresAt } = req.body;
 
   const existing = await PromoCode.findOne({ code: code.toUpperCase() });
   if (existing) {
@@ -68,6 +80,7 @@ exports.createPromoCode = asyncHandler(async (req, res, next) => {
     type,
     value,
     usageLimit,
+    usagePerUser: usagePerUser ?? 1,
     expiresAt,
   });
 
@@ -87,6 +100,7 @@ exports.updatePromoCode = asyncHandler(async (req, res, next) => {
     type: req.body.type,
     value: req.body.value,
     usageLimit: req.body.usageLimit,
+    usagePerUser: req.body.usagePerUser,
     expiresAt: req.body.expiresAt,
     active: req.body.active,
   };
@@ -146,17 +160,32 @@ exports.validatePromoCode = asyncHandler(async (req, res, next) => {
     return next(new AppError('Promo code has expired', 400));
   }
 
-  if (promoCode.usageLimit) {
-    const usageCount = await PromoRedemption.countDocuments({ promoCodeId: promoCode._id });
-    if (usageCount >= promoCode.usageLimit) {
-      return next(new AppError('Promo code usage limit reached', 400));
+  const totalUsage = await PromoRedemption.countDocuments({ promoCodeId: promoCode._id });
+
+  if (promoCode.usageLimit && totalUsage >= promoCode.usageLimit) {
+    return next(new AppError('Promo code usage limit reached', 400));
+  }
+
+  // Per-user limit check
+  if (req.user?.customerId && promoCode.usagePerUser > 0) {
+    const userUsage = await PromoRedemption.countDocuments({
+      promoCodeId: promoCode._id,
+      customerId: req.user.customerId,
+    });
+    if (userUsage >= promoCode.usagePerUser) {
+      return next(new AppError(
+        promoCode.usagePerUser === 1
+          ? 'You have already used this promo code'
+          : `You can only use this promo code ${promoCode.usagePerUser} time(s)`,
+        400
+      ));
     }
   }
 
   res.status(200).json({
     success: true,
     message: 'Promo code is valid',
-    data: { promoCode },
+    data: { promoCode, usageCount: totalUsage },
   });
 });
 
@@ -177,12 +206,36 @@ exports.redeemPromoCode = asyncHandler(async (req, res, next) => {
     return next(new AppError('Promo already applied to this order', 400));
   }
 
+  // Per-user limit check
+  if (req.user?.customerId && promoCode.usagePerUser > 0) {
+    const userUsage = await PromoRedemption.countDocuments({
+      promoCodeId: promoCode._id,
+      customerId: req.user.customerId,
+    });
+    if (userUsage >= promoCode.usagePerUser) {
+      return next(new AppError(
+        promoCode.usagePerUser === 1
+          ? 'You have already used this promo code'
+          : `You can only use this promo code ${promoCode.usagePerUser} time(s)`,
+        400
+      ));
+    }
+  }
+
   const redemption = await PromoRedemption.create({
     promoCodeId: promoCode._id,
     orderId,
     customerId: req.user.customerId,
     amount,
   });
+
+  // Auto-disable when total usage limit is reached
+  if (promoCode.usageLimit) {
+    const totalUsage = await PromoRedemption.countDocuments({ promoCodeId: promoCode._id });
+    if (totalUsage >= promoCode.usageLimit) {
+      await PromoCode.findByIdAndUpdate(promoCode._id, { active: false });
+    }
+  }
 
   res.status(201).json({
     success: true,

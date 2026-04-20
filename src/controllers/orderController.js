@@ -514,15 +514,34 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     try {
       const promoDoc = await PromoCode.findOne({ code: bodyPromoCode.toUpperCase(), active: true });
       if (promoDoc) {
-        await PromoRedemption.create({
-          promoCodeId: promoDoc._id,
-          orderId: order._id,
-          customerId: orderCustomerRefId || null,
-          amount: orderPricing.discount,
-        });
+        // Skip if this customer already hit their per-user limit
+        let canRedeem = true;
+        if (orderCustomerRefId && promoDoc.usagePerUser > 0) {
+          const userUsage = await PromoRedemption.countDocuments({
+            promoCodeId: promoDoc._id,
+            customerId: orderCustomerRefId,
+          });
+          if (userUsage >= promoDoc.usagePerUser) canRedeem = false;
+        }
+
+        if (canRedeem) {
+          await PromoRedemption.create({
+            promoCodeId: promoDoc._id,
+            orderId: order._id,
+            customerId: orderCustomerRefId || null,
+            amount: orderPricing.discount,
+          });
+
+          // Auto-disable when global usage limit is reached
+          if (promoDoc.usageLimit) {
+            const totalUsage = await PromoRedemption.countDocuments({ promoCodeId: promoDoc._id });
+            if (totalUsage >= promoDoc.usageLimit) {
+              await PromoCode.findByIdAndUpdate(promoDoc._id, { active: false });
+            }
+          }
+        }
       }
     } catch (err) {
-      // Non-fatal: log but don't fail the order
       console.error('Promo redemption recording failed:', err.message);
     }
   }
