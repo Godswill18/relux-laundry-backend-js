@@ -9,6 +9,7 @@ const allowedOrigins = [
     'http://localhost:4173',
     'https://relux.ng',
     'https://staff.relux.ng',
+    'https://api.authentication.relux.relux.ng',
     'https://admin.relux.ng',
 ];
 
