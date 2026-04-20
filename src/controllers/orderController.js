@@ -1979,7 +1979,7 @@ exports.getMyStats = asyncHandler(async (req, res, next) => {
 
   // Aggregate total orders and total spent for this customer
   const [agg] = await Order.aggregate([
-    { $match: { customer: new mongoose.Types.ObjectId(userId), status: { $ne: 'CANCELLED' } } },
+    { $match: { customer: new mongoose.Types.ObjectId(userId), status: { $nin: ['cancelled', 'draft'] } } },
     {
       $group: {
         _id: null,
