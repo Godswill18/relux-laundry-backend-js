@@ -744,6 +744,22 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     }
   }
 
+  // Cross-status search — when ?search= is provided, wipe tab/status filters
+  // and match orderNumber, code, or walk-in customer name/phone across ALL statuses.
+  if (req.query.search?.trim() && req.user.role !== 'customer') {
+    const raw = req.query.search.trim();
+    const regex = new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    delete query.status;
+    delete query.assignedStaff;
+    delete query.$or;
+    query.$or = [
+      { orderNumber: regex },
+      { code: regex },
+      { 'walkInCustomer.name': regex },
+      { 'walkInCustomer.phone': regex },
+    ];
+  }
+
   // Pagination
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 10;
