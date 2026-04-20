@@ -276,11 +276,11 @@ OrderSchema.pre('validate', async function (next) {
     this.code = code;
   }
 
-  // Add initial status to history
+  // Add initial status to history — use staff creator for walk-in orders
   this.statusHistory.push({
     status: this.status,
     timestamp: new Date(),
-    updatedBy: this.customer,
+    updatedBy: this.customer || this.createdByStaff,
   });
 
   next();
