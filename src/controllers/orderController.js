@@ -656,8 +656,12 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
 exports.getOrders = asyncHandler(async (req, res, next) => {
   let query;
 
-  // Customers see their own orders + any walk-in orders linked by phone
-  if (req.user.role === 'customer') {
+  // Customer UI always sends scope=customer — enforces personal-only view regardless of role.
+  // This prevents staff accounts logged into the customer UI from seeing all orders.
+  const isCustomerScope = req.user.role === 'customer' || req.query.scope === 'customer';
+
+  // Customers (or any role in customer-scope mode) see their own orders + walk-in orders linked by phone
+  if (isCustomerScope) {
     const normalizedPhone = normalizePhone(req.user.phone);
     const phoneConditions = [];
     if (normalizedPhone) phoneConditions.push({ 'walkInCustomer.phone': normalizedPhone, orderSource: 'offline' });
@@ -924,8 +928,10 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
-  // Check if customer has access — either directly linked or via phone match (walk-in)
-  if (req.user.role === 'customer') {
+  // Enforce ownership for customers and for any role using the customer-scope UI.
+  // This prevents staff accounts logged into the customer UI from viewing others' orders.
+  const isCustomerScope = req.user.role === 'customer' || req.query.scope === 'customer';
+  if (isCustomerScope) {
     const linkedByUserId = order.customer && order.customer._id?.toString() === req.user.id;
     const userPhone = normalizePhone(req.user.phone) || req.user.phone;
     const orderPhone = order.walkInCustomer?.phone;
