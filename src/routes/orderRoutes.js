@@ -4,6 +4,7 @@ const {
   createOrder,
   getOrders,
   getOrderCounts,
+  getOrderDashboardStats,
   getStaffCounts,
   getMyStats,
   getOrder,
@@ -37,7 +38,8 @@ router.route('/')
   .post(orderLimiter, createOrder);
 
 // Must be before /:id to avoid route conflict
-router.get('/counts',       authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
+router.get('/counts',          authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
+router.get('/dashboard-stats', authorize('admin', 'manager'), getOrderDashboardStats);
 router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
 router.get('/my-stats',         authorize('customer'), getMyStats);
 router.post('/backfill-walkin', authorize('admin'), backfillWalkIn);

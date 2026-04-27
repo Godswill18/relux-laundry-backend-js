@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   getUsers,
   getUser,
+  getCustomerStats,
   createStaff,
   updateUser,
   deactivateUser,
@@ -16,7 +17,9 @@ router.use(protect);
 router.use(authorize('admin', 'manager'));
 
 router.route('/')
-.get(getUsers);
+  .get(getUsers);
+
+router.get('/customer-stats', getCustomerStats);
 
 router.route('/staff')
   .post(createStaff);

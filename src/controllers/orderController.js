@@ -904,6 +904,49 @@ exports.getOrderCounts = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Aggregate dashboard stats — accurate across all orders (no pagination)
+// @route   GET /api/v1/orders/dashboard-stats
+// @access  Private (admin, manager)
+exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const todayEnd = new Date();
+  todayEnd.setHours(23, 59, 59, 999);
+
+  const INACTIVE_STATUSES = ['delivered', 'completed', 'cancelled'];
+
+  const [aggResult, totalOrders, activeOrders, pendingPayments, todayOrders] = await Promise.all([
+    // Total revenue (all paid orders ever) + today's revenue
+    Order.aggregate([
+      {
+        $facet: {
+          totalRevenue: [
+            { $match: { paymentStatus: 'paid' } },
+            { $group: { _id: null, sum: { $sum: '$pricing.total' } } },
+          ],
+          todayRevenue: [
+            { $match: { paymentStatus: 'paid', createdAt: { $gte: todayStart, $lte: todayEnd } } },
+            { $group: { _id: null, sum: { $sum: '$pricing.total' } } },
+          ],
+        },
+      },
+    ]),
+    Order.countDocuments({}),
+    Order.countDocuments({ status: { $nin: INACTIVE_STATUSES } }),
+    Order.countDocuments({ paymentStatus: { $in: ['unpaid', 'partial'] } }),
+    Order.countDocuments({ createdAt: { $gte: todayStart, $lte: todayEnd } }),
+  ]);
+
+  const facets = aggResult[0] || {};
+  const totalRevenue = facets.totalRevenue?.[0]?.sum ?? 0;
+  const todayRevenue = facets.todayRevenue?.[0]?.sum ?? 0;
+
+  res.status(200).json({
+    success: true,
+    data: { totalRevenue, todayRevenue, totalOrders, activeOrders, pendingPayments, todayOrders },
+  });
+});
+
 // @desc    Get single order
 // @route   GET /api/v1/orders/:id
 // @access  Private

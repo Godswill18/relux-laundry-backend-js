@@ -53,6 +53,27 @@ exports.getUsers = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Aggregate customer stats — accurate count regardless of pagination
+// @route   GET /api/v1/users/customer-stats
+// @access  Private (admin, manager)
+exports.getCustomerStats = asyncHandler(async (req, res) => {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+
+  const [total, active, newThisMonth, inactive] = await Promise.all([
+    User.countDocuments({ role: 'customer' }),
+    User.countDocuments({ role: 'customer', isActive: { $ne: false } }),
+    User.countDocuments({ role: 'customer', createdAt: { $gte: monthStart, $lte: monthEnd } }),
+    User.countDocuments({ role: 'customer', isActive: false }),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: { total, active, newThisMonth, inactive },
+  });
+});
+
 // @desc    Get single user
 // @route   GET /api/v1/users/:id
 // @access  Private (Admin/Manager)
