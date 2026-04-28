@@ -42,12 +42,16 @@ const app = express();
 // CORS must be first — applies to all routes including /uploads static files
 app.use(cors(corsOptions));
 
-// Serve uploaded files (images, etc.)
-// CORP header allows cross-origin <img> loads; CORS header (set above) covers fetch/XHR
-app.use('/uploads', (req, res, next) => {
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  next();
-}, express.static(path.join(__dirname, 'uploads')));
+// Security headers — configured before static files so CORP is set correctly.
+// crossOriginResourcePolicy: cross-origin allows <img> tags on other origins to
+// load images served from this API without ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+
+// Serve uploaded files (images, etc.) from the project root /uploads directory.
+// __dirname here is src/, so we go one level up to reach the project root.
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Webhook routes (must be before body parsers - needs raw body for Svix signature verification)
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRoutes);
@@ -58,9 +62,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // Cookie parser
 app.use(cookieParser());
-
-// Security headers
-app.use(helmet());
 
 // Data sanitization against NoSQL injection
 app.use(mongoSanitize());

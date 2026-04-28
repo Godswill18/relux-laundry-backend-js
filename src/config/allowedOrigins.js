@@ -1,5 +1,5 @@
 const allowedOrigins = [
-    // 'http://192.168.0.7:8080',
+    // local dev
     'http://localhost:3000',
     'http://localhost:3001',
     'http://localhost:8080',
@@ -7,10 +7,10 @@ const allowedOrigins = [
     'http://localhost:5173',
     'http://localhost:5174',
     'http://localhost:4173',
+    // production frontends only — never add the API's own domain here
     'https://relux.ng',
+    'https://www.relux.ng',
     'https://staff.relux.ng',
-    'https://api.authentication.relux.relux.ng',
-    'https://api.authentication.relux.relux.ng/upload',
     'https://admin.relux.ng',
 ];
 
