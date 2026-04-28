@@ -146,7 +146,7 @@ exports.updateCustomer = asyncHandler(async (req, res, next) => {
 // @access  Private
 exports.getMyProfile = asyncHandler(async (req, res, next) => {
   const customer = await Customer.findById(req.user.customerId)
-    .populate('loyaltyTierId', 'name rank multiplierPercent');
+    .populate('loyaltyTierId', 'name rank multiplierPercent discountPercent freePickup freeDelivery priorityTurnaround');
 
   if (!customer) {
     return next(new AppError('Customer profile not found', 404));

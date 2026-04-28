@@ -143,7 +143,7 @@ exports.deleteTier = asyncHandler(async (req, res, next) => {
 exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
   const [customer, settings] = await Promise.all([
     Customer.findById(req.user.customerId)
-      .populate('loyaltyTierId', 'name rank multiplierPercent freePickup freeDelivery priorityTurnaround'),
+      .populate('loyaltyTierId', 'name rank multiplierPercent discountPercent freePickup freeDelivery priorityTurnaround'),
     LoyaltySetting.findOne().lean(),
   ]);
 

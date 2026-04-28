@@ -237,6 +237,17 @@ const OrderSchema = new mongoose.Schema(
     notes: String,
     qrCode: String,
     editHistory: [EditHistorySchema],
+    // Loyalty tier benefit snapshot — locked at checkout, unaffected by future tier changes
+    loyaltyTierSnapshot: {
+      tierId:          { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyTier' },
+      tierName:        String,
+      discountPercent: Number,
+      discountAmount:  Number,
+      freeDelivery:    Boolean,
+      freePickup:      Boolean,
+      priorityHandling: Boolean,
+      multiplierPercent: Number,
+    },
     // Countdown timer fields — set each time status changes to a timed stage
     stageDeadlineAt: { type: Date },
     stageDurationMinutes: { type: Number },

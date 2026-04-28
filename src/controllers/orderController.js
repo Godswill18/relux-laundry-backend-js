@@ -269,17 +269,21 @@ async function awardOrderPoints(order, io) {
     throw e;
   }
 
-  // Credit customer balance
+  // Credit customer balance + lifetime spend
   const updatedCustomer = await Customer.findByIdAndUpdate(
     customerId,
-    { $inc: { loyaltyPointsBalance: points, loyaltyLifetimePoints: points } },
+    { $inc: { loyaltyPointsBalance: points, loyaltyLifetimePoints: points, lifetimeSpend: orderAmount } },
     { new: true }
   ).lean();
 
-  // Tier upgrade check
+  // Tier upgrade check — customer qualifies when BOTH point and spend thresholds are met
   if (updatedCustomer) {
     const allTiers = await LoyaltyTier.find({ active: true }).sort('rank').lean();
-    const eligible = allTiers.filter(t => t.pointsRequired <= (updatedCustomer.loyaltyLifetimePoints || 0)).pop();
+    const lifetimePts   = updatedCustomer.loyaltyLifetimePoints || 0;
+    const lifetimeSpend = updatedCustomer.lifetimeSpend || 0;
+    const eligible = allTiers
+      .filter(t => t.pointsRequired <= lifetimePts && (t.minSpend === 0 || t.minSpend <= lifetimeSpend))
+      .pop(); // highest qualifying rank
     const currentTierId = updatedCustomer.loyaltyTierId?.toString();
     if (eligible && eligible._id.toString() !== currentTierId) {
       await Customer.findByIdAndUpdate(customerId, { loyaltyTierId: eligible._id });
@@ -448,10 +452,37 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   }
 
   // pickupFee: frontend passes it at top-level or inside pricing object
-  const resolvedPickupFee = bodyPickupFee || (pricing && pricing.pickupFee) || 0;
-  const resolvedDeliveryFee = req.body.deliveryFee || (pricing && pricing.deliveryFee) || 0;
+  let resolvedPickupFee    = bodyPickupFee || (pricing && pricing.pickupFee) || 0;
+  let resolvedDeliveryFee  = req.body.deliveryFee || (pricing && pricing.deliveryFee) || 0;
   // discount: promo + points reductions passed by frontend
-  const resolvedDiscount = bodyDiscount != null ? bodyDiscount : (pricing && pricing.discount) || 0;
+  let resolvedDiscount     = bodyDiscount != null ? bodyDiscount : (pricing && pricing.discount) || 0;
+
+  // ── Apply loyalty tier benefits dynamically ───────────────────────────────
+  let loyaltyTierSnapshot = null;
+  if (orderCustomerRefId) {
+    const loyalCustomer = await Customer.findById(orderCustomerRefId)
+      .populate('loyaltyTierId')
+      .lean();
+    const tier = loyalCustomer?.loyaltyTierId;
+    if (tier && tier.active) {
+      const tierDiscountAmount = tier.discountPercent > 0
+        ? Math.round(baseSubtotal * tier.discountPercent / 100)
+        : 0;
+      resolvedDiscount += tierDiscountAmount;
+      if (tier.freePickup)   resolvedPickupFee   = 0;
+      if (tier.freeDelivery) resolvedDeliveryFee = 0;
+      loyaltyTierSnapshot = {
+        tierId:           tier._id,
+        tierName:         tier.name,
+        discountPercent:  tier.discountPercent || 0,
+        discountAmount:   tierDiscountAmount,
+        freeDelivery:     tier.freeDelivery || false,
+        freePickup:       tier.freePickup || false,
+        priorityHandling: tier.priorityTurnaround || false,
+        multiplierPercent: tier.multiplierPercent || 100,
+      };
+    }
+  }
 
   // Always recalculate pricing from DB-verified item prices — ignore frontend total
   const orderPricing = calculateOrderPricing(
@@ -490,6 +521,8 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     stainRemoval: stainRemoval || false,
     fragrance: fragrance || false,
     addons: resolvedAddons,
+    loyaltyTierSnapshot: loyaltyTierSnapshot || undefined,
+    priorityHandling: loyaltyTierSnapshot?.priorityHandling || false,
     // Staff-created walk-in orders → auto-assigned + skip pending (go straight to confirmed)
     // Admin/manager-created and online orders → unassigned pending pool for staff to pick
     assignedStaff: (req.user.role === 'staff' && isOffline)

@@ -7,6 +7,7 @@ const LoyaltyTierSchema = new mongoose.Schema(
     minSpend: { type: Number, default: 0 },
     multiplierPercent: { type: Number, default: 100 },
     rank: { type: Number, default: 1 },
+    discountPercent: { type: Number, default: 0, min: 0, max: 100 },
     freePickup: { type: Boolean, default: false },
     freeDelivery: { type: Boolean, default: false },
     priorityTurnaround: { type: Boolean, default: false },

@@ -16,6 +16,7 @@ const CustomerSchema = new mongoose.Schema(
     },
     loyaltyPointsBalance: { type: Number, default: 0 },
     loyaltyLifetimePoints: { type: Number, default: 0 },
+    lifetimeSpend: { type: Number, default: 0 },
     loyaltyTierId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyTier' },
   },
   { timestamps: true }
