@@ -39,8 +39,11 @@ const errorHandler = require('./middleware/errorHandler.js');
 const { apiLimiter } = require('./middleware/rateLimiter.js');
 const app = express();
 
+// CORS must be first — applies to all routes including /uploads static files
+app.use(cors(corsOptions));
+
 // Serve uploaded files (images, etc.)
-// Set CORP header so browsers allow cross-origin image loads from the frontend
+// CORP header allows cross-origin <img> loads; CORS header (set above) covers fetch/XHR
 app.use('/uploads', (req, res, next) => {
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
@@ -55,9 +58,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // Cookie parser
 app.use(cookieParser());
-
-// CORS
-app.use(cors(corsOptions));
 
 // Security headers
 app.use(helmet());
