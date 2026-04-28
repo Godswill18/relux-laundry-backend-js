@@ -10,6 +10,7 @@ const allowedOrigins = [
     'https://relux.ng',
     'https://staff.relux.ng',
     'https://api.authentication.relux.relux.ng',
+    'https://api.authentication.relux.relux.ng/upload',
     'https://admin.relux.ng',
 ];
 
