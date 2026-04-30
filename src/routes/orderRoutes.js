@@ -26,6 +26,7 @@ const {
   getOrderMedia,
   backfillWalkIn,
 } = require('../controllers/orderController.js');
+const { exportOrdersExcel, exportOrdersPDF } = require('../controllers/exportController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
 const { orderLimiter } = require('../middleware/rateLimiter.js');
@@ -40,6 +41,8 @@ router.route('/')
 // Must be before /:id to avoid route conflict
 router.get('/counts',          authorize('staff', 'admin', 'manager', 'receptionist'), getOrderCounts);
 router.get('/dashboard-stats', authorize('admin', 'manager'), getOrderDashboardStats);
+router.get('/export/excel',    authorize('admin', 'manager'), exportOrdersExcel);
+router.get('/export/pdf',      authorize('admin', 'manager'), exportOrdersPDF);
 router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
 router.get('/my-stats',         authorize('customer'), getMyStats);
 router.post('/backfill-walkin', authorize('admin'), backfillWalkIn);
