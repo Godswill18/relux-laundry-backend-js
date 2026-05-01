@@ -255,3 +255,98 @@ exports.updateAttendance = asyncHandler(async (req, res, next) => {
     data: { attendance },
   });
 });
+
+// ─── Monthly Hours Summary ────────────────────────────────────────────────────
+// @desc    Aggregate work hours per staff member for a given month/year
+// @route   GET /api/v1/attendance/monthly-hours
+// @access  Admin, Manager
+exports.getMonthlyHoursSummary = asyncHandler(async (req, res) => {
+  const month  = parseInt(req.query.month, 10) || (new Date().getMonth() + 1);
+  const year   = parseInt(req.query.year,  10) || new Date().getFullYear();
+  const userId = req.query.userId || null;
+
+  // Clamp month
+  const m = Math.max(1, Math.min(12, month));
+
+  const startDate = new Date(Date.UTC(year, m - 1, 1, 0, 0, 0, 0));
+  const endDate   = new Date(Date.UTC(year, m,     0, 23, 59, 59, 999));
+
+  const mongoose = require('mongoose');
+
+  const baseMatch = { clockInAt: { $gte: startDate, $lte: endDate } };
+  if (userId) baseMatch.userId = new mongoose.Types.ObjectId(userId);
+
+  // ── Complete sessions (have clockOut & positive duration) ────────────────
+  const completePipeline = [
+    { $match: { ...baseMatch, clockOutAt: { $exists: true, $ne: null } } },
+    { $addFields: { durationMs: { $subtract: ['$clockOutAt', '$clockInAt'] } } },
+    { $match: { durationMs: { $gt: 0 } } },
+    {
+      $group: {
+        _id: '$userId',
+        totalMinutes: { $sum: { $divide: ['$durationMs', 60000] } },
+        daysSet: { $addToSet: { $dateToString: { format: '%Y-%m-%d', date: '$clockInAt' } } },
+        sessionCount: { $sum: 1 },
+      },
+    },
+    {
+      $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' },
+    },
+    { $unwind: { path: '$user', preserveNullAndEmptyArrays: false } },
+    {
+      $project: {
+        userId:       '$_id',
+        name:         { $ifNull: ['$user.name', 'Unknown'] },
+        role:         { $ifNull: ['$user.staffRole', '$user.role'] },
+        totalMinutes: { $round: ['$totalMinutes', 0] },
+        daysWorked:   { $size: '$daysSet' },
+        sessionCount: 1,
+      },
+    },
+    { $sort: { name: 1 } },
+  ];
+
+  // ── Incomplete sessions (missing or null clockOut) ───────────────────────
+  const incompletePipeline = [
+    { $match: { ...baseMatch, $or: [{ clockOutAt: { $exists: false } }, { clockOutAt: null }] } },
+    { $group: { _id: '$userId', count: { $sum: 1 } } },
+  ];
+
+  const [completeRows, incompleteRows] = await Promise.all([
+    Attendance.aggregate(completePipeline),
+    Attendance.aggregate(incompletePipeline),
+  ]);
+
+  const incompleteMap = {};
+  incompleteRows.forEach(({ _id, count }) => { incompleteMap[_id.toString()] = count; });
+
+  const STANDARD_DAILY_HOURS = 8;
+
+  const summary = completeRows.map((r) => {
+    const totalMinutes  = Math.max(0, r.totalMinutes);
+    const totalHours    = Math.round(totalMinutes / 60 * 10) / 10;
+    const avgDaily      = r.daysWorked > 0 ? Math.round(totalMinutes / r.daysWorked) : 0;
+    const expectedMins  = r.daysWorked * STANDARD_DAILY_HOURS * 60;
+    const overtimeMins  = Math.max(0, totalMinutes - expectedMins);
+    return {
+      userId:              r.userId,
+      name:                r.name,
+      role:                r.role,
+      sessionCount:        r.sessionCount,
+      incompleteSessions:  incompleteMap[r.userId.toString()] || 0,
+      daysWorked:          r.daysWorked,
+      totalMinutes,
+      totalHours,
+      avgDailyMinutes:     avgDaily,
+      avgDailyHours:       Math.round(avgDaily / 60 * 10) / 10,
+      overtimeMinutes:     overtimeMins,
+      overtimeHours:       Math.round(overtimeMins / 60 * 10) / 10,
+    };
+  });
+
+  res.status(200).json({
+    success: true,
+    message: 'Monthly hours summary fetched',
+    data: { summary, month: m, year },
+  });
+});
