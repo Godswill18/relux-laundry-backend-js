@@ -626,6 +626,7 @@ async function processSuccessfulPaystackPayment(transaction, paystackData, io) {
       await Order.findByIdAndUpdate(transaction.orderId, {
         paymentStatus: 'paid',
         'payment.status': 'paid',
+        'payment.method': 'paystack',
         'payment.amount': transaction.amount,
         'payment.paidAt': new Date(),
       });

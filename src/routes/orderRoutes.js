@@ -17,6 +17,7 @@ const {
   scanPickup,
   updatePayment,
   payBalanceFromWallet,
+  customerPayWithWallet,
   cancelOrder,
   lookupByQR,
   scanDelivery,
@@ -61,6 +62,7 @@ router.patch('/:id/accept-delivery',  authorize('delivery', 'admin', 'manager'),
 router.patch('/:id/assign',           authorize('admin', 'manager'), assignStaff);
 router.put('/:id/payment', authorize('staff', 'admin', 'manager'), updatePayment);
 router.post('/:id/pay-balance', authorize('staff', 'admin', 'manager'), payBalanceFromWallet);
+router.post('/:id/pay-wallet', customerPayWithWallet);
 router.put('/:id/cancel', cancelOrder);
 
 // Order items

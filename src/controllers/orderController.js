@@ -1840,6 +1840,92 @@ exports.payBalanceFromWallet = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Customer pays an unpaid/partial order from their own wallet
+// @route   POST /api/v1/orders/:id/pay-wallet
+// @access  Private (Customer — order owner only)
+exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return next(new AppError('Order not found', 404));
+
+  // Ownership check — order.customer is the User._id
+  if (order.customer.toString() !== req.user._id.toString()) {
+    return next(new AppError('Not authorized to pay for this order', 403));
+  }
+
+  // Prevent double payment
+  if (order.paymentStatus === 'paid') {
+    return next(new AppError('Order is already paid', 409));
+  }
+
+  if (!['unpaid', 'partial'].includes(order.paymentStatus)) {
+    return next(new AppError('Order cannot be paid in this state', 400));
+  }
+
+  const alreadyPaid = order.paymentStatus === 'unpaid' ? 0 : (order.payment?.amount || 0);
+  const balanceDue  = Math.max(0, Math.round((order.total - alreadyPaid) * 100) / 100);
+
+  if (balanceDue <= 0) {
+    return next(new AppError('No outstanding balance on this order', 400));
+  }
+
+  // Resolve customer wallet via User.customerId
+  const orderUser = await User.findById(order.customer).select('customerId').lean();
+  if (!orderUser?.customerId) {
+    return next(new AppError('Customer wallet not found', 404));
+  }
+
+  const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+  if (!wallet) return next(new AppError('Wallet not found. Please contact support.', 404));
+
+  if (wallet.balance < balanceDue) {
+    return next(new AppError(
+      `Insufficient wallet balance. Balance: ₦${wallet.balance.toLocaleString()}, Required: ₦${balanceDue.toLocaleString()}`,
+      400
+    ));
+  }
+
+  // Deduct from wallet
+  wallet.balance -= balanceDue;
+  await wallet.save();
+
+  await WalletTransaction.create({
+    walletId:     wallet._id,
+    customerId:   orderUser.customerId,
+    type:         'debit',
+    amount:       balanceDue,
+    reason:       `Payment for order ${order.orderNumber}`,
+    balanceAfter: wallet.balance,
+  });
+
+  // Mark order fully paid
+  order.paymentStatus      = 'paid';
+  order.payment.status     = 'paid';
+  order.payment.method     = 'wallet';
+  order.payment.amount     = order.total;
+  order.payment.paidAt     = new Date();
+  await order.save();
+
+  await processReferralReward(order, 'paid', req.app.get('io'));
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`user-${req.user._id}`).emit('wallet:balance-updated', {
+      balance: wallet.balance,
+      transaction: { type: 'debit', amount: balanceDue, reason: `Payment for order ${order.orderNumber}` },
+    });
+    io.to(`order-${order._id}`).emit('order:updated', {
+      orderId: order._id,
+      paymentStatus: 'paid',
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `₦${balanceDue.toLocaleString()} paid from wallet. Order is now fully paid.`,
+    data: { order, amountCharged: balanceDue, walletBalance: wallet.balance },
+  });
+});
+
 // @desc    Cancel order
 // @route   PUT /api/v1/orders/:id/cancel
 // @access  Private
