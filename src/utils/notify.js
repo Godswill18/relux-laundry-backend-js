@@ -1,9 +1,53 @@
 // ============================================================================
-// NOTIFY UTILITY — persist in-app notification + emit socket event
+// NOTIFY UTILITY — persist in-app notification + emit socket event + web push
 // ============================================================================
 
 const Notification = require('../models/Notification.js');
 const logger = require('./logger.js');
+const webpush = require('web-push');
+const PushSubscription = require('../models/PushSubscription.js');
+
+webpush.setVapidDetails(
+  process.env.VAPID_SUBJECT || 'mailto:support@reluxlaundry.com',
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY,
+);
+
+async function sendPushToUser({ userId, customerId, title, body, type, metadata }) {
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
+  const query = [];
+  if (userId)     query.push({ userId });
+  if (customerId) query.push({ customerId });
+  if (!query.length) return;
+
+  const subs = await PushSubscription.find({ $or: query }).lean();
+  if (!subs.length) return;
+
+  const payload = JSON.stringify({
+    title: title || 'Relux',
+    body:  body  || '',
+    icon:  '/favicon.webp',
+    badge: '/favicon.webp',
+    data:  { type, metadata },
+  });
+
+  const results = await Promise.allSettled(
+    subs.map((sub) =>
+      webpush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, payload)
+    )
+  );
+
+  const expiredEndpoints = [];
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      const status = r.reason?.statusCode;
+      if (status === 410 || status === 404) expiredEndpoints.push(subs[i].endpoint);
+    }
+  });
+  if (expiredEndpoints.length) {
+    PushSubscription.deleteMany({ endpoint: { $in: expiredEndpoints } }).catch(() => {});
+  }
+}
 
 /**
  * Create a persistent in-app notification and emit a socket event.
@@ -68,6 +112,9 @@ async function notify(io, opts) {
       io.to(targetRoom).emit(event, payload);
     }
   }
+
+  // 3. Web Push (fire-and-forget — non-blocking)
+  sendPushToUser({ userId, customerId, title, body, type, metadata }).catch(() => {});
 
   return saved;
 }

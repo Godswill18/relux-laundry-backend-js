@@ -7,6 +7,7 @@ const {
   getOrderDashboardStats,
   getStaffCounts,
   getMyStats,
+  getLeaderboard,
   getOrder,
   updateOrder,
   updateOrderStatus,
@@ -46,6 +47,7 @@ router.get('/export/excel',    authorize('admin', 'manager'), exportOrdersExcel)
 router.get('/export/pdf',      authorize('admin', 'manager'), exportOrdersPDF);
 router.get('/staff-counts', authorize('staff', 'admin', 'manager', 'receptionist'), getStaffCounts);
 router.get('/my-stats',         authorize('customer'), getMyStats);
+router.get('/leaderboard',      getLeaderboard);
 router.post('/backfill-walkin', authorize('admin'), backfillWalkIn);
 router.post('/lookup-by-qr', authorize('staff', 'admin', 'manager', 'delivery'), lookupByQR);
 router.post('/scan-delivery', authorize('staff', 'admin', 'manager', 'delivery'), scanDelivery);

@@ -1,5 +1,6 @@
 const Notification = require('../models/Notification.js');
 const NotificationPreference = require('../models/NotificationPreference.js');
+const PushSubscription = require('../models/PushSubscription.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 
@@ -183,6 +184,41 @@ exports.getPreferences = asyncHandler(async (req, res, next) => {
     message: 'Preferences fetched successfully',
     data: { preferences },
   });
+});
+
+// @desc    Get VAPID public key for Web Push subscription
+// @route   GET /api/v1/notifications/vapid-public-key
+// @access  Public
+exports.getVapidPublicKey = (req, res) => {
+  res.json({ success: true, data: { publicKey: process.env.VAPID_PUBLIC_KEY || '' } });
+};
+
+// @desc    Save a Web Push subscription
+// @route   POST /api/v1/notifications/push-subscribe
+// @access  Private
+exports.subscribePush = asyncHandler(async (req, res) => {
+  const { endpoint, keys } = req.body;
+  if (!endpoint || !keys?.p256dh || !keys?.auth) {
+    return res.status(400).json({ success: false, message: 'Invalid subscription object' });
+  }
+  const userId     = req.user?.role !== 'customer' ? req.user._id : undefined;
+  const customerId = req.user?.customerId || undefined;
+
+  await PushSubscription.findOneAndUpdate(
+    { endpoint },
+    { endpoint, keys, userId, customerId, userAgent: req.headers['user-agent'] },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, message: 'Push subscription saved' });
+});
+
+// @desc    Remove a Web Push subscription
+// @route   DELETE /api/v1/notifications/push-subscribe
+// @access  Private
+exports.unsubscribePush = asyncHandler(async (req, res) => {
+  const { endpoint } = req.body;
+  if (endpoint) await PushSubscription.deleteOne({ endpoint });
+  res.json({ success: true, message: 'Push subscription removed' });
 });
 
 // @desc    Update notification preferences

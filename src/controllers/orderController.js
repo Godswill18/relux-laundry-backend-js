@@ -954,12 +954,12 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
       {
         $facet: {
           totalRevenue: [
-            { $match: { paymentStatus: 'paid' } },
-            { $group: { _id: null, sum: { $sum: '$pricing.total' } } },
+            { $match: { paymentStatus: 'paid', status: { $nin: ['cancelled'] } } },
+            { $group: { _id: null, sum: { $sum: { $ifNull: ['$pricing.total', '$total'] } } } },
           ],
           todayRevenue: [
-            { $match: { paymentStatus: 'paid', createdAt: { $gte: todayStart, $lte: todayEnd } } },
-            { $group: { _id: null, sum: { $sum: '$pricing.total' } } },
+            { $match: { paymentStatus: 'paid', status: { $nin: ['cancelled'] }, createdAt: { $gte: todayStart, $lte: todayEnd } } },
+            { $group: { _id: null, sum: { $sum: { $ifNull: ['$pricing.total', '$total'] } } } },
           ],
         },
       },
@@ -1273,6 +1273,44 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
+  // Auto-refund wallet if order was paid via wallet and is now being cancelled
+  let walletRefundIssued = false;
+  let refundAmount = 0;
+  if (status === 'cancelled' && order.payment?.method === 'wallet' && order.paymentStatus === 'paid') {
+    refundAmount = order.payment?.amount || order.total || 0;
+    if (refundAmount > 0) {
+      const orderUser = await User.findById(order.customer).select('customerId').lean();
+      if (orderUser?.customerId) {
+        const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+        if (wallet) {
+          wallet.balance += refundAmount;
+          await wallet.save();
+          await WalletTransaction.create({
+            walletId: wallet._id,
+            customerId: orderUser.customerId,
+            type: 'credit',
+            amount: refundAmount,
+            reason: `Order Cancellation Refund — ${order.orderNumber}`,
+            balanceAfter: wallet.balance,
+            source: 'order',
+          });
+          order.paymentStatus = 'refunded';
+          order.payment.status = 'refunded';
+          await order.save();
+          walletRefundIssued = true;
+
+          const refundIo = req.app.get('io');
+          if (refundIo) {
+            refundIo.to(`user-${orderUser.customerId}`).emit('wallet:balance-updated', {
+              balance: wallet.balance,
+              transaction: { type: 'credit', amount: refundAmount, reason: 'Order Cancellation Refund' },
+            });
+          }
+        }
+      }
+    }
+  }
+
   // Handle referral auto-qualification — respects all referral settings
   if (status) {
     await processReferralReward(order, status, req.app.get('io'));
@@ -1325,10 +1363,13 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     };
     const label = statusLabels[status] || status;
     if (resolvedCustomerId) {
+      const notifBody = walletRefundIssued
+        ? `Your order ${order.orderNumber} has been cancelled. A refund of ₦${refundAmount.toLocaleString()} has been credited to your wallet.`
+        : `Your order ${order.orderNumber} is now ${label}.`;
       await notify(io, {
         type: 'order_status_updated',
         title: 'Order Update',
-        body: `Your order ${order.orderNumber} is now ${label}.`,
+        body: notifBody,
         customerId: resolvedCustomerId,
         metadata: { orderId: order._id, orderNumber: order.orderNumber, status },
       });
@@ -1831,6 +1872,7 @@ exports.payBalanceFromWallet = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       paymentStatus: 'paid',
     });
+    io.emit('leaderboard:updated');
   }
 
   res.status(200).json({
@@ -1917,6 +1959,7 @@ exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       paymentStatus: 'paid',
     });
+    io.emit('leaderboard:updated');
   }
 
   res.status(200).json({
@@ -2212,6 +2255,103 @@ exports.getMyStats = asyncHandler(async (req, res, next) => {
         : null,
       tiers: tiers.map((t) => ({ name: t.name, minSpend: t.minSpend, rank: t.rank })),
     },
+  });
+});
+
+// @desc    Get customer points leaderboard (weekly + monthly)
+// @route   GET /api/v1/orders/leaderboard
+// @access  Private
+exports.getLeaderboard = asyncHandler(async (req, res) => {
+  const now = new Date();
+
+  const weekStart = new Date(now);
+  weekStart.setUTCDate(now.getUTCDate() - ((now.getUTCDay() + 6) % 7));
+  weekStart.setUTCHours(0, 0, 0, 0);
+
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+  const TOP_N = 50;
+
+  const buildPipeline = (dateStart) => [
+    {
+      $match: {
+        type: 'earn',
+        customerId: { $ne: null },
+        createdAt: { $gte: dateStart },
+      },
+    },
+    {
+      $group: {
+        _id: '$customerId',
+        totalPoints: { $sum: '$points' },
+      },
+    },
+    { $sort: { totalPoints: -1 } },
+    { $limit: TOP_N },
+    {
+      $lookup: {
+        from: 'customers',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'customer',
+      },
+    },
+    { $unwind: '$customer' },
+    {
+      $project: {
+        _id: 0,
+        customerId: '$_id',
+        name: '$customer.name',
+        totalPoints: 1,
+      },
+    },
+  ];
+
+  const [weeklyRaw, monthlyRaw] = await Promise.all([
+    LoyaltyLedger.aggregate(buildPipeline(weekStart)),
+    LoyaltyLedger.aggregate(buildPipeline(monthStart)),
+  ]);
+
+  const addRank = (arr) => arr.map((entry, i) => ({ ...entry, rank: i + 1 }));
+  const weekly  = addRank(weeklyRaw);
+  const monthly = addRank(monthlyRaw);
+
+  let myWeeklyRank  = null;
+  let myMonthlyRank = null;
+
+  if (req.user.role === 'customer' && req.user.customerId) {
+    const myId = req.user.customerId.toString();
+
+    const getMyRank = async (dateStart) => {
+      const results = await LoyaltyLedger.aggregate([
+        {
+          $match: {
+            type: 'earn',
+            customerId: { $ne: null },
+            createdAt: { $gte: dateStart },
+          },
+        },
+        {
+          $group: {
+            _id: '$customerId',
+            totalPoints: { $sum: '$points' },
+          },
+        },
+        { $sort: { totalPoints: -1 } },
+      ]);
+      const idx = results.findIndex((r) => r._id.toString() === myId);
+      return idx === -1 ? null : { rank: idx + 1, totalPoints: results[idx].totalPoints };
+    };
+
+    [myWeeklyRank, myMonthlyRank] = await Promise.all([
+      getMyRank(weekStart),
+      getMyRank(monthStart),
+    ]);
+  }
+
+  res.status(200).json({
+    success: true,
+    data: { weekly, monthly, myWeeklyRank, myMonthlyRank },
   });
 });
 

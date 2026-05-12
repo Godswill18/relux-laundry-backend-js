@@ -630,6 +630,7 @@ async function processSuccessfulPaystackPayment(transaction, paystackData, io) {
         'payment.amount': transaction.amount,
         'payment.paidAt': new Date(),
       });
+      if (io) io.emit('leaderboard:updated');
     } catch (orderErr) {
       logger.error(`[processSuccessful] Order update error for ref=${transaction.reference}: ${orderErr.message}`);
     }
