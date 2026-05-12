@@ -7,11 +7,13 @@ const logger = require('./logger.js');
 const webpush = require('web-push');
 const PushSubscription = require('../models/PushSubscription.js');
 
-webpush.setVapidDetails(
-  process.env.VAPID_SUBJECT || 'mailto:support@reluxlaundry.com',
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY,
-);
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:support@reluxlaundry.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY,
+  );
+}
 
 async function sendPushToUser({ userId, customerId, title, body, type, metadata }) {
   if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;

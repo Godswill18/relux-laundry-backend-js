@@ -11,7 +11,7 @@ const allowedOrigins = [
     'https://relux.ng',
     'https://www.relux.ng',
     'https://staff.relux.ng',
-    'https://admin.relux.ng',
+    // 'https://admin.relux.ng',
 ];
 
 module.exports = allowedOrigins;
