@@ -15,6 +15,29 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
   );
 }
 
+function resolveUrl(type, metadata = {}) {
+  const orderId = metadata.orderId;
+  switch (type) {
+    case 'order_created':
+    case 'order_status_updated':
+    case 'order_cancelled':
+    case 'order_ready_for_delivery':
+    case 'order_needs_pickup':
+      return orderId ? `/orders/${orderId}` : '/orders';
+    case 'wallet_credited':
+      return '/wallet';
+    case 'referral_rewarded':
+      return '/referrals';
+    case 'points_earned':
+    case 'points_converted':
+      return '/loyalty';
+    case 'site_announcement':
+      return '/dashboard';
+    default:
+      return '/dashboard';
+  }
+}
+
 async function sendPushToUser({ userId, customerId, title, body, type, metadata }) {
   if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
   const query = [];
@@ -30,7 +53,7 @@ async function sendPushToUser({ userId, customerId, title, body, type, metadata 
     body:  body  || '',
     icon:  '/favicon.webp',
     badge: '/favicon.webp',
-    data:  { type, metadata },
+    data:  { type, metadata, url: resolveUrl(type, metadata) },
   });
 
   const results = await Promise.allSettled(
