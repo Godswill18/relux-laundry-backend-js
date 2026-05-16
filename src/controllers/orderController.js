@@ -1889,8 +1889,14 @@ exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
   const order = await Order.findById(req.params.id);
   if (!order) return next(new AppError('Order not found', 404));
 
-  // Ownership check — order.customer is the User._id
-  if (order.customer.toString() !== req.user._id.toString()) {
+  // Ownership check — supports direct customer link AND phone-matched walk-in orders
+  const linkedByUserId = order.customer && order.customer.toString() === req.user._id.toString();
+  const userPhone = normalizePhone(req.user.phone) || req.user.phone;
+  const orderPhone = order.walkInCustomer?.phone;
+  const linkedByPhone = order.orderSource === 'offline' && orderPhone &&
+    (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
+
+  if (!linkedByUserId && !linkedByPhone) {
     return next(new AppError('Not authorized to pay for this order', 403));
   }
 
@@ -1910,8 +1916,9 @@ exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('No outstanding balance on this order', 400));
   }
 
-  // Resolve customer wallet via User.customerId
-  const orderUser = await User.findById(order.customer).select('customerId').lean();
+  // Resolve customer wallet — use order.customer if set; fall back to logged-in user for phone-matched walk-ins
+  const walletUserId = order.customer || req.user._id;
+  const orderUser = await User.findById(walletUserId).select('customerId').lean();
   if (!orderUser?.customerId) {
     return next(new AppError('Customer wallet not found', 404));
   }
