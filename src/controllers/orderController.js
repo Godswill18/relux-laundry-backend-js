@@ -734,31 +734,17 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       const st = req.query.statusTab;
       const isAdminRole = ['admin', 'manager', 'receptionist'].includes(req.user.role);
 
-      if (st === 'pending') {
-        query.status = 'pending';
-        if (!isAdminRole) {
-          // Staff see only the pickable pool: unassigned orders created by admin/manager OR online orders
-          // Staff-created orders are auto-assigned at creation so they never land here,
-          // but createdByRole filter ensures correctness even for edge cases
-          query.assignedStaff = { $exists: false };
-          query.$or = [
-            { orderSource: 'online' },                                             // customer / app orders
-            { createdByRole: { $in: ['admin', 'manager', 'receptionist'] } },      // admin-created walk-ins
-          ];
-        }
-      } else {
-        query.status = st;
-        // Non-pending: all staff see ALL orders globally (full visibility).
-        // When ?myOrders=true: filter to only orders this staff is involved with.
-        if (!isAdminRole && req.query.myOrders === 'true') {
-          const staffId = req.user.id;
-          query.$or = [
-            { assignedStaff: staffId },
-            { pickupStaffId: staffId },
-            { deliveredBy: staffId },
-            { lastUpdatedById: staffId },
-          ];
-        }
+      query.status = st;
+      // All statuses: staff see all orders globally.
+      // When ?myOrders=true: filter to only orders this staff is involved with.
+      if (!isAdminRole && req.query.myOrders === 'true') {
+        const staffId = req.user.id;
+        query.$or = [
+          { assignedStaff: staffId },
+          { pickupStaffId: staffId },
+          { deliveredBy: staffId },
+          { lastUpdatedById: staffId },
+        ];
       }
     } else {
       // Manual filters
@@ -873,17 +859,6 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
 
   const results = await Promise.all(
     STATUSES.map((s) => {
-      if (s === 'pending') {
-        // Pending badge = pickable pool: unassigned admin/manager/online orders
-        return Order.countDocuments({
-          status: 'pending',
-          assignedStaff: { $exists: false },
-          $or: [
-            { orderSource: 'online' },
-            { createdByRole: { $in: ['admin', 'manager', 'receptionist'] } },
-          ],
-        });
-      }
       if (scope === 'all') {
         // Global count — all orders at this status regardless of assignment
         return Order.countDocuments({ status: s });
