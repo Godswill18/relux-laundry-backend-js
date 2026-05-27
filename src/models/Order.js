@@ -100,6 +100,12 @@ const OrderSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+    idempotencyKey: {
+      type: String,
+      unique: true,
+      sparse: true,
+      select: false,
+    },
     // 'online' = placed by customer via app; 'offline' = created by staff for walk-in
     orderSource: {
       type: String,

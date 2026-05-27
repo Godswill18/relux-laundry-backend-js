@@ -306,6 +306,15 @@ async function awardOrderPoints(order, io) {
 // @route   POST /api/v1/orders
 // @access  Private
 exports.createOrder = asyncHandler(async (req, res, next) => {
+  // Idempotency: if the client retried after a lost response, return the existing order
+  const idempotencyKey = req.body.idempotencyKey;
+  if (idempotencyKey) {
+    const existing = await Order.findOne({ idempotencyKey }).select('+idempotencyKey').lean();
+    if (existing) {
+      return res.status(200).json({ success: true, data: { order: existing } });
+    }
+  }
+
   const {
     serviceType,
     orderType,
@@ -536,6 +545,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       status: 'pending',
       amount: orderPricing.total,
     },
+    idempotencyKey: idempotencyKey || undefined,
   });
 
   // Generate QR code
@@ -581,93 +591,85 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
 
   // Handle wallet payment if payment method is 'wallet'
   if (paymentMethod && paymentMethod.toLowerCase() === 'wallet') {
-    // Get customer's wallet
-    const wallet = await Wallet.findOne({ customerId: orderCustomerRefId });
+    try {
+      const wallet = await Wallet.findOne({ customerId: orderCustomerRefId });
 
-    if (!wallet) {
-      return next(new AppError('Wallet not found for this customer', 404, ERROR_CODES.NOT_FOUND));
-    }
+      if (!wallet || wallet.balance < orderPricing.total) {
+        // Mark payment pending — customer can pay separately; don't fail the whole request
+        logger.warn(`[createOrder] Wallet payment skipped for order ${order.orderNumber}: ${!wallet ? 'wallet not found' : 'insufficient balance'}`);
+      } else {
+        wallet.balance -= orderPricing.total;
+        await wallet.save();
 
-    // Validate sufficient balance
-    if (wallet.balance < orderPricing.total) {
-      return next(new AppError('Insufficient wallet balance', 400, ERROR_CODES.INSUFFICIENT_BALANCE));
-    }
-
-    // Deduct from wallet
-    wallet.balance -= orderPricing.total;
-    await wallet.save();
-
-    // Create wallet transaction
-    await WalletTransaction.create({
-      walletId: wallet._id,
-      customerId: orderCustomerRefId,
-      type: 'debit',
-      amount: orderPricing.total,
-      reason: `Payment for order ${order.orderNumber}`,
-      balanceAfter: wallet.balance,
-      orderId: order._id,
-    });
-
-    // Mark payment as paid
-    order.payment.status = 'paid';
-    order.payment.paidAt = new Date();
-    order.paymentStatus = 'paid';
-    await order.save();
-
-    // Auto-disburse referral reward if qualifyOnStatus is 'paid'
-    await processReferralReward(order, 'paid', req.app.get('io'));
-
-    // Emit Socket.io event for wallet update
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`user-${orderCustomerRefId}`).emit('wallet:balance-updated', {
-        balance: wallet.balance,
-        transaction: {
+        await WalletTransaction.create({
+          walletId: wallet._id,
+          customerId: orderCustomerRefId,
           type: 'debit',
           amount: orderPricing.total,
           reason: `Payment for order ${order.orderNumber}`,
-        },
-      });
+          balanceAfter: wallet.balance,
+          orderId: order._id,
+        });
+
+        order.payment.status = 'paid';
+        order.payment.paidAt = new Date();
+        order.paymentStatus = 'paid';
+        await order.save();
+
+        await processReferralReward(order, 'paid', req.app.get('io')).catch(() => {});
+
+        const io = req.app.get('io');
+        if (io) {
+          io.to(`user-${orderCustomerRefId}`).emit('wallet:balance-updated', {
+            balance: wallet.balance,
+            transaction: { type: 'debit', amount: orderPricing.total, reason: `Payment for order ${order.orderNumber}` },
+          });
+        }
+      }
+    } catch (walletErr) {
+      logger.error(`[createOrder] Wallet payment failed for order ${order.orderNumber}: ${walletErr.message}`);
+      // Order already saved — let it proceed as unpaid so customer can retry payment
     }
   }
 
-  // Emit socket event for real-time update + notifications
-  const io = req.app.get('io');
-  if (io) {
-    io.emit('order-created', order);
-    io.to(`user-${orderCustomerRefId || orderCustomerId}`).emit('order:created', order);
-  }
+  // Emit socket event + send notifications (fire-and-forget — must not block the response)
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('order-created', order);
+      io.to(`user-${orderCustomerRefId || orderCustomerId}`).emit('order:created', order);
+    }
 
-  // Notify admin room: new order
-  await notify(io, {
-    type: 'order_created',
-    title: 'New Order Received',
-    body: `Order ${order.orderNumber} has been placed${order.orderSource === 'online' ? ' online' : ' (walk-in)'}.`,
-    room: 'admin',
-    metadata: { orderId: order._id, orderNumber: order.orderNumber, total: order.total },
-  });
-
-  // Notify delivery agents: new order that requires pickup + delivery
-  const needsDelivery = order.orderType === 'pickup-delivery' || !!order.deliveryAddress;
-  if (needsDelivery) {
-    await notify(io, {
-      type: 'order_needs_pickup',
-      title: '🚚 New Delivery Order',
-      body: `Order ${order.orderNumber} requires pickup and delivery.`,
-      room: 'delivery',
-      metadata: { orderId: order._id, orderNumber: order.orderNumber },
-    });
-  }
-
-  // Notify customer: order confirmed
-  if (orderCustomerRefId || orderCustomerId) {
     await notify(io, {
       type: 'order_created',
-      title: 'Order Confirmed',
-      body: `Your order ${order.orderNumber} has been received and is being processed.`,
-      customerId: String(orderCustomerRefId || orderCustomerId),
-      metadata: { orderId: order._id, orderNumber: order.orderNumber },
+      title: 'New Order Received',
+      body: `Order ${order.orderNumber} has been placed${order.orderSource === 'online' ? ' online' : ' (walk-in)'}.`,
+      room: 'admin',
+      metadata: { orderId: order._id, orderNumber: order.orderNumber, total: order.total },
     });
+
+    const needsDelivery = order.orderType === 'pickup-delivery' || !!order.deliveryAddress;
+    if (needsDelivery) {
+      await notify(io, {
+        type: 'order_needs_pickup',
+        title: '🚚 New Delivery Order',
+        body: `Order ${order.orderNumber} requires pickup and delivery.`,
+        room: 'delivery',
+        metadata: { orderId: order._id, orderNumber: order.orderNumber },
+      });
+    }
+
+    if (orderCustomerRefId || orderCustomerId) {
+      await notify(io, {
+        type: 'order_created',
+        title: 'Order Confirmed',
+        body: `Your order ${order.orderNumber} has been received and is being processed.`,
+        customerId: String(orderCustomerRefId || orderCustomerId),
+        metadata: { orderId: order._id, orderNumber: order.orderNumber },
+      });
+    }
+  } catch (notifyErr) {
+    logger.error(`[createOrder] Notification/socket failed for order ${order.orderNumber}: ${notifyErr.message}`);
   }
 
   res.status(201).json({
