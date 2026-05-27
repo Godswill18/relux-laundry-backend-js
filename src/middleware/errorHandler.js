@@ -6,8 +6,16 @@ const errorHandler = (err, req, res, next) => {
   error.message = err.message;
   let errorCode = err.errorCode || 'SERVER_ERROR';
 
-  // Log error
-  logger.error(err);
+  // Log error with full request context so Dokploy shows actionable info
+  logger.error({
+    message: err.message,
+    method: req.method,
+    path: req.originalUrl,
+    status: err.statusCode || 500,
+    ip: req.ip || req.headers['x-forwarded-for'],
+    userId: req.user?.id || null,
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack }),
+  });
 
   // Mongoose bad ObjectId
   if (err.name === 'CastError') {

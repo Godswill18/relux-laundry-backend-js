@@ -7,7 +7,8 @@ const hpp = require('hpp');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
-const corsOptions = require('./config/corsOptions.js')
+const corsOptions = require('./config/corsOptions.js');
+const logger = require('./utils/logger.js');
 
 // Route imports
 const authRoutes = require('./routes/authRoutes.js');
@@ -72,9 +73,16 @@ app.use(hpp());
 // Compression
 app.use(compression());
 
-// Dev logging middleware
+// HTTP request logging — dev gets colorized output; production pipes to Winston
+// so every request appears in Dokploy's log stream as a structured JSON line.
 if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
+} else {
+  app.use(
+    morgan('combined', {
+      stream: { write: (msg) => logger.http(msg.trim()) },
+    })
+  );
 }
 
 // ✅ Add this before rate limiter and routes

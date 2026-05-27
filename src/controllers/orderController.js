@@ -585,7 +585,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
         }
       }
     } catch (err) {
-      console.error('Promo redemption recording failed:', err.message);
+      logger.error({ message: 'Promo redemption recording failed', error: err.message });
     }
   }
 

@@ -1,52 +1,48 @@
 const winston = require('winston');
-const path = require('path');
-const fs = require('fs');
 
-// Create logs directory if it doesn't exist
-const logsDir = path.join(__dirname, '../logs');
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
-}
+const isProd = process.env.NODE_ENV === 'production';
 
-// Define log format
-const logFormat = winston.format.combine(
+// JSON format for production (machine-readable, works with Dokploy/Docker log drivers)
+const jsonFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.errors({ stack: true }),
   winston.format.splat(),
   winston.format.json()
 );
 
-// Create the logger
+// Pretty format for development
+const prettyFormat = winston.format.combine(
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  winston.format.errors({ stack: true }),
+  winston.format.splat(),
+  winston.format.colorize(),
+  winston.format.printf(({ timestamp, level, message, ...meta }) => {
+    const metaStr = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
+    return `${timestamp} [${level}]: ${message}${metaStr}`;
+  })
+);
+
+// Custom levels that add 'http' between 'info' and 'verbose' so Morgan
+// access logs are captured and don't silently fall below the threshold.
+const customLevels = {
+  levels: { error: 0, warn: 1, info: 2, http: 3, verbose: 4, debug: 5, silly: 6 },
+  colors: { error: 'red', warn: 'yellow', info: 'green', http: 'magenta', verbose: 'cyan', debug: 'blue', silly: 'grey' },
+};
+winston.addColors(customLevels.colors);
+
+// In Docker/Dokploy everything goes to stdout/stderr — the container runtime
+// captures it. File transports are avoided in production because containers
+// are ephemeral and log files would be lost on restart.
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: logFormat,
+  levels: customLevels.levels,
+  level: process.env.LOG_LEVEL || 'http',
+  format: isProd ? jsonFormat : prettyFormat,
   transports: [
-    // Write all logs with level 'error' and below to error.log
-    new winston.transports.File({
-      filename: path.join(logsDir, 'error.log'),
-      level: 'error',
-      maxsize: 5242880, // 5MB
-      maxFiles: 5,
-    }),
-    // Write all logs to combined.log
-    new winston.transports.File({
-      filename: path.join(logsDir, 'combined.log'),
-      maxsize: 5242880, // 5MB
-      maxFiles: 5,
+    new winston.transports.Console({
+      // errors → stderr, everything else → stdout
+      stderrLevels: ['error'],
     }),
   ],
 });
-
-// If we're not in production, log to the console as well
-if (process.env.NODE_ENV !== 'production') {
-  logger.add(
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      ),
-    })
-  );
-}
 
 module.exports = logger;

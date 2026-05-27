@@ -214,20 +214,20 @@ exports.clerkSync = asyncHandler(async (req, res, next) => {
   }
 
   if (!token) {
-    console.log('[clerkSync] No token in Authorization header');
+    logger.debug('[clerkSync] No token in Authorization header');
     return next(new AppError('No token provided', 401));
   }
 
-  console.log('[clerkSync] Token received:', token.substring(0, 20) + '...');
+  logger.debug(`[clerkSync] Token received: ${token.substring(0, 20)}...`);
 
   // Verify Clerk token
   let clerkUserId;
   try {
     const verified = await clerkClient.verifyToken(token);
-    console.log('[clerkSync] Clerk verified:', JSON.stringify(verified));
+    logger.debug(`[clerkSync] Clerk verified sub: ${verified?.sub}`);
     clerkUserId = verified.sub;
   } catch (err) {
-    console.log('[clerkSync] Clerk verifyToken FAILED:', err.message);
+    logger.debug(`[clerkSync] Clerk verifyToken FAILED: ${err.message}`);
     return next(new AppError('Invalid Clerk token', 401));
   }
 
@@ -457,8 +457,10 @@ exports.requestOTP = asyncHandler(async (req, res, next) => {
   await user.save({ validateBeforeSave: false });
 
   // TODO: Send OTP via SMS (Twilio integration)
-  // For now, just return success
-  console.log(`OTP for ${phone}: ${otp}`);
+  // For now, only expose OTP in development (never log it in production)
+  if (process.env.NODE_ENV === 'development') {
+    logger.debug(`[requestOtp] OTP for ${phone}: ${otp}`);
+  }
 
   res.status(200).json({
     success: true,

@@ -236,8 +236,8 @@ async function dropLegacyIndexes() {
 }
 
 mongoose.connection.once('open', () => {
-  console.log('✅ MongoDB Connected Successfully');
-  console.log(`🚀 Server Environment: ${process.env.NODE_ENV || 'development'}`);
+  logger.info('MongoDB connected successfully');
+  logger.info(`Server environment: ${process.env.NODE_ENV || 'development'}`);
 
   // Clean up stale indexes from previous schema versions
   dropLegacyIndexes();
@@ -245,10 +245,6 @@ mongoose.connection.once('open', () => {
   server.listen(PORT, () => {
     logger.info(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
     logger.info(`Worker ${process.pid} started`);
-    console.log(`🎉 Server running successfully on port ${PORT}`);
-    console.log(`📍 Server URL: http://localhost:${PORT}`);
-    console.log(`🔗 Health check: GET /`);
-    console.log('─'.repeat(50));
 
     // On boot: resume retries killed by server restart (5s delay for full init)
     setTimeout(() => recoverPendingPaystackTransactions(io), 5000);
@@ -262,11 +258,11 @@ mongoose.connection.once('open', () => {
 });
 
 mongoose.connection.on('error', (err) => {
-  console.error('❌ MongoDB connection error:', err);
+  logger.error({ message: 'MongoDB connection error', error: err.message });
 });
 
 mongoose.connection.on('disconnected', () => {
-  console.log('⚠️ MongoDB disconnected');
+  logger.warn('MongoDB disconnected');
 });
 
 module.exports = server;

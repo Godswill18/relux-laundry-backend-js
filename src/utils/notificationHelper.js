@@ -3,6 +3,7 @@
 // ============================================================================
 
 const Notification = require('../models/Notification.js');
+const logger = require('./logger.js');
 
 /**
  * Create a notification and emit Socket.io event
@@ -56,7 +57,7 @@ const createNotification = async (params, io = null) => {
 
     return notification;
   } catch (error) {
-    console.error('Error creating notification:', error);
+    logger.error({ message: 'Error creating notification', error: error.message });
     throw error;
   }
 };
