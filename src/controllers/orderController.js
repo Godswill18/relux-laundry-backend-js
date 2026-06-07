@@ -1215,9 +1215,9 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   }
 
   if (order.status === 'cancelled') {
-    // Wallet refund was already issued on cancellation — reset payment so the
+    // Wallet refund was already issued on cancellation — reset to unpaid so the
     // customer pays again through the normal flow.
-    order.paymentStatus = 'pending';
+    order.paymentStatus = 'unpaid';
   }
 
   // Update status
