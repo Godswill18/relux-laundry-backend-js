@@ -5,7 +5,7 @@
 const WorkShift = require('../models/WorkShift.js');
 const Attendance = require('../models/Attendance.js');
 const logger = require('./logger.js');
-const { getNowWAT } = require('./helpers.js');
+const { getNowWAT, capToEndOfWATDay } = require('./helpers.js');
 const notify = require('./notify.js');
 const { purgeOldReadNotifications } = require('../controllers/notificationController.js');
 
@@ -49,7 +49,23 @@ function startShiftScheduler(io) {
 
       for (const shift of todaysShifts) {
         const userId = shift.userId?._id || shift.userId;
-        const shouldBeActive = currentTime >= shift.startTime && currentTime < shift.endTime;
+        // Overnight shifts (endTime <= startTime, e.g. 22:00→06:00) need special handling
+        const isOvernight = shift.endTime <= shift.startTime;
+        let shouldBeActive;
+        if (isOvernight) {
+          if (todayDate === shift.startDate && todayDate === shift.endDate) {
+            // Same-day overnight config: active during evening OR morning portions
+            shouldBeActive = currentTime >= shift.startTime || currentTime < shift.endTime;
+          } else if (todayDate === shift.startDate) {
+            shouldBeActive = currentTime >= shift.startTime; // evening portion only
+          } else if (todayDate === shift.endDate) {
+            shouldBeActive = currentTime < shift.endTime; // morning portion only
+          } else {
+            shouldBeActive = true; // middle day of a multi-day span
+          }
+        } else {
+          shouldBeActive = currentTime >= shift.startTime && currentTime < shift.endTime;
+        }
 
         // ACTIVATE: should be active but isn't, and not emergency-controlled
         if (shouldBeActive && !shift.isActive && !shift.emergencyActivated) {
@@ -111,9 +127,16 @@ function startShiftScheduler(io) {
             if (openAttendance) {
               // Compute exact shift end as a UTC Date from WAT time (WAT = UTC+1)
               const [endHour, endMin] = shift.endTime.split(':').map(Number);
-              const [yr, mo, dy] = shift.endDate.split('-').map(Number);
+              let [yr, mo, dy] = shift.endDate.split('-').map(Number);
+              // Overnight shift with same startDate/endDate: actual end is the NEXT calendar day
+              if (shift.endDate === shift.startDate && shift.endTime <= shift.startTime) {
+                const nextDay = new Date(Date.UTC(yr, mo - 1, dy + 1));
+                yr = nextDay.getUTCFullYear();
+                mo = nextDay.getUTCMonth() + 1;
+                dy = nextDay.getUTCDate();
+              }
               const shiftEndUTC = new Date(Date.UTC(yr, mo - 1, dy, endHour - 1, endMin, 0, 0));
-              openAttendance.clockOutAt = shiftEndUTC;
+              openAttendance.clockOutAt = capToEndOfWATDay(openAttendance.clockInAt, shiftEndUTC);
               openAttendance.autoClockOut = true;
               await openAttendance.save();
               logger.info(`Auto clocked out user ${userId} at shift end ${shift.endTime} (shift ${shift._id})`);

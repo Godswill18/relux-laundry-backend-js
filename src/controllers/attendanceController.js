@@ -2,6 +2,7 @@ const Attendance = require('../models/Attendance.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const { validateGeofence } = require('../utils/geofenceHelper.js');
+const { getTodayWAT, capToEndOfWATDay } = require('../utils/helpers.js');
 
 // @desc    Clock in
 // @route   POST /api/v1/attendance/clock-in
@@ -78,11 +79,11 @@ exports.clockOut = asyncHandler(async (req, res, next) => {
 
   if (!attendance) {
     // Fallback: check for today's auto-clocked-out record so staff can correct
-    // the time after being auto-logged out at shift end
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayEnd = new Date();
-    todayEnd.setHours(23, 59, 59, 999);
+    // the time after being auto-logged out at shift end.
+    // Use WAT midnight (UTC+1) so Nigerian users see the correct day boundary.
+    const todayWAT   = getTodayWAT();                              // "YYYY-MM-DD" in WAT
+    const todayStart = new Date(`${todayWAT}T00:00:00+01:00`);    // WAT midnight
+    const todayEnd   = new Date(`${todayWAT}T23:59:59+01:00`);    // WAT 11:59 PM
 
     attendance = await Attendance.findOne({
       userId: req.user.id,
@@ -95,7 +96,7 @@ exports.clockOut = asyncHandler(async (req, res, next) => {
     return next(new AppError('No active clock-in found', 400));
   }
 
-  attendance.clockOutAt = new Date();
+  attendance.clockOutAt = capToEndOfWATDay(attendance.clockInAt, new Date());
   attendance.autoClockOut = false;
   if (geoLat != null) attendance.geoLat = Number(geoLat);
   if (geoLng != null) attendance.geoLng = Number(geoLng);
@@ -223,36 +224,32 @@ exports.getAttendanceByUser = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/attendance/:id
 // @access  Private (Admin/Manager)
 exports.updateAttendance = asyncHandler(async (req, res, next) => {
-  const fieldsToUpdate = {
-    clockInAt: req.body.clockInAt,
-    clockOutAt: req.body.clockOutAt,
-    status: req.body.status,
-    shiftId: req.body.shiftId,
-    autoClockOut: req.body.autoClockOut,
-  };
+  const existing = await Attendance.findById(req.params.id);
+  if (!existing) return next(new AppError('Attendance record not found', 404));
 
-  // When admin manually sets a clock-out time, clear the auto-clock-out flag
+  const fieldsToUpdate = {};
+  if (req.body.status    !== undefined) fieldsToUpdate.status    = req.body.status;
+  if (req.body.shiftId   !== undefined) fieldsToUpdate.shiftId   = req.body.shiftId;
+  if (req.body.clockInAt !== undefined) fieldsToUpdate.clockInAt  = req.body.clockInAt;
+
   if (req.body.clockOutAt !== undefined) {
+    const effectiveClockIn = req.body.clockInAt
+      ? new Date(req.body.clockInAt)
+      : existing.clockInAt;
+    fieldsToUpdate.clockOutAt   = capToEndOfWATDay(effectiveClockIn, new Date(req.body.clockOutAt));
     fieldsToUpdate.autoClockOut = false;
   }
 
-  Object.keys(fieldsToUpdate).forEach(
-    (key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]
-  );
+  Object.assign(existing, fieldsToUpdate);
+  await existing.save({ validateBeforeSave: true });
 
-  const attendance = await Attendance.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
-    new: true,
-    runValidators: true,
-  });
-
-  if (!attendance) {
-    return next(new AppError('Attendance record not found', 404));
-  }
+  await existing.populate('userId', 'name role staffRole');
+  await existing.populate('shiftId', 'startDate startTime endDate endTime shiftType status isActive');
 
   res.status(200).json({
     success: true,
     message: 'Attendance updated successfully',
-    data: { attendance },
+    data: { attendance: existing },
   });
 });
 

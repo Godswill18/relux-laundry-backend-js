@@ -105,6 +105,20 @@ const getNowWAT = () => {
   return { dateStr, timeStr };
 };
 
+// Return the WAT calendar date string ("YYYY-MM-DD") for any Date object
+const getWATDateStr = (date) => {
+  const watMs = date.getTime() + 60 * 60 * 1000;
+  return new Date(watMs).toISOString().slice(0, 10);
+};
+
+// Cap proposedClockOut to 23:59:59 WAT of the clock-in day.
+// Both arguments must be Date objects. Returns a Date.
+const capToEndOfWATDay = (clockIn, proposedClockOut) => {
+  const dayStr   = getWATDateStr(new Date(clockIn));
+  const endOfDay = new Date(`${dayStr}T23:59:59+01:00`); // = 22:59:59 UTC
+  return proposedClockOut > endOfDay ? endOfDay : proposedClockOut;
+};
+
 module.exports = {
   generateOTP,
   splitName,
@@ -113,4 +127,6 @@ module.exports = {
   generateQRCode,
   getTodayWAT,
   getNowWAT,
+  getWATDateStr,
+  capToEndOfWATDay,
 };
