@@ -1215,16 +1215,6 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   }
 
   if (order.status === 'cancelled') {
-    const canRestore = ['admin', 'manager'].includes(req.user.role);
-    if (!canRestore) {
-      return next(new AppError('Cannot update status of a cancelled order', 400));
-    }
-    const restorableStatuses = ['pending', 'confirmed'];
-    if (!restorableStatuses.includes(status)) {
-      return next(
-        new AppError('Cancelled orders can only be restored to pending or confirmed', 400)
-      );
-    }
     // Wallet refund was already issued on cancellation — reset payment so the
     // customer pays again through the normal flow.
     order.paymentStatus = 'pending';
