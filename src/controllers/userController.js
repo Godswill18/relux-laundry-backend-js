@@ -13,6 +13,20 @@ exports.getUsers = asyncHandler(async (req, res, next) => {
     query.role = req.query.role;
   }
 
+  // Developer accounts are invisible to all non-developer users
+  if (req.user?.role !== 'developer') {
+    if (query.role === 'developer') {
+      // Block explicit queries for developer accounts
+      return res.status(200).json({
+        success: true,
+        message: 'Users fetched successfully',
+        data: { users: [] },
+        pagination: { page: 1, limit: parseInt(req.query.limit, 10) || 10, total: 0, pages: 0 },
+      });
+    }
+    query.role = query.role || { $ne: 'developer' };
+  }
+
   // Filter by active status
   if (req.query.isActive !== undefined) {
     query.isActive = req.query.isActive === 'true';

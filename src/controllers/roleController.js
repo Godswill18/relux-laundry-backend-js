@@ -19,7 +19,8 @@ exports.getRoles = asyncHandler(async (req, res, next) => {
     await Role.insertMany(seeds);
   }
 
-  const roles = await Role.find().sort('name');
+  const roleFilter = req.user?.role !== 'developer' ? { name: { $ne: 'developer' } } : {};
+  const roles = await Role.find(roleFilter).sort('name');
 
   res.status(200).json({
     success: true,

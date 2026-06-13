@@ -71,6 +71,10 @@ exports.protect = asyncHandler(async (req, res, next) => {
 // Grant access to specific roles
 exports.authorize = (...roles) => {
   return (req, res, next) => {
+    // Developer role bypasses all role restrictions
+    if (req.user.role === 'developer') {
+      return next();
+    }
     if (!roles.includes(req.user.role)) {
       return next(
         new AppError(

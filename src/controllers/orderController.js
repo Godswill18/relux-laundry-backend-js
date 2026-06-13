@@ -343,7 +343,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     promoCode: bodyPromoCode,
   } = req.body;
 
-  const isStaffRole = ['staff', 'admin', 'manager'].includes(req.user.role);
+  const isStaffRole = ['staff', 'admin', 'manager', 'developer'].includes(req.user.role);
   // Auto-classify: staff/admin/manager always creates walk-in (offline); customers always create online
   const isOffline = isStaffRole;
 
@@ -734,7 +734,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     } else if (req.query.statusTab) {
       // --- 11-status workflow tab (Admin & Staff pages) ---
       const st = req.query.statusTab;
-      const isAdminRole = ['admin', 'manager', 'receptionist'].includes(req.user.role);
+      const isAdminRole = ['admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
 
       query.status = st;
       // All statuses: staff see all orders globally.
@@ -1443,8 +1443,8 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
     return next(new AppError('This order has been cancelled and cannot be delivered', 400));
   }
 
-  // Only the assigned delivery staff (or admin/manager) can confirm delivery
-  const isAdminRole = ['admin', 'manager'].includes(req.user.role);
+  // Only the assigned delivery staff (or admin/manager/developer) can confirm delivery
+  const isAdminRole = ['admin', 'manager', 'developer'].includes(req.user.role);
   if (!isAdminRole && order.deliveredBy) {
     const assignedId = String(order.deliveredBy._id || order.deliveredBy);
     if (assignedId !== String(req.user.id)) {
@@ -1695,8 +1695,8 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
     return next(new AppError(`Cannot confirm pickup: order is currently "${order.status}"`, 400));
   }
 
-  // Only the assigned pickup staff (or admin/manager) can scan
-  const isAdminRole = ['admin', 'manager'].includes(req.user.role);
+  // Only the assigned pickup staff (or admin/manager/developer) can scan
+  const isAdminRole = ['admin', 'manager', 'developer'].includes(req.user.role);
   if (!isAdminRole && order.pickupStaffId) {
     const assignedId = String(order.pickupStaffId._id || order.pickupStaffId);
     if (assignedId !== String(req.user.id)) {

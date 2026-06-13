@@ -15,7 +15,7 @@ const AppError = require('../utils/appError.js');
 exports.getStaff = asyncHandler(async (req, res, next) => {
   let query = { role: { $in: ['staff', 'admin', 'manager', 'delivery'] } };
 
-  if (req.query.role && req.query.role !== 'all') {
+  if (req.query.role && req.query.role !== 'all' && req.query.role !== 'developer') {
     query.role = req.query.role;
   }
 
