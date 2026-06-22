@@ -9,6 +9,7 @@ const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
 const corsOptions = require('./config/corsOptions.js');
 const logger = require('./utils/logger.js');
+const requestLogger = require('./middleware/requestLogger.js');
 
 // Route imports
 const authRoutes = require('./routes/authRoutes.js');
@@ -73,17 +74,13 @@ app.use(hpp());
 // Compression
 app.use(compression());
 
-// HTTP request logging — dev gets colorized output; production pipes to Winston
-// so every request appears in Dokploy's log stream as a structured JSON line.
+// Dev: colorized Morgan output for easy reading in local terminal.
+// All envs: structured requestLogger attaches a requestId to every request
+// and emits one JSON log line per response — filterable by field in Dokploy.
 if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
-} else {
-  app.use(
-    morgan('combined', {
-      stream: { write: (msg) => logger.http(msg.trim()) },
-    })
-  );
 }
+app.use(requestLogger);
 
 // ✅ Add this before rate limiter and routes
 app.set('trust proxy', 1);

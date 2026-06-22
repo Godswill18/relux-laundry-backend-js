@@ -6,9 +6,11 @@ const errorHandler = (err, req, res, next) => {
   error.message = err.message;
   let errorCode = err.errorCode || 'SERVER_ERROR';
 
-  // Log error with full request context so Dokploy shows actionable info
+  // Log error with full request context so Dokploy shows actionable info.
+  // requestId links this error line to the HTTP access log for the same request.
   logger.error({
     message: err.message,
+    requestId: req.requestId || null,
     method: req.method,
     path: req.originalUrl,
     status: err.statusCode || 500,
