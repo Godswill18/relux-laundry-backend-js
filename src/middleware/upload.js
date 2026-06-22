@@ -5,7 +5,7 @@ const crypto  = require('crypto');
 
 // ── Announcement images ───────────────────────────────────────────────────────
 
-const ANNOUNCEMENT_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'announcements');
+const ANNOUNCEMENT_UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads', 'announcements');
 
 // Ensure directory exists on first require
 if (!fs.existsSync(ANNOUNCEMENT_UPLOAD_DIR)) {
