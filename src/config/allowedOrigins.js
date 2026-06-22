@@ -11,6 +11,7 @@ const allowedOrigins = [
     'https://relux.ng',
     'https://www.relux.ng',
     'https://staff.relux.ng',
+    'https://media.relux.ng'
     // 'https://admin.relux.ng',
 ];
 
