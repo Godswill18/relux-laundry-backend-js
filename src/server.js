@@ -1,5 +1,6 @@
 require('dotenv').config();
 const http = require('http');
+const fs   = require('fs');
 const { Server } = require('socket.io');
 const app = require('./app.js');
 const connectDB = require('./config/database.js');
@@ -15,6 +16,13 @@ const {
   paystackRequest,
   processSuccessfulPaystackPayment,
 } = require('./controllers/paymentController.js');
+
+// Ensure upload directories exist on startup
+const uploadsDir = process.cwd() + '/uploads/announcements';
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+logger.info(`[startup] Upload directory: ${uploadsDir}`);
 
 // Connect to database
 connectDB();
