@@ -53,7 +53,7 @@ app.use(helmet({
 
 // Serve uploaded files (images, etc.) from the project root /uploads directory.
 // __dirname here is src/, so we go one level up to reach the project root.
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 // Webhook routes (must be before body parsers - needs raw body for Svix signature verification)
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRoutes);
