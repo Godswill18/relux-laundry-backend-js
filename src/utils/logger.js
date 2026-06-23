@@ -1,8 +1,11 @@
 const winston = require('winston');
 
-const isProd = process.env.NODE_ENV === 'production';
+// Colors only when running in an actual terminal (never in Docker containers)
+const isTTY = !!process.stdout.isTTY;
+// JSON mode: opt-in via LOG_FORMAT=json env var (useful for log aggregators)
+const useJson = process.env.LOG_FORMAT === 'json';
 
-// JSON format for production (machine-readable, works with Dokploy/Docker log drivers)
+// JSON format — machine-readable, for log aggregators
 const jsonFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.errors({ stack: true }),
@@ -10,7 +13,18 @@ const jsonFormat = winston.format.combine(
   winston.format.json()
 );
 
-// Pretty format for development
+// Plain text format — readable in Dokploy/Docker without ANSI garbage
+const plainFormat = winston.format.combine(
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  winston.format.errors({ stack: true }),
+  winston.format.splat(),
+  winston.format.printf(({ timestamp, level, message, ...meta }) => {
+    const metaStr = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
+    return `${timestamp} [${level}]: ${message}${metaStr}`;
+  })
+);
+
+// Pretty format — colorized, for local terminal only
 const prettyFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.errors({ stack: true }),
@@ -30,13 +44,18 @@ const customLevels = {
 };
 winston.addColors(customLevels.colors);
 
+// Format selection:
+//   LOG_FORMAT=json → JSON (for log aggregators)
+//   TTY (local terminal) → colored pretty text
+//   No TTY (Docker/Dokploy) → plain readable text, no ANSI codes
+const selectedFormat = useJson ? jsonFormat : isTTY ? prettyFormat : plainFormat;
+
 // In Docker/Dokploy everything goes to stdout/stderr — the container runtime
-// captures it. File transports are avoided in production because containers
-// are ephemeral and log files would be lost on restart.
+// captures it. File transports are avoided because containers are ephemeral.
 const logger = winston.createLogger({
   levels: customLevels.levels,
   level: process.env.LOG_LEVEL || 'http',
-  format: isProd ? jsonFormat : prettyFormat,
+  format: selectedFormat,
   transports: [
     new winston.transports.Console({
       // errors → stderr, everything else → stdout
