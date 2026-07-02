@@ -188,7 +188,8 @@ exports.deleteAnnouncement = asyncHandler(async (req, res, next) => {
 exports.uploadAnnouncementImage = asyncHandler(async (req, res, next) => {
   if (!req.file) return next(new AppError('No image file provided', 400));
 
-  const imageUrl = `/uploads/announcements/${req.file.filename}`;
+  const baseUrl = (process.env.MEDIA_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  const imageUrl = `${baseUrl}/uploads/announcements/${req.file.filename}`;
   res.status(200).json({
     success: true,
     message: 'Image uploaded successfully',
