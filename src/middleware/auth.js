@@ -86,3 +86,13 @@ exports.authorize = (...roles) => {
     next();
   };
 };
+
+// Block customer role from staff-only route groups.
+// Defense-in-depth on top of individual authorize() calls — ensures a future
+// route added without authorize() cannot accidentally expose staff data to customers.
+exports.noCustomers = (req, res, next) => {
+  if (req.user?.role === 'customer') {
+    return next(new AppError('This portal is for staff only.', 403, 'STAFF_ONLY'));
+  }
+  next();
+};

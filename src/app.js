@@ -39,6 +39,11 @@ const announcementRoutes = require('./routes/announcementRoutes.js');
 // Middleware imports
 const errorHandler = require('./middleware/errorHandler.js');
 const { apiLimiter } = require('./middleware/rateLimiter.js');
+const { protect, noCustomers } = require('./middleware/auth.js');
+
+// Gateway applied to routes the customer app never touches — requires a valid
+// staff JWT and blocks the customer role before any route handler runs.
+const staffGate = [protect, noCustomers];
 const app = express();
 
 // CORS must be first — applies to all routes including /uploads static files
@@ -103,9 +108,9 @@ const API_VERSION = process.env.API_VERSION || 'v1';
 app.use(`/api/${API_VERSION}/auth`, authRoutes);
 app.use(`/api/${API_VERSION}/users`, userRoutes);
 app.use(`/api/${API_VERSION}/orders`, orderRoutes);
-app.use(`/api/${API_VERSION}/admin`, adminRoutes);
+app.use(`/api/${API_VERSION}/admin`, staffGate, adminRoutes);
 app.use(`/api/${API_VERSION}/customers`, customerRoutes);
-app.use(`/api/${API_VERSION}/roles`, roleRoutes);
+app.use(`/api/${API_VERSION}/roles`, staffGate, roleRoutes);
 app.use(`/api/${API_VERSION}/services`, serviceRoutes);
 app.use(`/api/${API_VERSION}/payments`, paymentRoutes);
 app.use(`/api/${API_VERSION}/wallets`, walletRoutes);
@@ -115,12 +120,12 @@ app.use(`/api/${API_VERSION}/notifications`, notificationRoutes);
 app.use(`/api/${API_VERSION}/subscriptions`, subscriptionRoutes);
 app.use(`/api/${API_VERSION}/loyalty`, loyaltyRoutes);
 app.use(`/api/${API_VERSION}/referrals`, referralRoutes);
-app.use(`/api/${API_VERSION}/staff`, staffRoutes);
-app.use(`/api/${API_VERSION}/attendance`, attendanceRoutes);
-app.use(`/api/${API_VERSION}/work-location`, workLocationRoutes);
-app.use(`/api/${API_VERSION}/payroll`, payrollRoutes);
-app.use(`/api/${API_VERSION}/settings`, settingsRoutes);
-app.use(`/api/${API_VERSION}/audit-logs`, auditRoutes);
+app.use(`/api/${API_VERSION}/staff`, staffGate, staffRoutes);
+app.use(`/api/${API_VERSION}/attendance`, staffGate, attendanceRoutes);
+app.use(`/api/${API_VERSION}/work-location`, staffGate, workLocationRoutes);
+app.use(`/api/${API_VERSION}/payroll`, staffGate, payrollRoutes);
+app.use(`/api/${API_VERSION}/settings`, staffGate, settingsRoutes);
+app.use(`/api/${API_VERSION}/audit-logs`, staffGate, auditRoutes);
 app.use(`/api/${API_VERSION}/announcements`, announcementRoutes);
 
 // 404 handler

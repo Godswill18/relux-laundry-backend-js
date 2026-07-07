@@ -425,6 +425,10 @@ exports.updatePassword = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/auth/logout
 // @access  Private
 exports.logout = asyncHandler(async (req, res, next) => {
+  // Bump jwtVersion so the old JWT is rejected by protect on any subsequent request —
+  // the signed token is cryptographically invalid even if someone captured it.
+  await User.findByIdAndUpdate(req.user.id, { $inc: { jwtVersion: 1 } });
+
   res.cookie('token', 'none', {
     expires: new Date(Date.now() + 10 * 1000),
     httpOnly: true,
