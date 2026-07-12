@@ -1247,6 +1247,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status,
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes,
   });
 
@@ -1458,6 +1459,7 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status: 'delivered',
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes: 'Delivery confirmed via barcode scan',
     timestamp: new Date(),
   });
@@ -1542,6 +1544,7 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status: 'confirmed',
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes: `Order accepted by staff: ${req.user.name}`,
   });
   await order.save();
@@ -1608,6 +1611,7 @@ exports.acceptPickup = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status: order.status,
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes: `Pickup claimed by delivery staff: ${req.user.name}`,
   });
   await order.save();
@@ -1657,6 +1661,7 @@ exports.acceptDelivery = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status: 'out-for-delivery',
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes: `Delivery accepted and marked out-for-delivery by: ${req.user.name}`,
   });
   await order.save();
@@ -1710,6 +1715,7 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status: 'picked-up',
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes: 'Pickup confirmed via barcode scan',
     timestamp: new Date(),
   });
@@ -1986,6 +1992,7 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   order.statusHistory.push({
     status: 'cancelled',
     updatedBy: req.user.id,
+    actorRole: req.user.role,
     notes: reason,
   });
 

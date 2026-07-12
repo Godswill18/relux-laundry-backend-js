@@ -40,6 +40,9 @@ const StatusHistorySchema = new mongoose.Schema({
     ref: 'User',
     required: true,
   },
+  actorRole: {
+    type: String,
+  },
   notes: String,
 });
 
@@ -293,11 +296,14 @@ OrderSchema.pre('validate', async function (next) {
     this.code = code;
   }
 
-  // Add initial status to history — use staff creator for walk-in orders
+  // Add initial status to history.
+  // Staff creator always takes priority (walk-in orders); fall back to customer for online orders.
+  // actorRole recorded so admin UI can distinguish staff actions from customer self-service.
   this.statusHistory.push({
     status: this.status,
     timestamp: new Date(),
-    updatedBy: this.customer || this.createdByStaff,
+    updatedBy: this.createdByStaff || this.customer,
+    actorRole: this.createdByRole || 'customer',
   });
 
   next();

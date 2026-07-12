@@ -6,13 +6,34 @@ const AppError      = require('../utils/appError.js');
 
 // ── Image helpers ─────────────────────────────────────────────────────────────
 
-// Delete a local uploaded file by its stored path (e.g. "/uploads/announcements/xxx.jpg")
+// Extract the /uploads/... pathname from a stored URL (relative or absolute, any domain).
+function extractUploadPath(imageUrl) {
+  if (!imageUrl) return null;
+  let pathname = imageUrl;
+  if (imageUrl.startsWith('http')) {
+    try { pathname = new URL(imageUrl).pathname; } catch { return null; }
+  }
+  return pathname.startsWith('/uploads/') ? pathname : null;
+}
+
+// Delete the local file for a stored imageUrl, regardless of whether the URL
+// is a relative path (/uploads/...) or an absolute URL (https://domain/uploads/...).
 function deleteLocalFile(imageUrl) {
-  if (!imageUrl || !imageUrl.startsWith('/uploads/')) return;
+  const pathname = extractUploadPath(imageUrl);
+  if (!pathname) return;
   try {
-    const filePath = path.join(__dirname, '..', imageUrl);
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    const fullPath = path.join(process.cwd(), pathname);
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
   } catch { /* non-critical */ }
+}
+
+// Rebase any stored imageUrl to the current backend's origin.
+// Handles old media.relux.ng URLs and any other domain stored in the DB.
+function normalizeImageUrl(imageUrl, req) {
+  const pathname = extractUploadPath(imageUrl);
+  if (!pathname) return imageUrl;
+  const baseUrl = (process.env.MEDIA_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  return `${baseUrl}${pathname}`;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -38,9 +59,10 @@ exports.getActiveAnnouncements = asyncHandler(async (req, res) => {
     targetAudience:   audienceFilter(req.user.role),
   };
 
-  const announcements = await Announcement.find(filter)
+  const announcements = (await Announcement.find(filter)
     .sort({ priority: -1, createdAt: -1 })
-    .lean();
+    .lean()
+  ).map((a) => ({ ...a, imageUrl: normalizeImageUrl(a.imageUrl, req) }));
 
   res.status(200).json({
     success: true,
@@ -62,7 +84,7 @@ exports.getAnnouncements = asyncHandler(async (req, res) => {
   if (req.query.type)                    query.type            = req.query.type;
   if (req.query.audience)               query.targetAudience  = req.query.audience;
 
-  const [total, announcements] = await Promise.all([
+  const [total, raw] = await Promise.all([
     Announcement.countDocuments(query),
     Announcement.find(query)
       .sort({ priority: -1, createdAt: -1 })
@@ -70,6 +92,7 @@ exports.getAnnouncements = asyncHandler(async (req, res) => {
       .limit(limit)
       .lean(),
   ]);
+  const announcements = raw.map((a) => ({ ...a, imageUrl: normalizeImageUrl(a.imageUrl, req) }));
 
   res.status(200).json({
     success: true,
@@ -89,7 +112,7 @@ exports.getAnnouncement = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Announcement fetched',
-    data: { announcement: item },
+    data: { announcement: { ...item, imageUrl: normalizeImageUrl(item.imageUrl, req) } },
   });
 });
 
