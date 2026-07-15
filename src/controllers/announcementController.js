@@ -1,39 +1,42 @@
-const path          = require('path');
-const fs            = require('fs');
-const Announcement  = require('../models/Announcement.js');
-const asyncHandler  = require('../utils/asyncHandler.js');
-const AppError      = require('../utils/appError.js');
+const Announcement = require('../models/Announcement.js');
+const asyncHandler = require('../utils/asyncHandler.js');
+const AppError     = require('../utils/appError.js');
+const storage      = require('../lib/storage.js');
 
 // ── Image helpers ─────────────────────────────────────────────────────────────
 
-// Extract the /uploads/... pathname from a stored URL (relative or absolute, any domain).
-function extractUploadPath(imageUrl) {
-  if (!imageUrl) return null;
-  let pathname = imageUrl;
-  if (imageUrl.startsWith('http')) {
-    try { pathname = new URL(imageUrl).pathname; } catch { return null; }
+// Delete a stored announcement image.
+// Handles both MinIO URLs and legacy local /uploads/... paths (backward compat).
+async function deleteStoredImage(imageUrl) {
+  if (!imageUrl) return;
+  const key = storage.extractKey(imageUrl);
+  if (key) {
+    await storage.deleteFile(key).catch(() => {});
+    return;
   }
-  return pathname.startsWith('/uploads/') ? pathname : null;
-}
-
-// Delete the local file for a stored imageUrl, regardless of whether the URL
-// is a relative path (/uploads/...) or an absolute URL (https://domain/uploads/...).
-function deleteLocalFile(imageUrl) {
-  const pathname = extractUploadPath(imageUrl);
-  if (!pathname) return;
+  // Legacy local file — delete from disk if it exists
   try {
-    const fullPath = path.join(process.cwd(), pathname);
-    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    const fs   = require('fs');
+    const path = require('path');
+    let pathname = imageUrl;
+    if (imageUrl.startsWith('http')) {
+      try { pathname = new URL(imageUrl).pathname; } catch { return; }
+    }
+    if (pathname.startsWith('/uploads/')) {
+      const fullPath = path.join(process.cwd(), pathname);
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    }
   } catch { /* non-critical */ }
 }
 
-// Rebase any stored imageUrl to the current backend's origin.
-// Handles old media.relux.ng URLs and any other domain stored in the DB.
+// Normalize any stored imageUrl for API responses:
+//   - Absolute URLs (MinIO / any CDN) → returned as-is
+//   - Legacy relative /uploads/... paths → rebased to the current backend host
 function normalizeImageUrl(imageUrl, req) {
-  const pathname = extractUploadPath(imageUrl);
-  if (!pathname) return imageUrl;
-  const baseUrl = (process.env.MEDIA_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-  return `${baseUrl}${pathname}`;
+  if (!imageUrl) return imageUrl;
+  if (imageUrl.startsWith('http')) return imageUrl;
+  const pathname = imageUrl.startsWith('/') ? imageUrl : `/${imageUrl}`;
+  return `${req.protocol}://${req.get('host')}${pathname}`;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,9 +164,9 @@ exports.updateAnnouncement = asyncHandler(async (req, res, next) => {
   const item = await Announcement.findById(req.params.id);
   if (!item) return next(new AppError('Announcement not found', 404));
 
-  // If imageUrl is being replaced, delete the old local file
+  // If imageUrl is being replaced, delete the old stored image
   if (req.body.imageUrl !== undefined && req.body.imageUrl !== item.imageUrl) {
-    deleteLocalFile(item.imageUrl);
+    await deleteStoredImage(item.imageUrl);
   }
 
   const fields = [
@@ -193,8 +196,8 @@ exports.deleteAnnouncement = asyncHandler(async (req, res, next) => {
   const item = await Announcement.findById(req.params.id);
   if (!item) return next(new AppError('Announcement not found', 404));
 
-  // Clean up local image if stored on this server
-  deleteLocalFile(item.imageUrl);
+  // Delete the stored image from MinIO (or local disk for legacy files)
+  await deleteStoredImage(item.imageUrl);
 
   await item.deleteOne();
   res.status(200).json({
@@ -207,16 +210,18 @@ exports.deleteAnnouncement = asyncHandler(async (req, res, next) => {
 // ── Upload announcement image ─────────────────────────────────────────────────
 // @route   POST /api/v1/announcements/upload-image
 // @access  Private (Admin/Manager)
-// Multer middleware is applied in the route — req.file is the uploaded file.
+// Multer middleware (memoryStorage) is applied in the route — req.file.buffer is the image data.
 exports.uploadAnnouncementImage = asyncHandler(async (req, res, next) => {
   if (!req.file) return next(new AppError('No image file provided', 400));
-
-  // Store a relative path — domain is resolved at read time by normalizeImageUrl()
-  // using MEDIA_URL env var, avoiding domain/protocol issues in Docker behind a proxy.
-  const imageUrl = `/uploads/announcements/${req.file.filename}`;
+  const { url } = await storage.uploadFile(
+    req.file.buffer,
+    req.file.originalname,
+    req.file.mimetype,
+    'announcements',
+  );
   res.status(200).json({
     success: true,
     message: 'Image uploaded successfully',
-    data: { imageUrl },
+    data: { imageUrl: url },
   });
 });

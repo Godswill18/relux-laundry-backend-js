@@ -35,6 +35,7 @@ const payrollRoutes = require('./routes/payrollRoutes.js');
 const settingsRoutes = require('./routes/settingsRoutes.js');
 const auditRoutes = require('./routes/auditRoutes.js');
 const announcementRoutes = require('./routes/announcementRoutes.js');
+const fileRoutes         = require('./routes/fileRoutes.js');
 
 // Middleware imports
 const errorHandler = require('./middleware/errorHandler.js');
@@ -127,6 +128,7 @@ app.use(`/api/${API_VERSION}/payroll`, staffGate, payrollRoutes);
 app.use(`/api/${API_VERSION}/settings`, staffGate, settingsRoutes);
 app.use(`/api/${API_VERSION}/audit-logs`, staffGate, auditRoutes);
 app.use(`/api/${API_VERSION}/announcements`, announcementRoutes);
+app.use(`/api/${API_VERSION}/files`,         fileRoutes);
 
 // 404 handler
 app.all('*', (req, res) => {
