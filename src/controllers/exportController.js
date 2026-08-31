@@ -1,6 +1,7 @@
 const Order = require('../models/Order.js');
 const Attendance = require('../models/Attendance.js');
 const asyncHandler = require('../utils/asyncHandler.js');
+const { watDayStart, watDayEnd } = require('../utils/helpers.js');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 
@@ -9,13 +10,13 @@ const PDFDocument = require('pdfkit');
 function buildFilter(query) {
   const filter = {};
 
+  // WAT calendar days, matching the dashboards. These were anchored to UTC, so a
+  // "1 August" export dropped orders taken 00:00–01:00 WAT on the 1st and picked
+  // up the same hour of the 2nd.
   if (query.startDate || query.endDate) {
     filter.createdAt = {};
-    if (query.startDate) filter.createdAt.$gte = new Date(query.startDate + 'T00:00:00.000Z');
-    if (query.endDate) {
-      const end = new Date(query.endDate + 'T23:59:59.999Z');
-      filter.createdAt.$lte = end;
-    }
+    if (query.startDate) filter.createdAt.$gte = watDayStart(query.startDate);
+    if (query.endDate)   filter.createdAt.$lte = watDayEnd(query.endDate);
   }
   if (query.status)        filter.status        = query.status;
   if (query.paymentStatus) filter.paymentStatus = query.paymentStatus;

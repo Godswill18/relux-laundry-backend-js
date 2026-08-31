@@ -27,6 +27,10 @@ const PaystackTransactionSchema = new mongoose.Schema(
     paystackData: { type: mongoose.Schema.Types.Mixed },
     // Reason stored on failure
     failureReason: { type: String },
+    // Set when Paystack collected a different sum than was requested at initialize.
+    // `amount` is then rewritten to the collected figure and the original kept here.
+    amountMismatch:  { type: Boolean, default: false },
+    requestedAmount: { type: Number },
     // Customer's User._id (for socket delivery) — set at initialize time
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },

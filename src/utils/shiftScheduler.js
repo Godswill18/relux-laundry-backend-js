@@ -6,14 +6,19 @@ const WorkShift = require('../models/WorkShift.js');
 const Attendance = require('../models/Attendance.js');
 const logger = require('./logger.js');
 const { getNowWAT, capToEndOfWATDay } = require('./helpers.js');
+const { acquireJobLock } = require('./jobLock.js');
 const notify = require('./notify.js');
 const { purgeOldReadNotifications } = require('../controllers/notificationController.js');
 
 // Run notification cleanup once per day (at most)
 let lastNotifCleanup = null;
 
-// Track which shift-end warnings have been sent this session
-// Key: `${shiftId}:${minutes}` → true
+// Track which shift-end warnings have been sent.
+//
+// In-memory only, which is fine now that a single lock holder runs the tick, but
+// the flags are lost if the process restarts or the lock moves to another
+// instance — the worst case is one repeated warning, never a missed one.
+// Key: `${shiftId}:${minutes}`
 const warningSentCache = new Set();
 
 /**
@@ -38,6 +43,12 @@ function startShiftScheduler(io) {
 
   setInterval(async () => {
     try {
+      // Only one process may run this tick. Every worker used to run it, which
+      // meant N× shift activations, N× shift-ending notifications and N×
+      // auto-clock-out attempts. TTL is 3× the interval so a slow tick keeps the
+      // lock, while a dead holder releases it within ~90s.
+      if (!(await acquireJobLock('shiftScheduler', CHECK_INTERVAL * 3))) return;
+
       const { dateStr: todayDate, timeStr: currentTime } = getNowWAT();
 
       // 1. Find all shifts that span today and are not cancelled

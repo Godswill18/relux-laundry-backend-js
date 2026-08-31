@@ -39,9 +39,12 @@ const tooManyRequestsMessage = (_req, res) => {
 
 // ── General API limiter ────────────────────────────────────────────────────
 // Applied per-IP on all /api routes. High ceiling — just a safety net.
+// Ceiling is deliberately generous: this runs before `protect`, so it is keyed by
+// IP and every device behind the shop's NAT shares one bucket. It is a runaway-
+// script backstop, not a per-user quota — see moneyLimiter for that.
 exports.apiLimiter = rateLimit({
   windowMs: 3 * 60 * 1000,           // 3-minute window
-  max: 600,                           // 600 req per IP per window
+  max: 1500,                          // 1500 req per IP per window
   keyGenerator: ipKey,
   handler: tooManyRequestsMessage,
   standardHeaders: true,              // RateLimit-* headers (RFC 6585)
@@ -59,6 +62,22 @@ exports.authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,       // Successful logins don't count against the limit
+});
+
+// ── Sensitive-endpoint limiter ─────────────────────────────────────────────
+// Wallet and payment routes. Tighter than the general limiter because these are
+// the endpoints where scripted abuse actually costs money.
+//
+// Keying: ipOrUserKey prefers req.user, but this is mounted at the app level
+// ahead of each route's own `protect`, so in practice it falls back to the IP.
+// Keep the ceiling comfortably above what a shop full of staff generates.
+exports.moneyLimiter = rateLimit({
+  windowMs: 3 * 60 * 1000,            // 3-minute window
+  max: 120,                           // 120 money-route calls per IP per window
+  keyGenerator: ipOrUserKey,
+  handler: tooManyRequestsMessage,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 // ── Order creation limiter ─────────────────────────────────────────────────

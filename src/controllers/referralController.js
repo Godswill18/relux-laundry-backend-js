@@ -13,12 +13,12 @@ async function creditWallet(userId, amount, reason) {
   if (!amount || amount <= 0) return;
   const user = await User.findById(userId).select('customerId').lean();
   if (!user?.customerId) return;
-  let wallet = await Wallet.findOne({ customerId: user.customerId });
-  if (!wallet) {
-    wallet = await Wallet.create({ customerId: user.customerId, balance: 0 });
-  }
-  wallet.balance += amount;
-  await wallet.save();
+  // Atomic upsert-and-credit
+  const wallet = await Wallet.findOneAndUpdate(
+    { customerId: user.customerId },
+    { $inc: { balance: amount } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
   await WalletTransaction.create({
     walletId: wallet._id,
     customerId: user.customerId,
@@ -26,6 +26,7 @@ async function creditWallet(userId, amount, reason) {
     amount,
     reason,
     balanceAfter: wallet.balance,
+    source: 'referral',
   });
 }
 

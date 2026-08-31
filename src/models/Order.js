@@ -260,11 +260,71 @@ const OrderSchema = new mongoose.Schema(
     // Countdown timer fields — set each time status changes to a timed stage
     stageDeadlineAt: { type: Date },
     stageDurationMinutes: { type: Number },
+    // When the pickup and delivery legs actually happened. Both were already being
+    // assigned by updateOrderStatus and scanPickup but were never declared, so
+    // Mongoose strict mode discarded them on every save.
+    actualPickupDate: { type: Date },
+    actualDeliveryDate: { type: Date },
   },
   {
     timestamps: true,
   }
 );
+
+// Allocate the next order sequence for a month, atomically.
+//
+// The first allocation in any month seeds the counter from the highest number
+// already issued, so switching an existing production month over to the counter
+// never reissues a number that is already printed on a ticket.
+async function nextOrderSequence(monthYear) {
+  const Counter = mongoose.model('Counter');
+  const key = `order:${monthYear}`;
+
+  // Fast path — counter already established for this month
+  const existing = await Counter.findOneAndUpdate(
+    { _id: key },
+    { $inc: { seq: 1 } },
+    { new: true }
+  );
+  if (existing) return existing.seq;
+
+  // First allocation this month: find the highest sequence already in use.
+  // Compared numerically, not as a string, so it stays correct past 999.
+  const prefix = `RLX-${monthYear}-`;
+  let lastSeq = 0;
+  try {
+    const [agg] = await mongoose.model('Order').aggregate([
+      { $match: { orderNumber: { $regex: `^${prefix}` } } },
+      {
+        $project: {
+          seq: {
+            $convert: {
+              input: { $substrBytes: ['$orderNumber', prefix.length, 12] },
+              to: 'int',
+              onError: 0,
+              onNull: 0,
+            },
+          },
+        },
+      },
+      { $group: { _id: null, max: { $max: '$seq' } } },
+    ]);
+    lastSeq = agg?.max || 0;
+  } catch (_) {
+    // Aggregation unavailable — fall through with 0; the unique index plus the
+    // retry in createOrder still prevent a collision from being persisted.
+  }
+
+  // $max is idempotent, so two workers seeding at once converge on the same floor
+  await Counter.updateOne({ _id: key }, { $max: { seq: lastSeq } }, { upsert: true });
+
+  const counter = await Counter.findOneAndUpdate(
+    { _id: key },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return counter.seq;
+}
 
 // Generate order number before validation (must run before validate, not save,
 // because orderNumber is required and validation runs before pre-save hooks)
@@ -278,13 +338,8 @@ OrderSchema.pre('validate', async function (next) {
   const monthYear = `${now.getFullYear()}${month}`;
   const prefix = `RLX-${monthYear}-`;
 
-  // Count orders for this month to get the next sequence number
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  const monthCount = await mongoose.model('Order').countDocuments({
-    createdAt: { $gte: monthStart, $lt: monthEnd },
-  });
-  this.orderNumber = `${prefix}${String(monthCount + 1).padStart(3, '0')}`;
+  const seq = await nextOrderSequence(monthYear);
+  this.orderNumber = `${prefix}${String(seq).padStart(3, '0')}`;
 
   // Generate a short 6-character alphanumeric code for customer reference
   if (!this.code) {

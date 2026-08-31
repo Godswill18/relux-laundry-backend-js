@@ -80,36 +80,29 @@ const generateQRCode = (orderNumber) => {
   return `RELUX-${orderNumber}-${Date.now()}`;
 };
 
+// WAT is UTC+1 all year — West Africa Time observes no daylight saving, so a
+// fixed offset is correct rather than a convenience.
+const WAT_OFFSET_MS = 60 * 60 * 1000;
+
+// Shift the epoch forward by the WAT offset, so reading the result with the
+// UTC accessors yields WAT wall-clock. Everything below reads via toISOString()
+// and never getHours()/getDate(), which makes these independent of the host
+// timezone — the previous versions added getTimezoneOffset() to an epoch that
+// was already UTC (a double shift) and then read local hours off the result,
+// so they were only correct while the container happened to run on TZ=UTC.
+const watWallClock = (ms = Date.now()) => new Date(ms + WAT_OFFSET_MS);
+
 // Get current date in WAT (West Africa Time, UTC+1) as "YYYY-MM-DD"
-const getTodayWAT = () => {
-  const now = new Date();
-  const watOffset = 1 * 60; // WAT = UTC+1 in minutes
-  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
-  const watMs = utcMs + watOffset * 60000;
-  return new Date(watMs).toISOString().slice(0, 10);
-};
+const getTodayWAT = () => watWallClock().toISOString().slice(0, 10);
 
 // Get current date and time in WAT as { dateStr: "YYYY-MM-DD", timeStr: "HH:MM" }
 const getNowWAT = () => {
-  const now = new Date();
-  const watOffset = 1 * 60;
-  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
-  const watMs = utcMs + watOffset * 60000;
-  const watDate = new Date(watMs);
-
-  const dateStr = watDate.toISOString().slice(0, 10);
-  const hours = String(watDate.getHours()).padStart(2, '0');
-  const minutes = String(watDate.getMinutes()).padStart(2, '0');
-  const timeStr = `${hours}:${minutes}`;
-
-  return { dateStr, timeStr };
+  const iso = watWallClock().toISOString();
+  return { dateStr: iso.slice(0, 10), timeStr: iso.slice(11, 16) };
 };
 
 // Return the WAT calendar date string ("YYYY-MM-DD") for any Date object
-const getWATDateStr = (date) => {
-  const watMs = date.getTime() + 60 * 60 * 1000;
-  return new Date(watMs).toISOString().slice(0, 10);
-};
+const getWATDateStr = (date) => watWallClock(date.getTime()).toISOString().slice(0, 10);
 
 // Cap proposedClockOut to 23:59:59 WAT of the clock-in day.
 // Both arguments must be Date objects. Returns a Date.
@@ -117,6 +110,52 @@ const capToEndOfWATDay = (clockIn, proposedClockOut) => {
   const dayStr   = getWATDateStr(new Date(clockIn));
   const endOfDay = new Date(`${dayStr}T23:59:59+01:00`); // = 22:59:59 UTC
   return proposedClockOut > endOfDay ? endOfDay : proposedClockOut;
+};
+
+// ─── Canonical revenue definition ────────────────────────────────────────────
+// /orders/dashboard-stats matched on `paymentStatus`, /admin/dashboard matched on
+// `payment.status`, and only one of them excluded cancelled orders — so the two
+// dashboards reported different revenue for the same day. Every aggregate that
+// means "money we took" must build its $match from this.
+const paidOrderMatch = () => ({
+  paymentStatus: 'paid',
+  status: { $nin: ['cancelled'] },
+});
+
+// Revenue amount for one order. Orders written before `pricing` was introduced
+// carry only `total`, so the fallback is required or they sum as null.
+const orderRevenueField = () => ({ $ifNull: ['$pricing.total', '$total'] });
+
+// ─── WAT day/month boundaries ────────────────────────────────────────────────
+// The business runs on WAT (UTC+1). Reporting previously mixed three different
+// notions of "a day": exportController anchored to UTC, the dashboards used
+// setHours() in whatever timezone the container happened to run in, and only the
+// shift scheduler used WAT. Roughly an hour of orders landed on the wrong day.
+// These are the single definition every report should use.
+
+// Start of a WAT calendar day ("YYYY-MM-DD") as a UTC Date
+const watDayStart = (dateStr) => new Date(`${dateStr}T00:00:00.000+01:00`);
+
+// End of a WAT calendar day ("YYYY-MM-DD") as a UTC Date
+const watDayEnd = (dateStr) => new Date(`${dateStr}T23:59:59.999+01:00`);
+
+// Start of today in WAT
+const startOfTodayWAT = () => watDayStart(getTodayWAT());
+
+// Start of the WAT day `days` days ago
+const startOfDaysAgoWAT = (days) => {
+  const d = new Date(startOfTodayWAT().getTime() - days * 24 * 60 * 60 * 1000);
+  return watDayStart(getWATDateStr(d));
+};
+
+// Start of the current WAT month
+const startOfMonthWAT = () => watDayStart(`${getTodayWAT().slice(0, 7)}-01`);
+
+// Start of the current WAT week (weeks run Sunday → Saturday)
+const startOfWeekWAT = () => {
+  // Midday avoids any DST/offset edge when reading the weekday back out
+  const weekday = new Date(`${getTodayWAT()}T12:00:00+01:00`).getUTCDay();
+  return startOfDaysAgoWAT(weekday);
 };
 
 module.exports = {
@@ -129,4 +168,12 @@ module.exports = {
   getNowWAT,
   getWATDateStr,
   capToEndOfWATDay,
+  paidOrderMatch,
+  orderRevenueField,
+  watDayStart,
+  watDayEnd,
+  startOfTodayWAT,
+  startOfDaysAgoWAT,
+  startOfMonthWAT,
+  startOfWeekWAT,
 };

@@ -10,6 +10,9 @@ const LoyaltySettingSchema = new mongoose.Schema(
     maxPointsPerOrder: { type: Number },
     maxPointsPerDay: { type: Number },
     minRedeemPoints: { type: Number, default: 100 },
+    // ₦ value of one loyalty point when redeemed against an order.
+    // Default 5 matches the rate the customer app has always displayed.
+    pointsRedemptionValue: { type: Number, default: 5 },
     maxRedeemPercent: { type: Number, default: 50 },
     maxRedeemPointsPerOrder: { type: Number },
     redeemIncludesDelivery: { type: Boolean, default: true },

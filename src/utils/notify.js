@@ -6,6 +6,7 @@ const Notification = require('../models/Notification.js');
 const logger = require('./logger.js');
 const webpush = require('web-push');
 const PushSubscription = require('../models/PushSubscription.js');
+const User = require('../models/User.js');
 
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails(
@@ -74,11 +75,29 @@ async function sendPushToUser({ userId, customerId, title, body, type, metadata 
   }
 }
 
+// Roles that belong to each broadcast room, mirroring the auto-joins in server.js.
+const ROOM_ROLES = {
+  admin:    ['admin', 'manager', 'staff', 'receptionist', 'developer'],
+  delivery: ['delivery'],
+};
+
 async function sendPushToRoom(room, { title, body, type, metadata }) {
   if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
 
-  // All staff/admin/manager subscriptions have userId set; customers only have customerId
-  const subs = await PushSubscription.find({ userId: { $exists: true, $ne: null } }).lean();
+  // Narrow to the roles that actually belong to this room. This previously pushed
+  // to every staff subscription regardless of `room`, so delivery agents received
+  // admin notifications and vice versa — the socket emit was scoped, the push was not.
+  const roles = ROOM_ROLES[room];
+  if (!roles) return;
+
+  const roomUsers = await User.find({ role: { $in: roles }, isActive: true })
+    .select('_id')
+    .lean();
+  if (!roomUsers.length) return;
+
+  const subs = await PushSubscription.find({
+    userId: { $in: roomUsers.map((u) => u._id) },
+  }).lean();
   if (!subs.length) return;
 
   const payload = JSON.stringify({

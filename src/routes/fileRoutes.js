@@ -3,7 +3,8 @@ const multer       = require('multer');
 const AppError     = require('../utils/appError.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const storage      = require('../lib/storage.js');
-const { protect, noCustomers } = require('../middleware/auth.js');
+const { logAudit } = require('../utils/auditLogger.js');
+const { protect, noCustomers, authorize } = require('../middleware/auth.js');
 
 const router = express.Router();
 
@@ -40,7 +41,9 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 // PUT /api/v1/files/:key — replace a file (key may contain slashes)
-router.put('/:key(*)', upload, asyncHandler(async (req, res, next) => {
+// Destructive: restricted to admin/manager. Previously any staff role — including
+// delivery — could overwrite or delete arbitrary keys in the bucket.
+router.put('/:key(*)', authorize('admin', 'manager'), upload, asyncHandler(async (req, res, next) => {
   if (!req.file) return next(new AppError('No file provided', 400));
   const oldKey = decodeURIComponent(req.params.key);
   const { key, url } = await storage.replaceFile(oldKey, req.file.buffer, req.file.mimetype);
@@ -48,8 +51,16 @@ router.put('/:key(*)', upload, asyncHandler(async (req, res, next) => {
 }));
 
 // DELETE /api/v1/files/:key — delete a file (key may contain slashes)
-router.delete('/:key(*)', asyncHandler(async (req, res) => {
-  await storage.deleteFile(decodeURIComponent(req.params.key));
+// Destructive and unrecoverable: admin only, and audited.
+router.delete('/:key(*)', authorize('admin'), asyncHandler(async (req, res) => {
+  const key = decodeURIComponent(req.params.key);
+  await storage.deleteFile(key);
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'FILE_DELETED',
+    targetType: 'File',
+    targetId: key,
+  });
   res.status(200).json({ success: true, message: 'File deleted' });
 }));
 

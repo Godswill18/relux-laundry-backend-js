@@ -4,6 +4,8 @@ const WorkShift = require('../models/WorkShift.js');
 const AuditLog = require('../models/AuditLog.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { logAudit } = require('../utils/auditLogger.js');
+const { checkRoleAssignment, checkTargetModifiable } = require('../utils/roleHierarchy.js');
 
 // ============================================================================
 // STAFF CRUD (users with staff/admin/manager roles)
@@ -13,7 +15,9 @@ const AppError = require('../utils/appError.js');
 // @route   GET /api/v1/staff
 // @access  Private (Admin/Manager)
 exports.getStaff = asyncHandler(async (req, res, next) => {
-  let query = { role: { $in: ['staff', 'admin', 'manager', 'delivery'] } };
+  // 'receptionist' included now that the role is creatable — without it, every
+  // receptionist account would be invisible in the staff list.
+  let query = { role: { $in: ['staff', 'admin', 'manager', 'delivery', 'receptionist'] } };
 
   if (req.query.role && req.query.role !== 'all' && req.query.role !== 'developer') {
     query.role = req.query.role;
@@ -57,6 +61,10 @@ exports.createStaff = asyncHandler(async (req, res, next) => {
     return next(new AppError('A user with this phone or email already exists', 400));
   }
 
+  // A caller may only create a role below their own
+  const roleError = checkRoleAssignment(req.user, role || 'staff');
+  if (roleError) return next(roleError);
+
   const user = await User.create({
     name,
     email,
@@ -78,6 +86,14 @@ exports.createStaff = asyncHandler(async (req, res, next) => {
   });
 
   user.password = undefined;
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'STAFF_CREATED',
+    targetType: 'User',
+    targetId: user._id.toString(),
+    after: { name: user.name, email: user.email, phone: user.phone, role: user.role },
+  });
 
   res.status(201).json({
     success: true,
@@ -114,14 +130,42 @@ exports.updateStaff = asyncHandler(async (req, res, next) => {
     (key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]
   );
 
-  const user = await User.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
+  const target = await User.findById(req.params.id).select('-password');
+  if (!target) {
+    return next(new AppError('Staff member not found', 404));
+  }
+
+  // A manager must not be able to edit, deactivate or promote an admin
+  const targetError = checkTargetModifiable(req.user, target);
+  if (targetError) return next(targetError);
+
+  // ...nor assign a role at or above their own
+  const roleError = checkRoleAssignment(req.user, fieldsToUpdate.role);
+  if (roleError) return next(roleError);
+
+  const previousRole = target.role;
+  const roleChanged  = fieldsToUpdate.role !== undefined && fieldsToUpdate.role !== previousRole;
+
+  // A role change must invalidate existing sessions: the JWT carries the
+  // permission list the frontend renders from, so without this bump a demoted
+  // user keeps their old menu until the token expires.
+  const update = roleChanged
+    ? { $set: fieldsToUpdate, $inc: { jwtVersion: 1 } }
+    : { $set: fieldsToUpdate };
+
+  const user = await User.findByIdAndUpdate(req.params.id, update, {
     new: true,
     runValidators: true,
   }).select('-password');
 
-  if (!user) {
-    return next(new AppError('Staff member not found', 404));
-  }
+  await logAudit({
+    actorUserId: req.user.id,
+    action: roleChanged ? 'STAFF_ROLE_CHANGED' : 'STAFF_UPDATED',
+    targetType: 'User',
+    targetId: req.params.id,
+    before: roleChanged ? { role: previousRole } : undefined,
+    after: roleChanged ? { role: user.role } : { updatedFields: Object.keys(fieldsToUpdate) },
+  });
 
   res.status(200).json({
     success: true,
@@ -143,6 +187,17 @@ exports.deleteStaff = asyncHandler(async (req, res, next) => {
   if (user._id.toString() === req.user.id) {
     return next(new AppError('You cannot delete your own account', 400));
   }
+
+  const targetError = checkTargetModifiable(req.user, user);
+  if (targetError) return next(targetError);
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'STAFF_DELETED',
+    targetType: 'User',
+    targetId: user._id.toString(),
+    before: { name: user.name, email: user.email, phone: user.phone, role: user.role },
+  });
 
   await user.deleteOne();
 

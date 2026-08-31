@@ -2,6 +2,7 @@ const Customer = require('../models/Customer.js');
 const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { logAudit } = require('../utils/auditLogger.js');
 
 // @desc    Get all customers (Users with role=customer)
 // @route   GET /api/v1/customers
@@ -206,6 +207,14 @@ exports.suspendCustomer = asyncHandler(async (req, res, next) => {
     return next(new AppError('Customer not found', 404));
   }
 
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'CUSTOMER_SUSPENDED',
+    targetType: 'Customer',
+    targetId: req.params.id,
+    after: { status: 'suspended' },
+  });
+
   res.status(200).json({
     success: true,
     message: 'Customer suspended successfully',
@@ -222,6 +231,26 @@ exports.deleteCustomer = asyncHandler(async (req, res, next) => {
   if (!user) {
     return next(new AppError('Customer not found', 404));
   }
+
+  // Hard delete of production data — record what was removed before it goes
+  const customerDoc = user.customerId
+    ? await Customer.findById(user.customerId).lean()
+    : null;
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'CUSTOMER_DELETED',
+    targetType: 'Customer',
+    targetId: user._id.toString(),
+    before: {
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      customerId: user.customerId ? String(user.customerId) : null,
+      loyaltyPointsBalance: customerDoc?.loyaltyPointsBalance ?? null,
+      lifetimeSpend: customerDoc?.lifetimeSpend ?? null,
+    },
+  });
 
   // Delete the linked Customer profile doc if it exists
   if (user.customerId) {

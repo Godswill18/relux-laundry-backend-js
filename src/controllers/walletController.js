@@ -2,6 +2,7 @@ const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { logAudit } = require('../utils/auditLogger.js');
 
 // @desc    Get my wallet
 // @route   GET /api/v1/wallets/me
@@ -41,44 +42,17 @@ exports.getWalletByCustomer = asyncHandler(async (req, res, next) => {
   });
 });
 
-// @desc    Top up wallet
-// @route   POST /api/v1/wallets/topup
-// @access  Private
-exports.topUpWallet = asyncHandler(async (req, res, next) => {
-  if (!req.user.customerId) {
-    return next(new AppError('No customer profile linked to this account', 400));
-  }
-
-  const amount = parseFloat(req.body.amount);
-  const { reason } = req.body;
-
-  if (isNaN(amount) || amount <= 0) {
-    return next(new AppError('Amount must be a number greater than 0', 400));
-  }
-
-  let wallet = await Wallet.findOne({ customerId: req.user.customerId });
-
-  if (!wallet) {
-    wallet = await Wallet.create({ customerId: req.user.customerId, balance: 0 });
-  }
-
-  wallet.balance += amount;
-  await wallet.save();
-
-  await WalletTransaction.create({
-    walletId: wallet._id,
-    amount,
-    type: 'credit',
-    reason: reason || 'Wallet top-up',
-    balanceAfter: wallet.balance,
-  });
-
-  res.status(200).json({
-    success: true,
-    message: 'Wallet topped up successfully',
-    data: { wallet },
-  });
-});
+// REMOVED: topUpWallet (POST /api/v1/wallets/topup)
+//
+// This credited the caller's own wallet directly from req.body.amount with no
+// payment behind it and only `protect` in front of it, so any authenticated
+// customer could grant themselves unlimited balance. Wallet credit now has
+// exactly four legitimate sources:
+//   1. processSuccessfulPaystackPayment() — a verified, amount-checked payment
+//   2. adminCreditWallet()                — admin/manager, audited
+//   3. processReferralReward()            — referral payout
+//   4. convertPointsToWallet()            — loyalty points conversion
+// For a manual credit, use POST /api/v1/wallets/admin-credit.
 
 // @desc    Debit wallet
 // @route   POST /api/v1/wallets/debit
@@ -95,24 +69,41 @@ exports.debitWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Amount must be a number greater than 0', 400));
   }
 
-  const wallet = await Wallet.findOne({ customerId });
+  const existing = await Wallet.findOne({ customerId });
 
-  if (!wallet) {
+  if (!existing) {
     return next(new AppError('Wallet not found', 404));
   }
 
-  if (wallet.balance < amount) {
+  // Atomic check-and-debit. Reading the balance, comparing it and then saving as
+  // three steps let two concurrent debits both pass the check and overdraw.
+  const wallet = await Wallet.findOneAndUpdate(
+    { _id: existing._id, balance: { $gte: amount } },
+    { $inc: { balance: -amount } },
+    { new: true }
+  );
+
+  if (!wallet) {
     return next(new AppError('Insufficient wallet balance', 400));
   }
 
-  wallet.balance -= amount;
-  await wallet.save();
-
   await WalletTransaction.create({
     walletId: wallet._id,
+    customerId,
     amount,
     type: 'debit',
     reason: reason || 'Wallet debit',
+    balanceAfter: wallet.balance,
+    source: 'admin',
+  });
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'WALLET_DEBITED',
+    targetType: 'Wallet',
+    targetId: wallet._id.toString(),
+    after: { amount, balanceAfter: wallet.balance, reason: reason || 'Wallet debit' },
+    metadata: { customerId: String(customerId) },
   });
 
   res.status(200).json({
@@ -190,20 +181,31 @@ exports.adminCreditWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Amount must be a number greater than 0', 400));
   }
 
-  let wallet = await Wallet.findOne({ customerId });
-
-  if (!wallet) {
-    wallet = await Wallet.create({ customerId, balance: 0 });
-  }
-
-  wallet.balance += amount;
-  await wallet.save();
+  // Atomic upsert-and-credit — no read-modify-write window for a concurrent
+  // credit to overwrite, and no separate create step to race against.
+  const wallet = await Wallet.findOneAndUpdate(
+    { customerId },
+    { $inc: { balance: amount } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
 
   await WalletTransaction.create({
     walletId: wallet._id,
+    customerId,
     amount,
     type: 'credit',
     reason: reason || 'Admin wallet credit',
+    balanceAfter: wallet.balance,
+    source: 'admin',
+  });
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'WALLET_CREDITED',
+    targetType: 'Wallet',
+    targetId: wallet._id.toString(),
+    after: { amount, balanceAfter: wallet.balance, reason: reason || 'Admin wallet credit' },
+    metadata: { customerId: String(customerId) },
   });
 
   res.status(200).json({

@@ -5,18 +5,29 @@ const PayrollEntry = require('../models/PayrollEntry.js');
 const WorkShift = require('../models/WorkShift.js');
 const Attendance = require('../models/Attendance.js');
 const asyncHandler = require('../utils/asyncHandler.js');
+const {
+  paidOrderMatch,
+  orderRevenueField,
+  startOfTodayWAT,
+  startOfMonthWAT,
+  startOfWeekWAT,
+  watDayStart,
+  watDayEnd,
+} = require('../utils/helpers.js');
 
 // @desc    Get dashboard stats
 // @route   GET /api/v1/admin/dashboard
 // @access  Private (Admin/Manager)
 exports.getDashboardStats = asyncHandler(async (req, res, next) => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  // All windows anchored to WAT calendar days, and all revenue aggregates built
+  // from paidOrderMatch()/orderRevenueField() so this endpoint and
+  // /orders/dashboard-stats can no longer report different numbers.
+  const today = startOfTodayWAT();
 
-  const startOfWeek = new Date(today);
-  startOfWeek.setDate(today.getDate() - today.getDay());
+  // Week starts on Sunday, matching the previous behaviour
+  const startOfWeek = startOfWeekWAT();
 
-  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  const startOfMonth = startOfMonthWAT();
 
   // Today's stats
   const todayOrders = await Order.countDocuments({
@@ -24,8 +35,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   });
 
   const todayRevenue = await Order.aggregate([
-    { $match: { createdAt: { $gte: today }, 'payment.status': 'paid' } },
-    { $group: { _id: null, total: { $sum: '$pricing.total' } } },
+    { $match: { ...paidOrderMatch(), createdAt: { $gte: today } } },
+    { $group: { _id: null, total: { $sum: orderRevenueField() } } },
   ]);
 
   const todayPending = await Order.countDocuments({
@@ -44,8 +55,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   });
 
   const weeklyRevenue = await Order.aggregate([
-    { $match: { createdAt: { $gte: startOfWeek }, 'payment.status': 'paid' } },
-    { $group: { _id: null, total: { $sum: '$pricing.total' } } },
+    { $match: { ...paidOrderMatch(), createdAt: { $gte: startOfWeek } } },
+    { $group: { _id: null, total: { $sum: orderRevenueField() } } },
   ]);
 
   // Monthly stats
@@ -54,8 +65,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   });
 
   const monthlyRevenue = await Order.aggregate([
-    { $match: { createdAt: { $gte: startOfMonth }, 'payment.status': 'paid' } },
-    { $group: { _id: null, total: { $sum: '$pricing.total' } } },
+    { $match: { ...paidOrderMatch(), createdAt: { $gte: startOfMonth } } },
+    { $group: { _id: null, total: { $sum: orderRevenueField() } } },
   ]);
 
   // Recent orders
@@ -66,7 +77,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
 
   // Top services
   const topServices = await Order.aggregate([
-    { $group: { _id: '$serviceType', count: { $sum: 1 }, revenue: { $sum: '$pricing.total' } } },
+    { $match: { status: { $nin: ['cancelled'] } } },
+    { $group: { _id: '$serviceType', count: { $sum: 1 }, revenue: { $sum: orderRevenueField() } } },
     { $sort: { count: -1 } },
     { $limit: 5 },
   ]);
@@ -107,16 +119,16 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
 exports.getRevenueReport = asyncHandler(async (req, res, next) => {
   const { startDate, endDate, groupBy = 'day' } = req.query;
 
-  const match = {
-    'payment.status': 'paid',
-  };
+  const match = paidOrderMatch();
 
+  // Date filters are WAT calendar days. `new Date('2026-08-01')` parses as UTC
+  // midnight, which is 01:00 WAT — an hour of orders landed on the wrong day.
   if (startDate) {
-    match.createdAt = { $gte: new Date(startDate) };
+    match.createdAt = { $gte: watDayStart(String(startDate).slice(0, 10)) };
   }
 
   if (endDate) {
-    match.createdAt = { ...match.createdAt, $lte: new Date(endDate) };
+    match.createdAt = { ...match.createdAt, $lte: watDayEnd(String(endDate).slice(0, 10)) };
   }
 
   let groupByFormat;
@@ -142,9 +154,9 @@ exports.getRevenueReport = asyncHandler(async (req, res, next) => {
     {
       $group: {
         _id: groupByFormat,
-        totalRevenue: { $sum: '$pricing.total' },
+        totalRevenue: { $sum: orderRevenueField() },
         orderCount: { $sum: 1 },
-        avgOrderValue: { $avg: '$pricing.total' },
+        avgOrderValue: { $avg: orderRevenueField() },
       },
     },
     { $sort: { _id: 1 } },
@@ -275,7 +287,7 @@ exports.getStaffProductivity = asyncHandler(async (req, res, next) => {
       $group: {
         _id: '$assignedStaff',
         orderCount: { $sum: 1 },
-        totalRevenue: { $sum: '$pricing.total' },
+        totalRevenue: { $sum: orderRevenueField() },
         completedOrders: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
         inProgressOrders: {
           $sum: {

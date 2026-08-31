@@ -6,6 +6,7 @@ const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { logAudit } = require('../utils/auditLogger.js');
 const notify = require('../utils/notify.js');
 
 // @desc    Get all loyalty tiers
@@ -162,6 +163,13 @@ exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
       walletConversionRate: settings?.walletConversionRate || 100,
       minConvertPoints: settings?.minConvertPoints || 100,
       pointsPerCurrency: settings?.pointsPerCurrency || 1,
+      // Redemption terms — the client renders these instead of hardcoding a rate,
+      // so the slider can never offer a discount the server will not honour.
+      redemptionEnabled:     settings?.redemptionEnabled !== false,
+      pointsRedemptionValue: settings?.pointsRedemptionValue > 0 ? settings.pointsRedemptionValue : 5,
+      minRedeemPoints:       settings?.minRedeemPoints || 0,
+      maxRedeemPercent:      settings?.maxRedeemPercent > 0 ? settings.maxRedeemPercent : 100,
+      maxRedeemPointsPerOrder: settings?.maxRedeemPointsPerOrder || 0,
     },
   });
 });
@@ -231,22 +239,53 @@ exports.getCustomerLoyalty = asyncHandler(async (req, res, next) => {
 exports.adjustPoints = asyncHandler(async (req, res, next) => {
   const { customerId, points, reason } = req.body;
 
-  const customer = await Customer.findById(customerId);
-  if (!customer) {
+  const delta = parseInt(points, 10);
+  if (!Number.isFinite(delta) || delta === 0) {
+    return next(new AppError('points must be a non-zero number', 400));
+  }
+
+  const existing = await Customer.findById(customerId).select('loyaltyPointsBalance').lean();
+  if (!existing) {
     return next(new AppError('Customer not found', 404));
   }
 
-  customer.loyaltyPointsBalance += points;
-  if (points > 0) {
-    customer.loyaltyLifetimePoints += points;
+  // Atomic adjustment. A negative delta is guarded so a deduction can never drive
+  // the balance below zero, and the read-modify-write that could lose a concurrent
+  // adjustment is gone.
+  const inc = { loyaltyPointsBalance: delta };
+  if (delta > 0) inc.loyaltyLifetimePoints = delta;
+
+  const customer = await Customer.findOneAndUpdate(
+    delta < 0
+      ? { _id: customerId, loyaltyPointsBalance: { $gte: -delta } }
+      : { _id: customerId },
+    { $inc: inc },
+    { new: true }
+  );
+
+  if (!customer) {
+    return next(new AppError(
+      `Insufficient points balance. Customer has ${existing.loyaltyPointsBalance || 0} points.`,
+      400
+    ));
   }
-  await customer.save();
 
   await LoyaltyLedger.create({
     customerId,
-    points,
+    points: delta,
     type: 'adjust',
     reason: reason || 'Manual adjustment',
+    balanceAfter: customer.loyaltyPointsBalance,
+  });
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'LOYALTY_POINTS_ADJUSTED',
+    targetType: 'Customer',
+    targetId: String(customerId),
+    before: { pointsBalance: existing.loyaltyPointsBalance || 0 },
+    after: { pointsBalance: customer.loyaltyPointsBalance },
+    metadata: { delta, reason: reason || 'Manual adjustment' },
   });
 
   res.status(200).json({
@@ -461,13 +500,12 @@ exports.convertPointsToWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Insufficient points balance', 400));
   }
 
-  // Credit wallet
-  let wallet = await Wallet.findOne({ customerId: req.user.customerId });
-  if (!wallet) {
-    wallet = await Wallet.create({ customerId: req.user.customerId, balance: 0 });
-  }
-  wallet.balance += walletAmount;
-  await wallet.save();
+  // Credit wallet — atomic upsert-and-credit
+  const wallet = await Wallet.findOneAndUpdate(
+    { customerId: req.user.customerId },
+    { $inc: { balance: walletAmount } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
 
   await WalletTransaction.create({
     walletId: wallet._id,
@@ -476,6 +514,7 @@ exports.convertPointsToWallet = asyncHandler(async (req, res, next) => {
     amount: walletAmount,
     reason: `Points Conversion (${points.toLocaleString()} pts)`,
     balanceAfter: wallet.balance,
+    source: 'loyalty',
   });
 
   // Record in loyalty ledger

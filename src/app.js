@@ -39,7 +39,7 @@ const fileRoutes         = require('./routes/fileRoutes.js');
 
 // Middleware imports
 const errorHandler = require('./middleware/errorHandler.js');
-const { apiLimiter } = require('./middleware/rateLimiter.js');
+const { apiLimiter, moneyLimiter } = require('./middleware/rateLimiter.js');
 const { protect, noCustomers } = require('./middleware/auth.js');
 
 // Gateway applied to routes the customer app never touches — requires a valid
@@ -91,8 +91,10 @@ app.use(requestLogger);
 // ✅ Add this before rate limiter and routes
 app.set('trust proxy', 1);
 
-// API rate limiting
-// app.use('/api', apiLimiter);
+// API rate limiting.
+// Re-enabled — this had been commented out, leaving every endpoint except auth
+// and order-creation completely unthrottled.
+app.use('/api', apiLimiter);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -113,8 +115,9 @@ app.use(`/api/${API_VERSION}/admin`, staffGate, adminRoutes);
 app.use(`/api/${API_VERSION}/customers`, customerRoutes);
 app.use(`/api/${API_VERSION}/roles`, staffGate, roleRoutes);
 app.use(`/api/${API_VERSION}/services`, serviceRoutes);
-app.use(`/api/${API_VERSION}/payments`, paymentRoutes);
-app.use(`/api/${API_VERSION}/wallets`, walletRoutes);
+// Money routes carry a tighter, per-user limit on top of the general one
+app.use(`/api/${API_VERSION}/payments`, moneyLimiter, paymentRoutes);
+app.use(`/api/${API_VERSION}/wallets`, moneyLimiter, walletRoutes);
 app.use(`/api/${API_VERSION}/promos`, promoRoutes);
 app.use(`/api/${API_VERSION}/chats`, chatRoutes);
 app.use(`/api/${API_VERSION}/notifications`, notificationRoutes);

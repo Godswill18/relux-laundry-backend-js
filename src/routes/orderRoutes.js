@@ -65,7 +65,8 @@ router.patch('/:id/assign',           authorize('admin', 'manager'), assignStaff
 router.put('/:id/payment', authorize('staff', 'admin', 'manager'), updatePayment);
 router.post('/:id/pay-balance', authorize('staff', 'admin', 'manager'), payBalanceFromWallet);
 router.post('/:id/pay-wallet', customerPayWithWallet);
-router.put('/:id/cancel', cancelOrder);
+// Delivery agents are deliberately excluded — cancelling is a counter/customer action
+router.put('/:id/cancel', authorize('customer', 'staff', 'admin', 'manager', 'receptionist'), cancelOrder);
 
 // Order items
 router.post('/:id/items', addOrderItem);

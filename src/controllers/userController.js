@@ -1,6 +1,8 @@
 const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { logAudit } = require('../utils/auditLogger.js');
+const { checkRoleAssignment, checkTargetModifiable } = require('../utils/roleHierarchy.js');
 
 // @desc    Get all users
 // @route   GET /api/v1/users
@@ -154,14 +156,36 @@ exports.updateUser = asyncHandler(async (req, res, next) => {
     (key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]
   );
 
-  const user = await User.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
-    new: true,
-    runValidators: true,
-  }).select('-password');
-
-  if (!user) {
+  const target = await User.findById(req.params.id).select('-password');
+  if (!target) {
     return next(new AppError('User not found', 404));
   }
+
+  // Same rank rules as the /staff endpoints — this route accepts `role` too, so
+  // without them it is a second path to a manager granting themselves developer.
+  const targetError = checkTargetModifiable(req.user, target);
+  if (targetError) return next(targetError);
+
+  const roleError = checkRoleAssignment(req.user, fieldsToUpdate.role);
+  if (roleError) return next(roleError);
+
+  const previousRole = target.role;
+  const roleChanged  = fieldsToUpdate.role !== undefined && fieldsToUpdate.role !== previousRole;
+
+  const user = await User.findByIdAndUpdate(
+    req.params.id,
+    roleChanged ? { $set: fieldsToUpdate, $inc: { jwtVersion: 1 } } : { $set: fieldsToUpdate },
+    { new: true, runValidators: true }
+  ).select('-password');
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: roleChanged ? 'USER_ROLE_CHANGED' : 'USER_UPDATED',
+    targetType: 'User',
+    targetId: req.params.id,
+    before: roleChanged ? { role: previousRole } : undefined,
+    after: roleChanged ? { role: user.role } : { updatedFields: Object.keys(fieldsToUpdate) },
+  });
 
   res.status(200).json({
     success: true,

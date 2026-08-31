@@ -9,6 +9,7 @@ const socketAuth = require('./middleware/socketAuth.js');
 const { startShiftScheduler } = require('./utils/shiftScheduler.js');
 const allowedOrigins = require('./config/allowedOrigins.js');
 const backfillWalkIn = require('./utils/backfillWalkIn.js');
+const { acquireJobLock, releaseJobLock, withJobLock } = require('./utils/jobLock.js');
 const PaystackTransaction = require('./models/PaystackTransaction.js');
 const {
   backgroundVerifyAndCredit,
@@ -135,6 +136,31 @@ app.set('io', io);
 // Start shift scheduler for auto-logout
 startShiftScheduler(io);
 
+// ─── Graceful shutdown ───────────────────────────────────────────────────────
+// PM2 sends SIGINT on restart. Releasing the job leases here means the next
+// process picks the work up immediately instead of idling until the TTL lapses.
+const JOB_LOCKS = ['shiftScheduler', 'paystackRecovery', 'backfillWalkIn'];
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`${signal} received — releasing job locks and shutting down`);
+
+  await Promise.allSettled(JOB_LOCKS.map((name) => releaseJobLock(name)));
+
+  server.close(() => {
+    logger.info('HTTP server closed');
+    process.exit(0);
+  });
+
+  // Don't hang forever if a connection refuses to drain
+  setTimeout(() => process.exit(0), 10000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
   logger.error(`Unhandled Rejection: ${err.message}`);
@@ -160,6 +186,12 @@ process.on('uncaughtException', (err) => {
 //      abandoned (user closed the Paystack popup without paying).
 async function recoverPendingPaystackTransactions(io) {
   try {
+    // One process only. Crediting is already idempotent (webhookProcessed plus
+    // the unique paystackReference index), so duplicates were never a money
+    // risk here — but N workers each hammering Paystack's verify API for every
+    // pending transaction every 15 minutes is a good way to get rate-limited.
+    if (!(await acquireJobLock('paystackRecovery', 10 * 60 * 1000))) return;
+
     const now      = new Date();
     const cutoff24 = new Date(now - 24 * 60 * 60 * 1000); // 24 h ago
     const cutoff30 = new Date(now -      30 * 60 * 1000);  // 30 min ago
@@ -250,8 +282,14 @@ mongoose.connection.once('open', () => {
     // On boot: resume retries killed by server restart (5s delay for full init)
     setTimeout(() => recoverPendingPaystackTransactions(io), 5000);
 
-    // On boot: normalize walk-in phones and link orders to registered accounts
-    setTimeout(() => backfillWalkIn(), 8000);
+    // On boot: normalize walk-in phones and link orders to registered accounts.
+    // Locked because it rewrites phone numbers and reassigns order ownership
+    // across the whole collection — concurrent copies of that are not something
+    // to find out about after the fact. Short TTL: it should only run once.
+    setTimeout(() => {
+      withJobLock('backfillWalkIn', 5 * 60 * 1000, () => backfillWalkIn())
+        .catch((err) => logger.error(`[backfillWalkIn] Failed: ${err.message}`));
+    }, 8000);
 
     // Every 15 minutes: auto-fail abandoned transactions and catch anything missed
     setInterval(() => recoverPendingPaystackTransactions(io), 15 * 60 * 1000);

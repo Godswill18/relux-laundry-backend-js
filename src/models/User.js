@@ -54,12 +54,19 @@ const UserSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['customer', 'staff', 'admin', 'manager', 'delivery', 'developer'],
+      // 'receptionist' is referenced by rolePermissions, four authorize() lists,
+      // Order.createdByRole, getOrders' admin-role check and both frontends, but
+      // was missing here — so the role could never actually be created and every
+      // receptionist code path was dead. Widening the enum is backward compatible.
+      enum: ['customer', 'staff', 'admin', 'manager', 'delivery', 'receptionist', 'developer'],
       default: 'customer',
     },
     staffRole: {
       type: String,
-      enum: [,'washer', 'delivery', null],
+      // Was written as the sparse literal [, 'washer', 'delivery', null], whose
+      // first element is `undefined`. Spelled out explicitly and widened to cover
+      // the values the seeder and admin UI already use.
+      enum: ['washer', 'ironer', 'delivery', 'receptionist', null],
     },
     address: String,
     city: String,

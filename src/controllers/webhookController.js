@@ -183,13 +183,9 @@ exports.handlePaystackWebhook = async (req, res) => {
         return;
       }
 
-      // Verify amount matches (Paystack sends kobo; our DB stores NGN)
-      const expectedKobo = Math.round(transaction.amount * 100);
-      if (amount !== expectedKobo) {
-        logger.error(`Paystack webhook: amount mismatch for ${reference} — expected ${expectedKobo} kobo, got ${amount}`);
-        return;
-      }
-
+      // Amount verification now lives inside processSuccessfulPaystackPayment so
+      // every entry point (webhook, verify, background retry, admin retry) shares
+      // one rule: credit what Paystack actually collected, flag any mismatch.
       const io = req.app ? req.app.get('io') : null;
       await processSuccessfulPaystackPayment(transaction, data, io);
       logger.info(`Paystack webhook: successfully processed ${reference}`);

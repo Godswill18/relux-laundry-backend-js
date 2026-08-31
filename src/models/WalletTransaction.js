@@ -3,6 +3,11 @@ const mongoose = require('mongoose');
 const WalletTransactionSchema = new mongoose.Schema(
   {
     walletId: { type: mongoose.Schema.Types.ObjectId, ref: 'Wallet', required: true },
+    // Denormalised owner + originating order. Ten call sites were already passing
+    // these; without the declarations Mongoose strict mode dropped them silently,
+    // leaving the ledger reachable only through walletId.
+    customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer' },
+    orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
     amount: { type: Number, required: true },
     type: { type: String, enum: ['credit', 'debit'], required: true },
     reason: { type: String },
@@ -16,6 +21,8 @@ const WalletTransactionSchema = new mongoose.Schema(
 );
 
 WalletTransactionSchema.index({ walletId: 1, createdAt: -1 });
+WalletTransactionSchema.index({ customerId: 1, createdAt: -1 });
+WalletTransactionSchema.index({ orderId: 1 });
 // Unique sparse index: prevents double-credit if processSuccessful runs concurrently
 WalletTransactionSchema.index({ paystackReference: 1 }, { unique: true, sparse: true });
 

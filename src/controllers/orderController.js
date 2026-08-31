@@ -19,9 +19,29 @@ const PromoRedemption = require('../models/PromoRedemption.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
-const { calculateOrderPricing, generateQRCode } = require('../utils/helpers.js');
+const {
+  calculateOrderPricing,
+  generateQRCode,
+  paidOrderMatch,
+  orderRevenueField,
+  startOfTodayWAT,
+  watDayEnd,
+  getTodayWAT,
+} = require('../utils/helpers.js');
 const notify = require('../utils/notify.js');
 const normalizePhone = require('../utils/normalizePhone.js');
+const logger = require('../utils/logger.js');
+const { logAudit } = require('../utils/auditLogger.js');
+
+// Every status an order may hold — mirrors the enum on OrderSchema.status.
+// Used to reject unknown values with a 400 instead of a raw Mongoose error.
+const ORDER_STATUSES = [
+  'draft', 'pending', 'confirmed', 'in_progress', 'picked-up', 'washing',
+  'ironing', 'ready', 'out-for-delivery', 'delivered', 'completed', 'cancelled',
+];
+
+// Statuses an order does not move on from under normal operation
+const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled'];
 
 // Statuses that have a countdown timer
 const TIMED_STAGES = new Set(['confirmed', 'picked-up', 'in_progress', 'washing', 'ironing', 'out-for-delivery']);
@@ -58,6 +78,80 @@ const CARE_TYPE_MULTIPLIERS = {
   'iron-only': 0.6,
   'wash-iron': 1.5,
 };
+
+// ─── Promo code resolution (server-side) ─────────────────────────────────────
+// Mirrors every check in promoController.validatePromoCode so a discount can never
+// be claimed by simply posting one. Returns the PromoCode doc when the code is
+// genuinely usable by this customer, otherwise null.
+async function resolveUsablePromoCode(code, customerId) {
+  if (!code) return null;
+
+  const promo = await PromoCode.findOne({ code: String(code).toUpperCase(), active: true });
+  if (!promo) return null;
+  if (promo.expiresAt && new Date(promo.expiresAt) < new Date()) return null;
+
+  const totalUsage = await PromoRedemption.countDocuments({ promoCodeId: promo._id });
+  if (promo.usageLimit && totalUsage >= promo.usageLimit) return null;
+
+  if (customerId && promo.usagePerUser > 0) {
+    const userUsage = await PromoRedemption.countDocuments({
+      promoCodeId: promo._id,
+      customerId,
+    });
+    if (userUsage >= promo.usagePerUser) return null;
+  }
+
+  return promo;
+}
+
+// Money value of a validated promo code against a given base. Never exceeds the base.
+function promoDiscountAmount(promo, base) {
+  if (!promo || base <= 0) return 0;
+  const raw = promo.type === 'percent'
+    ? Math.round(base * promo.value / 100)
+    : promo.value;
+  return Math.max(0, Math.min(raw, base));
+}
+
+// ─── Loyalty points redemption (server-side) ─────────────────────────────────
+// Works out how many points may actually be spent on this order and what they are
+// worth, honouring every LoyaltySetting guard and the customer's real balance.
+// Resolves only — the deduction happens separately so it can be rolled back.
+async function resolvePointsRedemption(requestedPoints, customerId, discountableBase) {
+  const none = { points: 0, amount: 0 };
+
+  const requested = parseInt(requestedPoints, 10);
+  if (!requested || requested <= 0 || !customerId || discountableBase <= 0) return none;
+
+  const settings = await LoyaltySetting.findOne().lean();
+  if (!settings || !settings.enabled || settings.redemptionEnabled === false) return none;
+
+  const customer = await Customer.findById(customerId).select('loyaltyPointsBalance').lean();
+  if (!customer) return none;
+
+  // Never spend more than the customer actually holds
+  let usable = Math.min(requested, customer.loyaltyPointsBalance || 0);
+
+  // Per-order point ceiling
+  if (settings.maxRedeemPointsPerOrder > 0) {
+    usable = Math.min(usable, settings.maxRedeemPointsPerOrder);
+  }
+
+  // Value ceiling — points may only cover maxRedeemPercent of the order
+  const nairaPerPoint = settings.pointsRedemptionValue > 0 ? settings.pointsRedemptionValue : 5;
+  const maxPct        = settings.maxRedeemPercent > 0 ? settings.maxRedeemPercent : 100;
+  const maxAmount     = Math.floor(discountableBase * maxPct / 100);
+  usable = Math.min(usable, Math.floor(maxAmount / nairaPerPoint));
+
+  if (usable <= 0) return none;
+
+  // Minimum redemption floor, applied after clamping so the customer is never
+  // charged points for a redemption below the configured threshold.
+  const minRedeem = settings.minRedeemPoints || 0;
+  if (minRedeem > 0 && usable < minRedeem) return none;
+
+  return { points: usable, amount: usable * nairaPerPoint };
+}
 
 // ─── Referral auto-qualification helper ──────────────────────────────────────
 // Called after an order reaches the trigger status (completed or paid).
@@ -114,10 +208,12 @@ async function processReferralReward(order, triggerStatus, io) {
   const referrerUser = await User.findById(referral.referrerUserId).select('_id customerId name').lean();
   if (referrerUser && referrerUser.customerId) {
     if (referrerRewardAmount > 0) {
-      let referrerWallet = await Wallet.findOne({ customerId: referrerUser.customerId });
-      if (!referrerWallet) referrerWallet = await Wallet.create({ customerId: referrerUser.customerId, balance: 0 });
-      referrerWallet.balance += referrerRewardAmount;
-      await referrerWallet.save();
+      // Atomic upsert-and-credit — no read-modify-write window, no separate create to race
+      const referrerWallet = await Wallet.findOneAndUpdate(
+        { customerId: referrerUser.customerId },
+        { $inc: { balance: referrerRewardAmount } },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
       await WalletTransaction.create({
         walletId: referrerWallet._id,
         customerId: referrerUser.customerId,
@@ -167,10 +263,11 @@ async function processReferralReward(order, triggerStatus, io) {
   // --- Credit referee wallet ---
   if (refereeUser.customerId) {
     if (refereeRewardAmount > 0) {
-      let refereeWallet = await Wallet.findOne({ customerId: refereeUser.customerId });
-      if (!refereeWallet) refereeWallet = await Wallet.create({ customerId: refereeUser.customerId, balance: 0 });
-      refereeWallet.balance += refereeRewardAmount;
-      await refereeWallet.save();
+      const refereeWallet = await Wallet.findOneAndUpdate(
+        { customerId: refereeUser.customerId },
+        { $inc: { balance: refereeRewardAmount } },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
       await WalletTransaction.create({
         walletId: refereeWallet._id,
         customerId: refereeUser.customerId,
@@ -341,6 +438,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     pickupFee: bodyPickupFee,
     discount: bodyDiscount,
     promoCode: bodyPromoCode,
+    pointsToRedeem: bodyPointsToRedeem,
   } = req.body;
 
   const isStaffRole = ['staff', 'admin', 'manager', 'developer'].includes(req.user.role);
@@ -463,28 +561,38 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   // pickupFee: frontend passes it at top-level or inside pricing object
   let resolvedPickupFee    = bodyPickupFee || (pricing && pricing.pickupFee) || 0;
   let resolvedDeliveryFee  = req.body.deliveryFee || (pricing && pricing.deliveryFee) || 0;
-  // discount: promo + points reductions passed by frontend
-  let resolvedDiscount     = bodyDiscount != null ? bodyDiscount : (pricing && pricing.discount) || 0;
 
-  // ── Apply loyalty tier benefits dynamically ───────────────────────────────
+  // ── Discount: rebuilt on the server, never taken from the request ──────────
+  // The client sends which promo code and how many points it wants to use; the
+  // amounts are derived here from the DB so a crafted request cannot conjure a
+  // discount. Staff keep their manual counter discount, but it is bounded and
+  // attributed (see manualDiscount below).
+  //
+  // Order matters: tier benefit first, then promo, then points, then any manual
+  // discount — each one sees the base the previous ones left behind. Resolving
+  // points before the tier discount would let them over-cover a tier-discounted
+  // order and silently burn point value the customer never received.
+  const discountableBase = baseSubtotal + serviceFee + addOnsFee;
+
+  // ── Loyalty tier benefits (server-derived) ────────────────────────────────
   let loyaltyTierSnapshot = null;
+  let tierDiscount        = 0;
   if (orderCustomerRefId) {
     const loyalCustomer = await Customer.findById(orderCustomerRefId)
       .populate('loyaltyTierId')
       .lean();
     const tier = loyalCustomer?.loyaltyTierId;
     if (tier && tier.active) {
-      const tierDiscountAmount = tier.discountPercent > 0
+      tierDiscount = tier.discountPercent > 0
         ? Math.round(baseSubtotal * tier.discountPercent / 100)
         : 0;
-      resolvedDiscount += tierDiscountAmount;
       if (tier.freePickup)   resolvedPickupFee   = 0;
       if (tier.freeDelivery) resolvedDeliveryFee = 0;
       loyaltyTierSnapshot = {
         tierId:           tier._id,
         tierName:         tier.name,
         discountPercent:  tier.discountPercent || 0,
-        discountAmount:   tierDiscountAmount,
+        discountAmount:   tierDiscount,
         freeDelivery:     tier.freeDelivery || false,
         freePickup:       tier.freePickup || false,
         priorityHandling: tier.priorityTurnaround || false,
@@ -492,6 +600,49 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       };
     }
   }
+
+  const validPromo    = await resolveUsablePromoCode(bodyPromoCode, orderCustomerRefId);
+  const promoDiscount = promoDiscountAmount(validPromo, Math.max(0, discountableBase - tierDiscount));
+
+  let pointsRedemption = await resolvePointsRedemption(
+    bodyPointsToRedeem,
+    orderCustomerRefId,
+    Math.max(0, discountableBase - tierDiscount - promoDiscount)
+  );
+
+  // Reserve the points now, before the order is written, so two concurrent
+  // checkouts cannot spend the same balance. Released again if creation fails.
+  let pointsBalanceAfter = null;
+  if (pointsRedemption.points > 0) {
+    const reserved = await Customer.findOneAndUpdate(
+      { _id: orderCustomerRefId, loyaltyPointsBalance: { $gte: pointsRedemption.points } },
+      { $inc: { loyaltyPointsBalance: -pointsRedemption.points } },
+      { new: true }
+    );
+    if (reserved) {
+      pointsBalanceAfter = reserved.loyaltyPointsBalance;
+    } else {
+      // Balance moved between resolve and reserve — drop the points discount
+      pointsRedemption = { points: 0, amount: 0 };
+    }
+  }
+
+  // Staff may apply a manual discount at the counter. Customers may not — any
+  // discount in a customer request is ignored entirely.
+  let manualDiscount = 0;
+  if (isStaffRole && bodyDiscount != null) {
+    const requested = Number(bodyDiscount);
+    if (Number.isFinite(requested) && requested > 0) {
+      manualDiscount = Math.min(
+        Math.round(requested),
+        Math.max(0, discountableBase - tierDiscount - promoDiscount - pointsRedemption.amount)
+      );
+    }
+  }
+
+  // Sum of every server-derived component. Bounded by discountableBase because
+  // each component above was clamped against what the previous ones left.
+  const resolvedDiscount = tierDiscount + promoDiscount + pointsRedemption.amount + manualDiscount;
 
   // Always recalculate pricing from DB-verified item prices — ignore frontend total
   const orderPricing = calculateOrderPricing(
@@ -504,7 +655,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   );
 
   // Create order
-  const order = await Order.create({
+  const orderDoc = {
     customer: orderCustomerId,
     customerId: orderCustomerRefId || undefined,
     orderSource: isOffline ? 'offline' : 'online',
@@ -546,61 +697,115 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       amount: orderPricing.total,
     },
     idempotencyKey: idempotencyKey || undefined,
-  });
+    // Server-derived loyalty redemption applied to this order
+    loyaltyPointsRedeemed: pointsRedemption.points,
+    loyaltyDiscountAmount: pointsRedemption.amount,
+    promoCodeId: validPromo ? validPromo._id : undefined,
+  };
+
+  let order;
+  try {
+    // Retry only on an orderNumber collision. The pre-validate hook allocates a
+    // fresh sequence on each attempt, so a retry resolves it. Any other duplicate
+    // key (idempotencyKey, code) is a real conflict and must surface.
+    let attempt = 0;
+    for (;;) {
+      try {
+        order = await Order.create(orderDoc);
+        break;
+      } catch (err) {
+        const isOrderNumberClash = err.code === 11000 && /orderNumber/i.test(err.message || '');
+        if (!isOrderNumberClash || ++attempt >= 5) throw err;
+        logger.warn(`[createOrder] orderNumber collision, retry ${attempt}/5`);
+      }
+    }
+  } catch (createErr) {
+    // Release the points reserved above — a failed write must never cost the customer
+    if (pointsRedemption.points > 0 && orderCustomerRefId) {
+      await Customer.findByIdAndUpdate(orderCustomerRefId, {
+        $inc: { loyaltyPointsBalance: pointsRedemption.points },
+      }).catch((e) => logger.error(`[createOrder] Point rollback failed: ${e.message}`));
+    }
+    throw createErr;
+  }
 
   // Generate QR code
   order.qrCode = generateQRCode(order.orderNumber);
   await order.save();
 
-  // Record promo code redemption (fire-and-forget — don't block the response)
-  if (bodyPromoCode) {
+  // Record the loyalty redemption in the ledger. The points were already deducted
+  // above; the unique { orderId, type } index keeps this to one row per order.
+  if (pointsRedemption.points > 0 && orderCustomerRefId) {
     try {
-      const promoDoc = await PromoCode.findOne({ code: bodyPromoCode.toUpperCase(), active: true });
-      if (promoDoc) {
-        // Skip if this customer already hit their per-user limit
-        let canRedeem = true;
-        if (orderCustomerRefId && promoDoc.usagePerUser > 0) {
-          const userUsage = await PromoRedemption.countDocuments({
-            promoCodeId: promoDoc._id,
-            customerId: orderCustomerRefId,
-          });
-          if (userUsage >= promoDoc.usagePerUser) canRedeem = false;
-        }
+      await LoyaltyLedger.create({
+        customerId:   orderCustomerRefId,
+        orderId:      order._id,
+        points:       -pointsRedemption.points,
+        type:         'redeem',
+        source:       'order',
+        reason:       `Redeemed on Order ${order.orderNumber}`,
+        balanceAfter: pointsBalanceAfter,
+      });
+      const redeemIo = req.app.get('io');
+      if (redeemIo) {
+        redeemIo.to(`user-${orderCustomerRefId}`).emit('loyalty:points-redeemed', {
+          points:  pointsRedemption.points,
+          amount:  pointsRedemption.amount,
+          balance: pointsBalanceAfter,
+          orderId: order._id,
+        });
+      }
+    } catch (ledgerErr) {
+      if (ledgerErr.code !== 11000) {
+        logger.error(`[createOrder] Loyalty ledger write failed for ${order.orderNumber}: ${ledgerErr.message}`);
+      }
+    }
+  }
 
-        if (canRedeem) {
-          await PromoRedemption.create({
-            promoCodeId: promoDoc._id,
-            orderId: order._id,
-            customerId: orderCustomerRefId || null,
-            amount: orderPricing.discount,
-          });
+  // Record the promo redemption. validPromo was already checked against expiry,
+  // global limit and per-user limit before the discount was applied, so there is
+  // no second validation here that could pass the discount but skip the record.
+  // Recorded for walk-ins too (customerId null) so the global usageLimit counts
+  // counter redemptions. Skipping them let a limited code be reused forever.
+  if (validPromo && promoDiscount > 0) {
+    try {
+      await PromoRedemption.create({
+        promoCodeId: validPromo._id,
+        orderId:     order._id,
+        customerId:  orderCustomerRefId || null,
+        amount:      promoDiscount,
+      });
 
-          // Auto-disable when global usage limit is reached
-          if (promoDoc.usageLimit) {
-            const totalUsage = await PromoRedemption.countDocuments({ promoCodeId: promoDoc._id });
-            if (totalUsage >= promoDoc.usageLimit) {
-              await PromoCode.findByIdAndUpdate(promoDoc._id, { active: false });
-            }
-          }
+      // Auto-disable when the global usage limit is reached
+      if (validPromo.usageLimit) {
+        const totalUsage = await PromoRedemption.countDocuments({ promoCodeId: validPromo._id });
+        if (totalUsage >= validPromo.usageLimit) {
+          await PromoCode.findByIdAndUpdate(validPromo._id, { active: false });
         }
       }
     } catch (err) {
-      logger.error({ message: 'Promo redemption recording failed', error: err.message });
+      if (err.code !== 11000) {
+        logger.error(`[createOrder] Promo redemption recording failed for ${order.orderNumber}: ${err.message}`);
+      }
     }
   }
 
   // Handle wallet payment if payment method is 'wallet'
   if (paymentMethod && paymentMethod.toLowerCase() === 'wallet') {
     try {
-      const wallet = await Wallet.findOne({ customerId: orderCustomerRefId });
+      // Atomic check-and-debit. Returns null when the wallet is missing or short,
+      // in which case the order simply stays unpaid and the customer can pay later.
+      const wallet = await Wallet.findOneAndUpdate(
+        { customerId: orderCustomerRefId, balance: { $gte: orderPricing.total } },
+        { $inc: { balance: -orderPricing.total } },
+        { new: true }
+      );
 
-      if (!wallet || wallet.balance < orderPricing.total) {
-        // Mark payment pending — customer can pay separately; don't fail the whole request
-        logger.warn(`[createOrder] Wallet payment skipped for order ${order.orderNumber}: ${!wallet ? 'wallet not found' : 'insufficient balance'}`);
+      if (!wallet) {
+        // Leave payment pending — the customer can pay separately. Never fail the
+        // whole request here: the order is already persisted at this point.
+        logger.warn(`[createOrder] Wallet payment skipped for order ${order.orderNumber}: wallet missing or insufficient balance`);
       } else {
-        wallet.balance -= orderPricing.total;
-        await wallet.save();
-
         await WalletTransaction.create({
           walletId: wallet._id,
           customerId: orderCustomerRefId,
@@ -609,6 +814,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
           reason: `Payment for order ${order.orderNumber}`,
           balanceAfter: wallet.balance,
           orderId: order._id,
+          source: 'order',
         });
 
         order.payment.status = 'paid';
@@ -779,11 +985,21 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       }
     }
 
-    // Delivery-role: restrict to delivery-type orders only
+    // Delivery-role: restrict to delivery-type orders only.
+    //
+    // Kept in $and rather than $or so it composes with the $or that the
+    // statusTab + myOrders branch may already have built (assigning to $or
+    // silently discarded it) and so the search block below, which resets $or,
+    // cannot drop the restriction either.
     if (req.user.role === 'delivery') {
-      query.$or = [
-        { orderType: 'pickup-delivery' },
-        { deliveryAddress: { $exists: true, $ne: null } },
+      query.$and = [
+        ...(query.$and || []),
+        {
+          $or: [
+            { orderType: 'pickup-delivery' },
+            { deliveryAddress: { $exists: true, $ne: null } },
+          ],
+        },
       ];
     }
   }
@@ -796,6 +1012,8 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     delete query.status;
     delete query.assignedStaff;
     delete query.$or;
+    // NB: query.$and is intentionally preserved — it carries the delivery-role
+    // scope, which a search must not be able to escape.
     query.$or = [
       { orderNumber: regex },
       { code: regex },
@@ -918,10 +1136,9 @@ exports.getOrderCounts = asyncHandler(async (req, res) => {
 // @route   GET /api/v1/orders/dashboard-stats
 // @access  Private (admin, manager)
 exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const todayEnd = new Date();
-  todayEnd.setHours(23, 59, 59, 999);
+  // WAT calendar day, not the container's local timezone
+  const todayStart = startOfTodayWAT();
+  const todayEnd   = watDayEnd(getTodayWAT());
 
   const INACTIVE_STATUSES = ['delivered', 'completed', 'cancelled'];
 
@@ -931,12 +1148,12 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
       {
         $facet: {
           totalRevenue: [
-            { $match: { paymentStatus: 'paid', status: { $nin: ['cancelled'] } } },
-            { $group: { _id: null, sum: { $sum: { $ifNull: ['$pricing.total', '$total'] } } } },
+            { $match: paidOrderMatch() },
+            { $group: { _id: null, sum: { $sum: orderRevenueField() } } },
           ],
           todayRevenue: [
-            { $match: { paymentStatus: 'paid', status: { $nin: ['cancelled'] }, createdAt: { $gte: todayStart, $lte: todayEnd } } },
-            { $group: { _id: null, sum: { $sum: { $ifNull: ['$pricing.total', '$total'] } } } },
+            { $match: { ...paidOrderMatch(), createdAt: { $gte: todayStart, $lte: todayEnd } } },
+            { $group: { _id: null, sum: { $sum: orderRevenueField() } } },
           ],
         },
       },
@@ -1132,17 +1349,21 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     // Customer overpaid — refund the difference to their wallet
     const orderUser = await User.findById(order.customer).select('customerId').lean();
     if (orderUser?.customerId) {
-      const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+      const wallet = await Wallet.findOneAndUpdate(
+        { customerId: orderUser.customerId },
+        { $inc: { balance: difference } },
+        { new: true }
+      );
       if (wallet) {
-        wallet.balance += difference;
-        await wallet.save();
         await WalletTransaction.create({
           walletId: wallet._id,
           customerId: orderUser.customerId,
+          orderId: order._id,
           type: 'credit',
           amount: difference,
           reason: `Order Adjustment Refund — ${order.orderNumber}`,
           balanceAfter: wallet.balance,
+          source: 'order',
         });
         refundIssued = true;
         refundAmount = difference;
@@ -1181,6 +1402,24 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
+  if (previousTotal !== newTotal) {
+    await logAudit({
+      actorUserId: req.user.id,
+      action: 'ORDER_PRICE_CHANGED',
+      targetType: 'Order',
+      targetId: order._id.toString(),
+      before: { total: previousTotal, paymentStatus: previousPaymentStatus },
+      after: { total: newTotal, paymentStatus: order.paymentStatus },
+      metadata: {
+        orderNumber: order.orderNumber,
+        difference,
+        refundIssued,
+        refundAmount,
+        note: req.body.editNote || undefined,
+      },
+    });
+  }
+
   await order.populate('customer', 'name phone email');
   await order.populate('assignedStaff', 'name phone staffRole');
   await order.populate('editHistory.editedBy', 'name role');
@@ -1213,6 +1452,41 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   if (!order) {
     return next(new AppError('Order not found', 404));
   }
+
+  // ── Transition guard ───────────────────────────────────────────────────────
+  // Deliberately permissive about movement *within* the active pipeline: an
+  // iron-only order legitimately skips washing, and staff need to walk a status
+  // back after a mis-tap. What it does stop is unknown values, no-op re-sends
+  // (which used to duplicate history rows and re-notify the customer) and
+  // anyone below manager reopening a finished or cancelled order.
+  if (!ORDER_STATUSES.includes(status)) {
+    return next(new AppError(
+      `'${status}' is not a valid order status`,
+      400,
+      ERROR_CODES.VALIDATION_ERROR
+    ));
+  }
+
+  if (order.status === status) {
+    return res.status(200).json({
+      success: true,
+      message: `Order is already ${status}`,
+      data: { order },
+    });
+  }
+
+  const isSupervisor = ['admin', 'manager', 'developer'].includes(req.user.role);
+  // 'delivered' → 'completed' is the normal close-out and stays open to everyone
+  const isRoutineCloseOut = order.status === 'delivered' && status === 'completed';
+
+  if (TERMINAL_STATUSES.includes(order.status) && !isRoutineCloseOut && !isSupervisor) {
+    return next(new AppError(
+      `Order is ${order.status}. Only a manager or admin can reopen it.`,
+      403
+    ));
+  }
+
+  const previousStatus = order.status;
 
   if (order.status === 'cancelled') {
     // Wallet refund was already issued on cancellation — reset to unpaid so the
@@ -1253,6 +1527,16 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_STATUS_CHANGED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    before: { status: previousStatus },
+    after: { status },
+    metadata: { orderNumber: order.orderNumber, notes: notes || undefined },
+  });
+
   // Auto-refund wallet if order was paid via wallet and is now being cancelled
   let walletRefundIssued = false;
   let refundAmount = 0;
@@ -1261,13 +1545,16 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     if (refundAmount > 0) {
       const orderUser = await User.findById(order.customer).select('customerId').lean();
       if (orderUser?.customerId) {
-        const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+        const wallet = await Wallet.findOneAndUpdate(
+          { customerId: orderUser.customerId },
+          { $inc: { balance: refundAmount } },
+          { new: true }
+        );
         if (wallet) {
-          wallet.balance += refundAmount;
-          await wallet.save();
           await WalletTransaction.create({
             walletId: wallet._id,
             customerId: orderUser.customerId,
+            orderId: order._id,
             type: 'credit',
             amount: refundAmount,
             reason: `Order Cancellation Refund — ${order.orderNumber}`,
@@ -1750,6 +2037,17 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
     return next(new AppError('Cannot update payment on a cancelled order', 400));
   }
 
+  const PAYMENT_STATES = ['pending', 'paid', 'failed', 'refunded'];
+  if (!PAYMENT_STATES.includes(status)) {
+    return next(new AppError(`'${status}' is not a valid payment status`, 400, ERROR_CODES.VALIDATION_ERROR));
+  }
+
+  const beforePayment = {
+    paymentStatus: order.paymentStatus,
+    status: order.payment?.status,
+    method: order.payment?.method,
+  };
+
   order.payment.status = status;
   if (method) order.payment.method = method;
   if (transactionId) order.payment.transactionId = transactionId;
@@ -1763,6 +2061,20 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
   if (paymentStatusMap[status]) order.paymentStatus = paymentStatusMap[status];
 
   await order.save();
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_PAYMENT_UPDATED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    before: beforePayment,
+    after: {
+      paymentStatus: order.paymentStatus,
+      status: order.payment?.status,
+      method: order.payment?.method,
+    },
+    metadata: { orderNumber: order.orderNumber, amount: order.payment?.amount, transactionId },
+  });
 
   // Handle referral auto-qualification for qualifyOnStatus: 'paid'
   if (status === 'paid') {
@@ -1814,27 +2126,33 @@ exports.payBalanceFromWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Customer wallet not found', 404));
   }
 
-  const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
-  if (!wallet) return next(new AppError('Customer does not have a wallet', 404));
+  const existingWallet = await Wallet.findOne({ customerId: orderUser.customerId });
+  if (!existingWallet) return next(new AppError('Customer does not have a wallet', 404));
 
-  if (wallet.balance < balanceDue) {
+  // Atomic check-and-debit — the balance guard and the deduction are one operation,
+  // so two concurrent charges cannot both pass the check and overdraw the wallet.
+  const wallet = await Wallet.findOneAndUpdate(
+    { _id: existingWallet._id, balance: { $gte: balanceDue } },
+    { $inc: { balance: -balanceDue } },
+    { new: true }
+  );
+
+  if (!wallet) {
     return next(new AppError(
-      `Insufficient wallet balance. Balance: ₦${wallet.balance.toLocaleString()}, Required: ₦${balanceDue.toLocaleString()}`,
+      `Insufficient wallet balance. Balance: ₦${existingWallet.balance.toLocaleString()}, Required: ₦${balanceDue.toLocaleString()}`,
       400
     ));
   }
 
-  // Deduct from wallet
-  wallet.balance -= balanceDue;
-  await wallet.save();
-
   await WalletTransaction.create({
     walletId: wallet._id,
     customerId: orderUser.customerId,
+    orderId: order._id,
     type: 'debit',
     amount: balanceDue,
     reason: `Balance payment for order ${order.orderNumber}`,
     balanceAfter: wallet.balance,
+    source: 'order',
   });
 
   // Mark order as fully paid
@@ -1908,27 +2226,32 @@ exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Customer wallet not found', 404));
   }
 
-  const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
-  if (!wallet) return next(new AppError('Wallet not found. Please contact support.', 404));
+  const existingWallet = await Wallet.findOne({ customerId: orderUser.customerId });
+  if (!existingWallet) return next(new AppError('Wallet not found. Please contact support.', 404));
 
-  if (wallet.balance < balanceDue) {
+  // Atomic check-and-debit — see payBalanceFromWallet for the reasoning.
+  const wallet = await Wallet.findOneAndUpdate(
+    { _id: existingWallet._id, balance: { $gte: balanceDue } },
+    { $inc: { balance: -balanceDue } },
+    { new: true }
+  );
+
+  if (!wallet) {
     return next(new AppError(
-      `Insufficient wallet balance. Balance: ₦${wallet.balance.toLocaleString()}, Required: ₦${balanceDue.toLocaleString()}`,
+      `Insufficient wallet balance. Balance: ₦${existingWallet.balance.toLocaleString()}, Required: ₦${balanceDue.toLocaleString()}`,
       400
     ));
   }
 
-  // Deduct from wallet
-  wallet.balance -= balanceDue;
-  await wallet.save();
-
   await WalletTransaction.create({
     walletId:     wallet._id,
     customerId:   orderUser.customerId,
+    orderId:      order._id,
     type:         'debit',
     amount:       balanceDue,
     reason:       `Payment for order ${order.orderNumber}`,
     balanceAfter: wallet.balance,
+    source:       'order',
   });
 
   // Mark order fully paid
@@ -1973,18 +2296,31 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
-  // Check if user has permission to cancel
-  if (
-    req.user.role === 'customer' &&
-    order.customer.toString() !== req.user.id
-  ) {
-    return next(new AppError('Not authorized to cancel this order', 403));
+  // Ownership check for customers.
+  //
+  // order.customer is null on a walk-in that has not been linked to an account
+  // yet, and those orders ARE surfaced to a matching customer by getOrders /
+  // getOrder — so this used to dereference null and 500 on a live code path.
+  // Matching mirrors customerPayWithWallet: direct link, or phone-matched walk-in.
+  if (req.user.role === 'customer') {
+    const linkedByUserId = order.customer && order.customer.toString() === req.user.id;
+
+    const userPhone  = normalizePhone(req.user.phone) || req.user.phone;
+    const orderPhone = order.walkInCustomer?.phone;
+    const linkedByPhone = order.orderSource === 'offline' && orderPhone && userPhone &&
+      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
+
+    if (!linkedByUserId && !linkedByPhone) {
+      return next(new AppError('Not authorized to cancel this order', 403));
+    }
   }
 
   // Check if order can be cancelled
   if (['delivered', 'completed', 'cancelled'].includes(order.status)) {
     return next(new AppError('Order cannot be cancelled', 400));
   }
+
+  const statusBeforeCancel = order.status;
 
   order.status = 'cancelled';
   order.notes = `Cancelled: ${reason}`;
@@ -1998,6 +2334,16 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
 
   await order.save();
 
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_CANCELLED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    before: { status: statusBeforeCancel },
+    after: { status: 'cancelled' },
+    metadata: { orderNumber: order.orderNumber, reason: reason || undefined, total: order.total },
+  });
+
   // Auto-refund wallet if paid via wallet
   const paidViaWallet = order.payment?.method === 'wallet' && order.paymentStatus === 'paid';
   const refundAmount = order.payment?.amount || order.total || 0;
@@ -2006,17 +2352,21 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   if (paidViaWallet && refundAmount > 0) {
     const orderUser = await User.findById(order.customer).select('customerId').lean();
     if (orderUser?.customerId) {
-      const wallet = await Wallet.findOne({ customerId: orderUser.customerId });
+      const wallet = await Wallet.findOneAndUpdate(
+        { customerId: orderUser.customerId },
+        { $inc: { balance: refundAmount } },
+        { new: true }
+      );
       if (wallet) {
-        wallet.balance += refundAmount;
-        await wallet.save();
         await WalletTransaction.create({
           walletId: wallet._id,
           customerId: orderUser.customerId,
+          orderId: order._id,
           type: 'credit',
           amount: refundAmount,
           reason: `Order Cancellation Refund — ${order.orderNumber}`,
           balanceAfter: wallet.balance,
+          source: 'order',
         });
         // Update payment status to refunded
         order.paymentStatus = 'refunded';

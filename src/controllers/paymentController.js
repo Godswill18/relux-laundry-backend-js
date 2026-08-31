@@ -11,6 +11,7 @@ const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const logger = require('../utils/logger.js');
 const notify = require('../utils/notify.js');
+const { logAudit } = require('../utils/auditLogger.js');
 
 // ─── Resolve active Paystack secret key ──────────────────────────────────────
 // Prefers the key saved in admin Payment Settings over the env var so that
@@ -179,8 +180,27 @@ exports.confirmPayment = asyncHandler(async (req, res, next) => {
 
   await payment.save();
 
-  // Update order payment status
-  await Order.findByIdAndUpdate(payment.orderId, { paymentStatus: 'paid' });
+  // Update the order's payment state.
+  //
+  // This used to set only `paymentStatus`, leaving the embedded `payment` object
+  // stale — which is why the two dashboards disagreed: one aggregates on
+  // paymentStatus, the other on payment.status. Both are written here now.
+  await Order.findByIdAndUpdate(payment.orderId, {
+    paymentStatus:    'paid',
+    'payment.status': 'paid',
+    'payment.method': payment.method,
+    'payment.amount': payment.amount,
+    'payment.paidAt': payment.paidAt,
+    ...(payment.reference ? { 'payment.transactionId': payment.reference } : {}),
+  });
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'PAYMENT_CONFIRMED',
+    targetType: 'Payment',
+    targetId: payment._id.toString(),
+    after: { amount: payment.amount, method: payment.method, orderId: String(payment.orderId) },
+  });
 
   // Emit real-time event to all admins watching the payments room
   const io = req.app.get('io');
@@ -530,6 +550,36 @@ async function processSuccessfulPaystackPayment(transaction, paystackData, io) {
     return;
   }
   logger.info(`[processSuccessful] Processing: ${transaction.reference} type=${transaction.type} amount=${transaction.amount}`);
+
+  // ── Amount verification ────────────────────────────────────────────────────
+  // Paystack is the only authority on what was actually collected. The amount on
+  // the transaction came from the client at initialize time and must never be the
+  // figure we credit — a client can request one amount and pay another. Every
+  // entry point (verify, background retry, admin retry, webhook) lands here, so
+  // this is the single place the check needs to live.
+  const expectedKobo = Math.round(transaction.amount * 100);
+  const paidKobo     = Number(paystackData?.amount);
+
+  if (!Number.isFinite(paidKobo) || paidKobo <= 0) {
+    logger.error(
+      `[processSuccessful] Paystack returned no usable amount for ${transaction.reference} — refusing to credit`
+    );
+    return;
+  }
+
+  if (paidKobo !== expectedKobo) {
+    logger.error(
+      `[processSuccessful] AMOUNT MISMATCH on ${transaction.reference}: requested ${expectedKobo} kobo, ` +
+      `Paystack collected ${paidKobo} kobo — crediting the collected amount and flagging for review`
+    );
+    transaction.amountMismatch  = true;
+    transaction.requestedAmount = transaction.amount;
+  }
+
+  // From here down, the collected amount is the only figure used. Rewriting it on
+  // the document means every downstream credit, ledger row, notification and
+  // socket payload picks it up without a separate variable to forget about.
+  transaction.amount = paidKobo / 100;
 
   // Mark status paid immediately so admin can see it even if side-effects are slow
   transaction.status = 'paid';
