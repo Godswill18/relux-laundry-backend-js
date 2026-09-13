@@ -36,6 +36,22 @@ const socketAuth = async (socket, next) => {
       return next(new Error('Authentication error: User not found'));
     }
 
+    // The HTTP `protect` middleware enforces both of the checks below, but this
+    // path enforced neither — so a deactivated account, or one whose role and
+    // permissions had been revoked, kept a live realtime feed until its token
+    // happened to expire. A websocket is a longer-lived grant than a request,
+    // not a weaker one.
+    if (!user.isActive) {
+      logger.warn(`Socket connection rejected: account deactivated (${socket.id}, userId: ${user._id})`);
+      return next(new Error('Authentication error: User account is deactivated'));
+    }
+
+    const tokenVersion = decoded.jwtVersion ?? 0;
+    if (tokenVersion !== user.jwtVersion) {
+      logger.warn(`Socket connection rejected: stale token (${socket.id}, userId: ${user._id})`);
+      return next(new Error('Authentication error: Your permissions have changed. Please log in again.'));
+    }
+
     // Attach user to socket object
     socket.user = user;
     socket.userId = user._id.toString();

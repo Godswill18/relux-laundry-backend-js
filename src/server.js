@@ -11,6 +11,11 @@ const allowedOrigins = require('./config/allowedOrigins.js');
 const backfillWalkIn = require('./utils/backfillWalkIn.js');
 const { acquireJobLock, releaseJobLock, withJobLock } = require('./utils/jobLock.js');
 const PaystackTransaction = require('./models/PaystackTransaction.js');
+// Needed to authorize socket room joins — a room join grants a live feed of the
+// same data the REST endpoints guard, so it has to check the same things.
+const Order = require('./models/Order.js');
+const ChatThread = require('./models/ChatThread.js');
+const normalizePhone = require('./utils/normalizePhone.js');
 const {
   backgroundVerifyAndCredit,
   paystackRequest,
@@ -80,8 +85,29 @@ io.on('connection', (socket) => {
     logger.info(`Auto-joined delivery room: ${userName}`);
   }
 
-  // Join payments room for admin real-time payment updates
+  // ── Room authorization ─────────────────────────────────────────────────────
+  // These three handlers used to join whatever room they were handed, with no
+  // check of any kind. A customer could emit join-payments and receive every
+  // payment event in the business, or join-order / join-chat with any id and
+  // watch another customer's order or read their support conversation. The
+  // rules below mirror the REST equivalents exactly: getPayments is
+  // admin/manager, getOrder allows the linked customer or a phone-matched
+  // walk-in, and getChatThread compares customerId.
+  const STAFF_ROLES = ['staff', 'admin', 'manager', 'receptionist', 'developer'];
+  const isStaff = STAFF_ROLES.includes(socket.user.role);
+
+  // Denials are reported back so the client can surface a real message instead
+  // of silently receiving nothing.
+  const deny = (room, reason) => {
+    logger.warn(`Socket room denied: ${userName} (${socket.user.role}) → ${room} — ${reason}`);
+    socket.emit('room:denied', { room, reason });
+  };
+
+  // Join payments room — admin/manager only, matching GET /payments.
   socket.on('join-payments', () => {
+    if (!['admin', 'manager', 'developer'].includes(socket.user.role)) {
+      return deny('payments', 'Not authorized to view payment activity');
+    }
     socket.join('payments');
     logger.info(`${userName} joined payments room`);
   });
@@ -91,9 +117,33 @@ io.on('connection', (socket) => {
     logger.info(`${userName} left payments room`);
   });
 
-  // Join order room for real-time updates
-  socket.on('join-order', (orderId) => {
-    if (!orderId) return;
+  // Join order room — staff see any order; a customer only their own, including
+  // a walk-in matched on phone (which getOrders/getOrder also surface to them).
+  socket.on('join-order', async (orderId) => {
+    if (!orderId || !mongoose.isValidObjectId(orderId)) return;
+
+    if (!isStaff) {
+      try {
+        const order = await Order.findById(orderId)
+          .select('customer orderSource walkInCustomer')
+          .lean();
+        if (!order) return deny(`order-${orderId}`, 'Order not found');
+
+        const linkedByUserId = order.customer && order.customer.toString() === userId;
+        const userPhone  = normalizePhone(socket.user.phone) || socket.user.phone;
+        const orderPhone = order.walkInCustomer?.phone;
+        const linkedByPhone = order.orderSource === 'offline' && orderPhone && userPhone &&
+          (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
+
+        if (!linkedByUserId && !linkedByPhone) {
+          return deny(`order-${orderId}`, 'Not authorized to follow this order');
+        }
+      } catch (err) {
+        logger.error(`join-order check failed for ${orderId}: ${err.message}`);
+        return deny(`order-${orderId}`, 'Could not verify access');
+      }
+    }
+
     socket.join(`order-${orderId}`);
     logger.info(`${userName} joined order room: ${orderId}`);
   });
@@ -105,9 +155,24 @@ io.on('connection', (socket) => {
     logger.info(`${userName} left order room: ${orderId}`);
   });
 
-  // Join chat room for real-time messaging
-  socket.on('join-chat', (threadId) => {
-    if (!threadId) return;
+  // Join chat room — staff handle any thread; a customer only their own.
+  socket.on('join-chat', async (threadId) => {
+    if (!threadId || !mongoose.isValidObjectId(threadId)) return;
+
+    if (!isStaff) {
+      try {
+        const thread = await ChatThread.findById(threadId).select('customerId').lean();
+        if (!thread) return deny(`chat-${threadId}`, 'Conversation not found');
+
+        if (!customerId || thread.customerId.toString() !== customerId) {
+          return deny(`chat-${threadId}`, 'Not authorized to view this conversation');
+        }
+      } catch (err) {
+        logger.error(`join-chat check failed for ${threadId}: ${err.message}`);
+        return deny(`chat-${threadId}`, 'Could not verify access');
+      }
+    }
+
     socket.join(`chat-${threadId}`);
     logger.info(`${userName} joined chat room: ${threadId}`);
   });

@@ -300,6 +300,13 @@ exports.pauseSubscription = asyncHandler(async (req, res, next) => {
     return next(new AppError('Subscription not found', 404));
   }
 
+  // Ownership guard, matching cancelSubscription and toggleAutoRenew. These
+  // three handlers were the ones that never had it, so any customer could act
+  // on — or read — another customer's subscription by id.
+  if (req.user.role === 'customer' && subscription.customerId.toString() !== String(req.user.customerId)) {
+    return next(new AppError('Not authorized', 403));
+  }
+
   if (subscription.status !== 'active') {
     return next(new AppError('Only active subscriptions can be paused', 400));
   }
@@ -329,6 +336,13 @@ exports.resumeSubscription = asyncHandler(async (req, res, next) => {
 
   if (!subscription) {
     return next(new AppError('Subscription not found', 404));
+  }
+
+  // Ownership guard, matching cancelSubscription and toggleAutoRenew. These
+  // three handlers were the ones that never had it, so any customer could act
+  // on — or read — another customer's subscription by id.
+  if (req.user.role === 'customer' && subscription.customerId.toString() !== String(req.user.customerId)) {
+    return next(new AppError('Not authorized', 403));
   }
 
   if (subscription.status !== 'paused') {
@@ -394,6 +408,13 @@ exports.getUsage = asyncHandler(async (req, res, next) => {
 
   if (!subscription) {
     return next(new AppError('Subscription not found', 404));
+  }
+
+  // Ownership guard, matching cancelSubscription and toggleAutoRenew. These
+  // three handlers were the ones that never had it, so any customer could act
+  // on — or read — another customer's subscription by id.
+  if (req.user.role === 'customer' && subscription.customerId.toString() !== String(req.user.customerId)) {
+    return next(new AppError('Not authorized', 403));
   }
 
   const usage = await SubscriptionUsage.find({ subscriptionId: req.params.id })

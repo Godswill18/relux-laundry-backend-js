@@ -1,7 +1,9 @@
 const PromoCode = require('../models/PromoCode.js');
 const PromoRedemption = require('../models/PromoRedemption.js');
+const Order = require('../models/Order.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const normalizePhone = require('../utils/normalizePhone.js');
 
 // @desc    Get all promo codes
 // @route   GET /api/v1/promos
@@ -193,17 +195,61 @@ exports.validatePromoCode = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/promos/redeem
 // @access  Private
 exports.redeemPromoCode = asyncHandler(async (req, res, next) => {
-  const { code, orderId, amount } = req.body;
+  const { code, orderId } = req.body;
 
-  const promoCode = await PromoCode.findOne({ code: code.toUpperCase(), active: true });
+  if (!code || !orderId) {
+    return next(new AppError('A promo code and an order are required', 400));
+  }
+
+  const promoCode = await PromoCode.findOne({ code: String(code).toUpperCase(), active: true });
 
   if (!promoCode) {
     return next(new AppError('Invalid or inactive promo code', 400));
   }
 
+  if (promoCode.expiresAt && new Date(promoCode.expiresAt) < new Date()) {
+    return next(new AppError('This promo code has expired', 400));
+  }
+
+  // ── The order must be one the caller may actually act on ──────────────────
+  // orderId was taken from the body with no check that it belonged to anyone in
+  // particular, so a customer could burn a campaign's global usage slots against
+  // other people's orders — and, with usageLimit set, exhaust it outright.
+  const order = await Order.findById(orderId).select('customer orderSource walkInCustomer total pricing');
+  if (!order) {
+    return next(new AppError('Order not found', 404));
+  }
+
+  const isStaffRole = ['staff', 'admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
+  if (!isStaffRole) {
+    const linkedByUserId = order.customer && order.customer.toString() === req.user.id;
+    const userPhone  = normalizePhone(req.user.phone) || req.user.phone;
+    const orderPhone = order.walkInCustomer?.phone;
+    const linkedByPhone = order.orderSource === 'offline' && orderPhone && userPhone &&
+      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
+
+    if (!linkedByUserId && !linkedByPhone) {
+      return next(new AppError('Not authorized to apply a promo code to this order', 403));
+    }
+  }
+
   const existingRedemption = await PromoRedemption.findOne({ orderId });
   if (existingRedemption) {
     return next(new AppError('Promo already applied to this order', 400));
+  }
+
+  // ── The discount is computed here, never accepted from the caller ─────────
+  // `amount` used to come straight from the request body into the redemption
+  // record, so the figure the business reports as promo cost was whatever the
+  // client claimed. It is derived from the code and the order total instead.
+  const orderTotal = order.total || order.pricing?.total || 0;
+  const rawDiscount = promoCode.type === 'percent'
+    ? Math.round(orderTotal * promoCode.value / 100)
+    : promoCode.value;
+  const amount = Math.max(0, Math.min(rawDiscount, orderTotal));
+
+  if (amount <= 0) {
+    return next(new AppError('This promo code has no value on this order', 400));
   }
 
   // Per-user limit check
