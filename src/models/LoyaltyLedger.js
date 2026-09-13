@@ -14,6 +14,12 @@ const LoyaltyLedgerSchema = new mongoose.Schema(
     referenceId: { type: mongoose.Schema.Types.ObjectId },  // referral _id or other ref
     source: { type: String, enum: ['order', 'referral', 'manual', 'conversion'], default: 'manual' },
     balanceAfter: { type: Number },
+    // ₦ value of this movement at the time it happened. Added because the Points
+    // page re-derived historical conversions from the *current* rate, so every
+    // past conversion silently changed value whenever an admin edited the rate.
+    // Optional: rows written before this field exists fall back to that old
+    // behaviour rather than having their history rewritten.
+    nairaAmount: { type: Number },
   },
   { timestamps: true }
 );

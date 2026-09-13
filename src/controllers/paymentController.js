@@ -10,6 +10,7 @@ const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const logger = require('../utils/logger.js');
+const normalizePhone = require('../utils/normalizePhone.js');
 const notify = require('../utils/notify.js');
 const { logAudit } = require('../utils/auditLogger.js');
 
@@ -22,6 +23,21 @@ async function getPaystackSecretKey() {
     if (setting?.paystackSecretKey) return setting.paystackSecretKey;
   } catch (_) { /* fall through */ }
   return process.env.PAYSTACK_SECRET_KEY;
+}
+
+// ─── Outstanding balance on an order ─────────────────────────────────────────
+// One definition, matching payBalanceFromWallet / customerPayWithWallet in the
+// order controller: `payment.amount` is seeded to the full total at creation, so
+// it only means "money actually received" once the order has left 'unpaid'.
+function amountAlreadyPaid(order) {
+  if (!order) return 0;
+  return order.paymentStatus === 'unpaid' ? 0 : (order.payment?.amount || 0);
+}
+
+function outstandingBalance(order) {
+  if (!order) return 0;
+  const total = order.total || order.pricing?.total || 0;
+  return Math.max(0, Math.round((total - amountAlreadyPaid(order)) * 100) / 100);
 }
 
 // ─── Paystack API helper ──────────────────────────────────────────────────────
@@ -144,9 +160,24 @@ exports.createPayment = asyncHandler(async (req, res, next) => {
     return next(new AppError('Payment already exists for this order', 400));
   }
 
+  // Bound the amount against the order. `amount` arrived unchecked, so a typo or
+  // a crafted request could record a payment larger than the order was ever for
+  // — which then flows straight into the revenue aggregates.
+  const orderTotal = order.total || order.pricing?.total || 0;
+  const recorded = Number(amount);
+  if (!Number.isFinite(recorded) || recorded <= 0) {
+    return next(new AppError('Payment amount must be greater than 0', 400));
+  }
+  if (recorded > orderTotal + 0.01) {
+    return next(new AppError(
+      `Payment of ₦${recorded.toLocaleString()} exceeds the order total of ₦${orderTotal.toLocaleString()}`,
+      400
+    ));
+  }
+
   const payment = await Payment.create({
     orderId,
-    amount,
+    amount: Math.round(recorded * 100) / 100,
     method,
     reference,
     metadata,
@@ -185,14 +216,36 @@ exports.confirmPayment = asyncHandler(async (req, res, next) => {
   // This used to set only `paymentStatus`, leaving the embedded `payment` object
   // stale — which is why the two dashboards disagreed: one aggregates on
   // paymentStatus, the other on payment.status. Both are written here now.
-  await Order.findByIdAndUpdate(payment.orderId, {
-    paymentStatus:    'paid',
-    'payment.status': 'paid',
-    'payment.method': payment.method,
-    'payment.amount': payment.amount,
-    'payment.paidAt': payment.paidAt,
-    ...(payment.reference ? { 'payment.transactionId': payment.reference } : {}),
-  });
+  //
+  // It also marked the order 'paid' for whatever sum the Payment carried, so
+  // confirming a part-payment closed the order out in full. The recorded amount
+  // decides the status, matching the Paystack settlement and counter paths.
+  const confirmedOrder = await Order.findById(payment.orderId);
+  if (confirmedOrder) {
+    const orderTotal = confirmedOrder.total || confirmedOrder.pricing?.total || 0;
+    const fullyPaid  = payment.amount >= orderTotal - 0.01;
+
+    if (!fullyPaid) {
+      payment.state = 'pending';
+      await payment.save();
+      logger.warn(
+        `[confirmPayment] Partial payment on order ${confirmedOrder.orderNumber}: ` +
+        `₦${payment.amount} of ₦${orderTotal}`
+      );
+    }
+
+    await Order.findByIdAndUpdate(payment.orderId, {
+      paymentStatus:    fullyPaid ? 'paid' : 'partial',
+      'payment.status': fullyPaid ? 'paid' : 'pending',
+      // Payment.method allows 'paystack'; the Order subdocument enum does not
+      // (it uses 'online'). findByIdAndUpdate skips validators, so an unmapped
+      // value would be written straight through as an invalid enum member.
+      'payment.method': payment.method === 'paystack' ? 'online' : payment.method,
+      'payment.amount': payment.amount,
+      'payment.paidAt': payment.paidAt,
+      ...(payment.reference ? { 'payment.transactionId': payment.reference } : {}),
+    });
+  }
 
   await logAudit({
     actorUserId: req.user.id,
@@ -262,12 +315,64 @@ exports.initializePaystack = asyncHandler(async (req, res, next) => {
     return next(new AppError('An email address is required to process this payment', 400));
   }
 
+  // ── Order payments: authorise the order and price it from the DB ──────────
+  // `amount` and `orderId` both arrived from the client with nothing checking
+  // either. That allowed two things: paying ₦100 against a ₦20,000 order (which
+  // processSuccessfulPaystackPayment then marked fully paid), and passing
+  // somebody else's orderId to settle their order. The outstanding balance is
+  // recomputed here from the stored total so the client figure never matters.
+  let chargeAmount = Number(amount);
+  let resolvedOrder = null;
+
+  if (type === 'order') {
+    if (!orderId) {
+      return next(new AppError('An order is required for an order payment', 400));
+    }
+
+    resolvedOrder = await Order.findById(orderId);
+    if (!resolvedOrder) {
+      return next(new AppError('Order not found', 404));
+    }
+
+    // Ownership mirrors customerPayWithWallet: a direct customer link, or a
+    // walk-in matched on phone. Walk-ins have order.customer === null until the
+    // person signs up, and they are already surfaced to that account by
+    // getOrders/getOrder — checking only the direct link would lock them out of
+    // paying for an order they can see.
+    const isStaffRole = ['staff', 'admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
+    const linkedByUserId = resolvedOrder.customer && resolvedOrder.customer.toString() === req.user.id;
+    const userPhone  = normalizePhone(req.user.phone) || req.user.phone;
+    const orderPhone = resolvedOrder.walkInCustomer?.phone;
+    const linkedByPhone = resolvedOrder.orderSource === 'offline' && orderPhone && userPhone &&
+      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
+
+    if (!isStaffRole && !linkedByUserId && !linkedByPhone) {
+      return next(new AppError('Not authorized to pay for this order', 403));
+    }
+
+    if (resolvedOrder.status === 'cancelled') {
+      return next(new AppError('Cannot pay for a cancelled order', 400));
+    }
+    if (resolvedOrder.paymentStatus === 'paid') {
+      return next(new AppError('This order is already paid', 409));
+    }
+
+    chargeAmount = outstandingBalance(resolvedOrder);
+    if (chargeAmount <= 0) {
+      return next(new AppError('No outstanding balance on this order', 400));
+    }
+  }
+
+  if (!Number.isFinite(chargeAmount) || chargeAmount <= 0) {
+    return next(new AppError('Amount is required', 400));
+  }
+
   const reference = `RLX-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
   // Persist a pending transaction so verifyPaystack can find it after payment
   const transaction = await PaystackTransaction.create({
     reference,
-    amount,
+    amount: chargeAmount,
     type: type || 'wallet_topup',
     customerId: req.user.customerId,
     userId: req.user.id,
@@ -277,7 +382,7 @@ exports.initializePaystack = asyncHandler(async (req, res, next) => {
     metadata: { type, orderId, planId, userId: req.user.id },
   });
 
-  logger.info(`[initializePaystack] DB record created reference=${reference} amount=${amount} type=${type || 'wallet_topup'} userId=${req.user.id}`);
+  logger.info(`[initializePaystack] DB record created reference=${reference} amount=${chargeAmount} type=${type || 'wallet_topup'} userId=${req.user.id}`);
 
   res.status(201).json({
     success: true,
@@ -286,7 +391,10 @@ exports.initializePaystack = asyncHandler(async (req, res, next) => {
       reference,
       paystackPublicKey: resolvedPublicKey,
       email: customerEmail,
-      amountKobo: Math.round(amount * 100),
+      // The server-derived figure, not the requested one — the popup must open
+      // for the amount the order actually owes.
+      amountKobo: Math.round(chargeAmount * 100),
+      amount: chargeAmount,
       transaction,
     },
   });
@@ -670,17 +778,64 @@ async function processSuccessfulPaystackPayment(transaction, paystackData, io) {
     }
   }
 
-  // For order payments — mark order paid
+  // ── Order payments ────────────────────────────────────────────────────────
+  // This used to write paymentStatus:'paid' for any collected amount, so a ₦100
+  // charge closed out a ₦20,000 order. The collected sum is added to what the
+  // order had already received and the status follows from the comparison:
+  // fully covered → 'paid', anything less → 'partial'.
   if (transaction.type === 'order' && transaction.orderId) {
     try {
-      await Order.findByIdAndUpdate(transaction.orderId, {
-        paymentStatus: 'paid',
-        'payment.status': 'paid',
-        'payment.method': 'paystack',
-        'payment.amount': transaction.amount,
-        'payment.paidAt': new Date(),
-      });
-      if (io) io.emit('leaderboard:updated');
+      const order = await Order.findById(transaction.orderId);
+      if (!order) {
+        logger.error(`[processSuccessful] Order ${transaction.orderId} not found for ref=${transaction.reference}`);
+      } else {
+        const orderTotal   = order.total || order.pricing?.total || 0;
+        const previouslyPaid = amountAlreadyPaid(order);
+        const totalPaid    = Math.round((previouslyPaid + transaction.amount) * 100) / 100;
+        // Tolerate sub-kobo float drift rather than leaving an order a fraction short
+        const fullyPaid    = totalPaid >= orderTotal - 0.01;
+
+        order.paymentStatus   = fullyPaid ? 'paid' : 'partial';
+        order.payment.status  = fullyPaid ? 'paid' : 'pending';
+        order.payment.method  = 'online';
+        order.payment.amount  = totalPaid;
+        order.payment.paidAt  = new Date();
+        order.payment.transactionId = transaction.reference;
+        await order.save();
+
+        if (!fullyPaid) {
+          logger.warn(
+            `[processSuccessful] Partial payment on order ${order.orderNumber}: ` +
+            `collected ₦${transaction.amount}, paid ₦${totalPaid} of ₦${orderTotal}`
+          );
+        }
+
+        // Mirror into the Payment collection. The admin Payments page reads that
+        // collection, so Paystack order revenue was invisible there and
+        // getPaymentByOrder 404'd for every online-paid order.
+        await Payment.findOneAndUpdate(
+          { orderId: order._id },
+          {
+            orderId:   order._id,
+            amount:    totalPaid,
+            method:    'paystack',
+            state:     fullyPaid ? 'paid' : 'pending',
+            reference: transaction.reference,
+            paidAt:    new Date(),
+            metadata:  { paystackTransactionId: String(transaction._id), lastCollected: transaction.amount },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+
+        if (io) {
+          io.to(`order-${order._id}`).emit('order:updated', {
+            orderId:       order._id,
+            paymentStatus: order.paymentStatus,
+            paymentMethod: order.payment.method,
+          });
+          io.emit('leaderboard:updated');
+        }
+      }
     } catch (orderErr) {
       logger.error(`[processSuccessful] Order update error for ref=${transaction.reference}: ${orderErr.message}`);
     }

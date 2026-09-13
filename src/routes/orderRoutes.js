@@ -68,9 +68,10 @@ router.post('/:id/pay-wallet', customerPayWithWallet);
 // Delivery agents are deliberately excluded — cancelling is a counter/customer action
 router.put('/:id/cancel', authorize('customer', 'staff', 'admin', 'manager', 'receptionist'), cancelOrder);
 
-// Order items
-router.post('/:id/items', addOrderItem);
-router.delete('/:id/items/:itemId', removeOrderItem);
+// Order items — editing an order's contents is a counter action, same authority
+// as PUT /:id. These previously carried no authorize() at all.
+router.post('/:id/items', authorize('staff', 'admin', 'manager', 'receptionist'), addOrderItem);
+router.delete('/:id/items/:itemId', authorize('staff', 'admin', 'manager', 'receptionist'), removeOrderItem);
 
 // Order media
 router.get('/:id/media', getOrderMedia);

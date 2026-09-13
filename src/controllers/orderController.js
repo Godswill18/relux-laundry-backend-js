@@ -1,5 +1,8 @@
 const Order = require('../models/Order.js');
-const OrderItem = require('../models/OrderItem.js');
+// NOTE: models/OrderItem.js is now unreferenced. The collection it maps to was
+// never read by anything and its two endpoints operate on order.items instead.
+// The file and any existing documents are left in place deliberately — dropping
+// them is a separate, reviewable cleanup.
 const OrderMedia = require('../models/OrderMedia.js');
 const Customer = require('../models/Customer.js');
 const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
@@ -16,6 +19,14 @@ const ServiceCategory = require('../models/ServiceCategory.js');
 const LoyaltyTier = require('../models/LoyaltyTier.js');
 const PromoCode = require('../models/PromoCode.js');
 const PromoRedemption = require('../models/PromoRedemption.js');
+const DeliveryZone = require('../models/DeliveryZone.js');
+const PickupWindow = require('../models/PickupWindow.js');
+const {
+  loadLoyaltySettings,
+  redemptionAvailable,
+  redemptionPointsPerNaira,
+  discountForPoints,
+} = require('../utils/loyaltyRates.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const ERROR_CODES = require('../utils/errorCodes.js');
@@ -123,8 +134,12 @@ async function resolvePointsRedemption(requestedPoints, customerId, discountable
   const requested = parseInt(requestedPoints, 10);
   if (!requested || requested <= 0 || !customerId || discountableBase <= 0) return none;
 
-  const settings = await LoyaltySetting.findOne().lean();
-  if (!settings || !settings.enabled || settings.redemptionEnabled === false) return none;
+  // Read fresh on every checkout, so a rate the customer's page loaded earlier
+  // is never the one that prices the order.
+  const settings = await loadLoyaltySettings();
+  // redemptionAvailable() covers the master programme switch too — previously
+  // only the channel switch was checked here.
+  if (!redemptionAvailable(settings)) return none;
 
   const customer = await Customer.findById(customerId).select('loyaltyPointsBalance').lean();
   if (!customer) return none;
@@ -137,11 +152,15 @@ async function resolvePointsRedemption(requestedPoints, customerId, discountable
     usable = Math.min(usable, settings.maxRedeemPointsPerOrder);
   }
 
-  // Value ceiling — points may only cover maxRedeemPercent of the order
-  const nairaPerPoint = settings.pointsRedemptionValue > 0 ? settings.pointsRedemptionValue : 5;
-  const maxPct        = settings.maxRedeemPercent > 0 ? settings.maxRedeemPercent : 100;
-  const maxAmount     = Math.floor(discountableBase * maxPct / 100);
-  usable = Math.min(usable, Math.floor(maxAmount / nairaPerPoint));
+  // Value ceiling — points may only cover maxRedeemPercent of the order.
+  // Expressed in points-per-₦1, the same unit as every other loyalty rate; this
+  // used to read pointsRedemptionValue, an inverted ₦-per-point field that the
+  // admin dashboard never exposed and which therefore valued points at 25× the
+  // configured rate.
+  const pointsPerNaira = redemptionPointsPerNaira(settings);
+  const maxPct         = settings.maxRedeemPercent > 0 ? settings.maxRedeemPercent : 100;
+  const maxAmount      = Math.floor(discountableBase * maxPct / 100);
+  usable = Math.min(usable, maxAmount * pointsPerNaira);
 
   if (usable <= 0) return none;
 
@@ -150,7 +169,11 @@ async function resolvePointsRedemption(requestedPoints, customerId, discountable
   const minRedeem = settings.minRedeemPoints || 0;
   if (minRedeem > 0 && usable < minRedeem) return none;
 
-  return { points: usable, amount: usable * nairaPerPoint };
+  const amount = discountForPoints(usable, settings);
+  if (amount <= 0) return none;
+
+  // Never let the discount exceed the base it applies to.
+  return { points: usable, amount: Math.min(amount, discountableBase) };
 }
 
 // ─── Referral auto-qualification helper ──────────────────────────────────────
@@ -558,9 +581,56 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     }
   }
 
-  // pickupFee: frontend passes it at top-level or inside pricing object
-  let resolvedPickupFee    = bodyPickupFee || (pricing && pricing.pickupFee) || 0;
-  let resolvedDeliveryFee  = req.body.deliveryFee || (pricing && pricing.deliveryFee) || 0;
+  // ── Pickup / delivery fees (server-derived) ───────────────────────────────
+  // These used to be taken straight from the request body. Every other money
+  // component on this order is rebuilt from the DB, but these two were not —
+  // so a customer could post deliveryFee: 0 to ride free, or a negative figure
+  // to drive the whole total to 0 (calculateOrderPricing clamps at 0, which hid
+  // it). The authoritative figures live on DeliveryZone.fee / PickupWindow.baseFee,
+  // with the rush surcharge added the same way the checkout screen shows it.
+  //
+  // Staff keep manual fee entry at the counter — a walk-in has no zone or window
+  // to look up — but the value is still clamped to a non-negative number so a
+  // fee can never act as an unaudited discount.
+  const resolvedDeliveryZoneId  = req.body.deliveryZoneId  || undefined;
+  const resolvedPickupWindowId  = req.body.pickupWindowId  || undefined;
+
+  const clampFee = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0;
+  };
+
+  let resolvedPickupFee   = 0;
+  let resolvedDeliveryFee = 0;
+
+  if (isStaffRole) {
+    resolvedPickupFee   = clampFee(bodyPickupFee ?? (pricing && pricing.pickupFee));
+    resolvedDeliveryFee = clampFee(req.body.deliveryFee ?? (pricing && pricing.deliveryFee));
+  }
+
+  // Customer-placed orders (and any staff order that did name a zone/window)
+  // price the legs from the DB, ignoring whatever the client asked for.
+  if (resolvedPickupWindowId) {
+    const win = await PickupWindow.findById(resolvedPickupWindowId).lean();
+    if (win && win.active !== false) {
+      resolvedPickupFee = clampFee((win.baseFee || 0) + (rush ? (win.rushFee || 0) : 0));
+    } else if (!isStaffRole) {
+      return next(new AppError('The selected pickup window is no longer available', 400));
+    }
+  } else if (!isStaffRole) {
+    resolvedPickupFee = 0;
+  }
+
+  if (resolvedDeliveryZoneId) {
+    const zone = await DeliveryZone.findById(resolvedDeliveryZoneId).lean();
+    if (zone && zone.active !== false) {
+      resolvedDeliveryFee = clampFee((zone.fee || 0) + (rush ? (zone.rushFee || 0) : 0));
+    } else if (!isStaffRole) {
+      return next(new AppError('The selected delivery zone is no longer available', 400));
+    }
+  } else if (!isStaffRole) {
+    resolvedDeliveryFee = 0;
+  }
 
   // ── Discount: rebuilt on the server, never taken from the request ──────────
   // The client sends which promo code and how many points it wants to use; the
@@ -677,6 +747,13 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     serviceLevelName: resolvedServiceLevelName,
     serviceLevelPercentage: serviceLevelPct,
     pickupMethod: pickupMethod || undefined,
+    // Both were declared on the schema and populated by getOrder, but never
+    // written here — so every order carried null and receipts could not show
+    // which zone was charged. They are also the source the fees above are
+    // derived from, so persisting them makes the pricing reproducible.
+    deliveryZoneId: resolvedDeliveryZoneId,
+    pickupWindowId: resolvedPickupWindowId,
+    deliveryFee: resolvedDeliveryFee,
     rush: rush || false,
     stainRemoval: stainRemoval || false,
     fragrance: fragrance || false,
@@ -1330,6 +1407,9 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     const newPricing = calculateOrderPricing(pricedItems, pickupFee, deliveryFee, discount, serviceFee, addOnsFee);
     order.pricing = newPricing;
     order.total   = newPricing.total;
+    // Keep the top-level mirror in step with pricing.deliveryFee — createOrder
+    // now populates it, and a later edit must not leave the two disagreeing.
+    order.deliveryFee = newPricing.deliveryFee;
     newTotal      = newPricing.total;
   } else if (req.body.pricing && req.body.pricing.total !== undefined) {
     // Manual pricing override (no items change)
@@ -2037,9 +2117,17 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
     return next(new AppError('Cannot update payment on a cancelled order', 400));
   }
 
+  // `status` is optional: the admin order page uses this endpoint to change only
+  // the payment method (OrderDetailPage sends { method } alone), and the blanket
+  // validation below rejected that with a 400 — the button did nothing. Validate
+  // the value only when one was actually supplied, and otherwise keep the status
+  // the order already has.
   const PAYMENT_STATES = ['pending', 'paid', 'failed', 'refunded'];
-  if (!PAYMENT_STATES.includes(status)) {
+  if (status !== undefined && !PAYMENT_STATES.includes(status)) {
     return next(new AppError(`'${status}' is not a valid payment status`, 400, ERROR_CODES.VALIDATION_ERROR));
+  }
+  if (status === undefined && method === undefined && transactionId === undefined) {
+    return next(new AppError('Nothing to update', 400, ERROR_CODES.VALIDATION_ERROR));
   }
 
   const beforePayment = {
@@ -2048,17 +2136,50 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
     method: order.payment?.method,
   };
 
-  order.payment.status = status;
   if (method) order.payment.method = method;
   if (transactionId) order.payment.transactionId = transactionId;
 
+  // ── Amount taken at the counter ───────────────────────────────────────────
+  // This handler used to flip the status without ever recording a figure, so
+  // `payment.amount` kept the full total it was seeded with at creation and a
+  // part-payment read back as settled in full. When an amount is supplied it is
+  // now the thing that decides the status: short of the total is 'partial'.
+  const orderTotal = order.total || order.pricing?.total || 0;
+  // A method-only update leaves the payment state exactly as it was.
+  let resolvedStatus = status === undefined ? order.payment?.status : status;
+
   if (status === 'paid') {
+    const requested = req.body.amount !== undefined ? Number(req.body.amount) : orderTotal;
+
+    if (!Number.isFinite(requested) || requested <= 0) {
+      return next(new AppError('Payment amount must be greater than 0', 400, ERROR_CODES.VALIDATION_ERROR));
+    }
+    if (requested > orderTotal + 0.01) {
+      return next(new AppError(
+        `Payment of ₦${requested.toLocaleString()} exceeds the order total of ₦${orderTotal.toLocaleString()}`,
+        400,
+        ERROR_CODES.VALIDATION_ERROR
+      ));
+    }
+
+    order.payment.amount = Math.round(requested * 100) / 100;
     order.payment.paidAt = Date.now();
+    // Sub-kobo tolerance, same rule the Paystack settlement path uses
+    if (order.payment.amount < orderTotal - 0.01) resolvedStatus = 'partial';
   }
 
-  // Keep top-level paymentStatus in sync so normalisation on the frontend is consistent
-  const paymentStatusMap = { pending: 'unpaid', paid: 'paid', failed: 'unpaid', refunded: 'refunded' };
-  if (paymentStatusMap[status]) order.paymentStatus = paymentStatusMap[status];
+  // 'partial' is a paymentStatus value, not a payment.status value — the
+  // embedded subdocument enum has no such member, so it stays 'pending'.
+  order.payment.status = resolvedStatus === 'partial' ? 'pending' : resolvedStatus;
+
+  // Keep top-level paymentStatus in sync so normalisation on the frontend is
+  // consistent — but only when a status was actually supplied. A method-only
+  // update must not touch it: payment.status is 'pending' for a partial payment,
+  // so mapping it back would silently downgrade a 'partial' order to 'unpaid'.
+  const paymentStatusMap = { pending: 'unpaid', paid: 'paid', partial: 'partial', failed: 'unpaid', refunded: 'refunded' };
+  if (status !== undefined && paymentStatusMap[resolvedStatus]) {
+    order.paymentStatus = paymentStatusMap[resolvedStatus];
+  }
 
   await order.save();
 
@@ -2076,8 +2197,9 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
     metadata: { orderNumber: order.orderNumber, amount: order.payment?.amount, transactionId },
   });
 
-  // Handle referral auto-qualification for qualifyOnStatus: 'paid'
-  if (status === 'paid') {
+  // Handle referral auto-qualification for qualifyOnStatus: 'paid'.
+  // Keyed off the resolved status so a part-payment does not qualify a referral.
+  if (resolvedStatus === 'paid') {
     await processReferralReward(order, 'paid', req.app.get('io'));
   }
 
@@ -2085,7 +2207,9 @@ exports.updatePayment = asyncHandler(async (req, res, next) => {
   if (io) {
     io.to(`order-${order._id}`).emit('order:updated', {
       orderId: order._id,
-      paymentStatus: order.payment.status,
+      // The top-level status is the one the UIs normalise on, and the only one
+      // that can express 'partial'.
+      paymentStatus: order.paymentStatus,
       paymentMethod: order.payment.method,
     });
   }
@@ -2344,6 +2468,64 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
     metadata: { orderNumber: order.orderNumber, reason: reason || undefined, total: order.total },
   });
 
+  // ── Reverse what the order consumed at checkout ───────────────────────────
+  // Cancellation refunded the wallet but nothing else, so a customer lost every
+  // loyalty point they had redeemed and a single-use promo code stayed burnt.
+  // Both are reversed here; each is independent and must not block the other or
+  // the cancellation itself, which is already persisted above.
+  let pointsReturned = 0;
+  if (order.loyaltyPointsRedeemed > 0 && order.customerId) {
+    try {
+      const restored = await Customer.findByIdAndUpdate(
+        order.customerId,
+        { $inc: { loyaltyPointsBalance: order.loyaltyPointsRedeemed } },
+        { new: true }
+      );
+      if (restored) {
+        pointsReturned = order.loyaltyPointsRedeemed;
+        // { orderId, type } is unique, so 'reversal' coexists with the original
+        // 'redeem' row and a double cancel cannot credit the points twice.
+        await LoyaltyLedger.create({
+          customerId:   order.customerId,
+          orderId:      order._id,
+          points:       pointsReturned,
+          type:         'reversal',
+          source:       'order',
+          reason:       `Points returned — Order ${order.orderNumber} cancelled`,
+          balanceAfter: restored.loyaltyPointsBalance,
+        });
+        order.loyaltyPointsRedeemed = 0;
+        order.loyaltyDiscountAmount = 0;
+        await order.save();
+      }
+    } catch (pointsErr) {
+      if (pointsErr.code === 11000) {
+        logger.info(`[cancelOrder] Points already reversed for ${order.orderNumber}`);
+      } else {
+        logger.error(`[cancelOrder] Point reversal failed for ${order.orderNumber}: ${pointsErr.message}`);
+      }
+    }
+  }
+
+  if (order.promoCodeId) {
+    try {
+      const removed = await PromoRedemption.findOneAndDelete({ orderId: order._id });
+      if (removed) {
+        // The code may have been auto-disabled when this redemption pushed it to
+        // its usage limit — releasing the slot has to release the code too.
+        const promo = await PromoCode.findById(order.promoCodeId);
+        if (promo && promo.usageLimit && !promo.active) {
+          const usage = await PromoRedemption.countDocuments({ promoCodeId: promo._id });
+          if (usage < promo.usageLimit) {
+            await PromoCode.findByIdAndUpdate(promo._id, { active: true });
+          }
+        }
+      }
+    } catch (promoErr) {
+      logger.error(`[cancelOrder] Promo release failed for ${order.orderNumber}: ${promoErr.message}`);
+    }
+  }
+
   // Auto-refund wallet if paid via wallet
   const paidViaWallet = order.payment?.method === 'wallet' && order.paymentStatus === 'paid';
   const refundAmount = order.payment?.amount || order.total || 0;
@@ -2385,6 +2567,33 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
     }
   }
 
+  // ── Money taken by a method we cannot refund automatically ────────────────
+  // Only wallet payments reverse themselves. A Paystack / cash / POS / transfer
+  // order used to be cancelled with paymentStatus left at 'paid' and no record
+  // anywhere that the business owes the money back. The status is left honest —
+  // the customer really did pay — but the obligation is now recorded and raised
+  // so it cannot be settled silently.
+  if (!walletRefundIssued && order.paymentStatus === 'paid' && refundAmount > 0) {
+    await logAudit({
+      actorUserId: req.user.id,
+      action: 'REFUND_DUE',
+      targetType: 'Order',
+      targetId: order._id.toString(),
+      before: { paymentStatus: 'paid', method: order.payment?.method },
+      after: { paymentStatus: 'paid', refundOutstanding: refundAmount },
+      metadata: {
+        orderNumber: order.orderNumber,
+        amount: refundAmount,
+        method: order.payment?.method,
+        note: 'Order cancelled after payment — manual refund required',
+      },
+    });
+    logger.warn(
+      `[cancelOrder] Manual refund owed on ${order.orderNumber}: ` +
+      `₦${refundAmount} paid by ${order.payment?.method || 'unknown'}`
+    );
+  }
+
   // Notifications
   const cancelIo = req.app.get('io');
   // Resolve customer's customerId for notification room
@@ -2395,12 +2604,15 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   }
 
   // Notify admin room
+  const manualRefundDue = !walletRefundIssued && order.paymentStatus === 'paid' && refundAmount > 0;
   await notify(cancelIo, {
     type: 'order_cancelled',
-    title: 'Order Cancelled',
-    body: `Order ${order.orderNumber} has been cancelled. Reason: ${reason || 'not specified'}.`,
+    title: manualRefundDue ? '⚠️ Order Cancelled — Refund Due' : 'Order Cancelled',
+    body: manualRefundDue
+      ? `Order ${order.orderNumber} was cancelled after payment. ₦${refundAmount.toLocaleString()} paid by ${order.payment?.method || 'unknown'} must be refunded manually. Reason: ${reason || 'not specified'}.`
+      : `Order ${order.orderNumber} has been cancelled. Reason: ${reason || 'not specified'}.`,
     room: 'admin',
-    metadata: { orderId: order._id, orderNumber: order.orderNumber, reason },
+    metadata: { orderId: order._id, orderNumber: order.orderNumber, reason, refundDue: manualRefundDue ? refundAmount : 0 },
   });
 
   // Notify customer
@@ -2420,13 +2632,47 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Order cancelled successfully',
-    data: { order, walletRefundIssued, refundAmount: walletRefundIssued ? refundAmount : 0 },
+    data: {
+      order,
+      walletRefundIssued,
+      refundAmount: walletRefundIssued ? refundAmount : 0,
+      pointsReturned,
+      manualRefundDue: manualRefundDue ? refundAmount : 0,
+    },
   });
 });
 
-// @desc    Add order item
+// ─── Order line items ────────────────────────────────────────────────────────
+// These two used to read and write a standalone `OrderItem` collection that
+// nothing else in the system ever read. Line items actually live in the embedded
+// `order.items` array, so an "added" item never appeared on the order, never
+// reached a receipt and never changed the total — while the route carried no
+// authorize() at all. Both now operate on the real array, reprice from the DB
+// the same way createOrder does, and recalculate the order total.
+//
+// Helper: rebuild pricing from the order's current items, preserving every
+// server-derived component already settled on this order.
+async function recalculateOrderTotal(order) {
+  const previousTotal = order.total || 0;
+  const pricing = calculateOrderPricing(
+    order.items,
+    order.pricing?.pickupFee   || 0,
+    order.pricing?.deliveryFee || 0,
+    order.pricing?.discount    || 0,
+    // Service-level surcharge is a percentage of the item subtotal, so it has to
+    // move with the items rather than be carried over as a frozen figure.
+    Math.round((order.items.reduce((a, i) => a + (i.unitPrice || 0) * (i.quantity || 1), 0))
+      * (order.serviceLevelPercentage || 0) / 100 * 100) / 100,
+    order.pricing?.addOnsFee || 0
+  );
+  order.pricing = pricing;
+  order.total   = pricing.total;
+  return { previousTotal, newTotal: pricing.total };
+}
+
+// @desc    Add an item to an order
 // @route   POST /api/v1/orders/:id/items
-// @access  Private
+// @access  Private (Staff/Admin/Manager)
 exports.addOrderItem = asyncHandler(async (req, res, next) => {
   const order = await Order.findById(req.params.id);
 
@@ -2434,34 +2680,82 @@ exports.addOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
-  if (req.user.role === 'customer' && order.customer.toString() !== req.user.id) {
-    return next(new AppError('Not authorized', 403));
+  // Editing an order's contents is a counter action, matching PUT /orders/:id
+  if (req.user.role === 'customer') {
+    return next(new AppError('Not authorized to edit order items', 403));
   }
 
-  const { serviceCategoryId, quantity, unitPrice, careType, serviceLevel } = req.body;
+  if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
+    return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
+  }
 
-  const subtotal = quantity * unitPrice;
+  const { itemType, categoryId, serviceType, serviceName, description, condition, careType } = req.body;
+  const quantity = parseInt(req.body.quantity, 10);
 
-  const orderItem = await OrderItem.create({
-    orderId: order._id,
-    serviceCategoryId,
+  if (!Number.isFinite(quantity) || quantity < 1) {
+    return next(new AppError('Quantity must be a whole number of at least 1', 400, ERROR_CODES.VALIDATION_ERROR));
+  }
+
+  // Price from the DB — never from the request body
+  let unitPrice = 0;
+  let categoryName;
+  if (categoryId) {
+    const category = await ServiceCategory.findById(categoryId).select('basePrice name').lean();
+    if (!category) {
+      return next(new AppError('Service category not found', 404));
+    }
+    categoryName = category.name;
+    unitPrice = Math.round(category.basePrice * (CARE_TYPE_MULTIPLIERS[serviceType] ?? 1));
+  } else if (req.user.role !== 'customer' && req.body.unitPrice !== undefined) {
+    // Counter-entered item with no catalogue category — staff set the price,
+    // clamped so it can never be negative.
+    const manual = Number(req.body.unitPrice);
+    unitPrice = Number.isFinite(manual) && manual > 0 ? Math.round(manual) : 0;
+  }
+
+  order.items.push({
+    itemType: itemType || categoryName || 'Item',
+    serviceType,
+    serviceName,
     quantity,
     unitPrice,
-    subtotal,
+    total: unitPrice * quantity,
     careType,
-    serviceLevel,
+    categoryId,
+    categoryName,
+    description,
+    condition,
   });
+
+  const { previousTotal, newTotal } = await recalculateOrderTotal(order);
+  order.lastUpdatedById = req.user.id;
+  await order.save();
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_ITEM_ADDED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    before: { total: previousTotal },
+    after: { total: newTotal },
+    metadata: { orderNumber: order.orderNumber, itemType: itemType || categoryName, quantity, unitPrice },
+  });
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order:updated', { orderId: order._id, total: order.total });
+  }
 
   res.status(201).json({
     success: true,
     message: 'Order item added successfully',
-    data: { orderItem },
+    data: { order },
   });
 });
 
-// @desc    Remove order item
+// @desc    Remove an item from an order
 // @route   DELETE /api/v1/orders/:id/items/:itemId
-// @access  Private
+// @access  Private (Staff/Admin/Manager)
 exports.removeOrderItem = asyncHandler(async (req, res, next) => {
   const order = await Order.findById(req.params.id);
 
@@ -2469,25 +2763,48 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
-  if (req.user.role === 'customer' && order.customer.toString() !== req.user.id) {
-    return next(new AppError('Not authorized', 403));
+  if (req.user.role === 'customer') {
+    return next(new AppError('Not authorized to edit order items', 403));
   }
 
-  const orderItem = await OrderItem.findOneAndDelete({
-    _id: req.params.itemId,
-    orderId: order._id,
+  if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
+    return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
+  }
+
+  const item = order.items.id(req.params.itemId);
+  if (!item) {
+    return next(new AppError('Order item not found', 404));
+  }
+
+  const removed = { itemType: item.itemType, quantity: item.quantity, unitPrice: item.unitPrice };
+  item.deleteOne();
+
+  const { previousTotal, newTotal } = await recalculateOrderTotal(order);
+  order.lastUpdatedById = req.user.id;
+  await order.save();
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_ITEM_REMOVED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    before: { total: previousTotal, ...removed },
+    after: { total: newTotal },
+    metadata: { orderNumber: order.orderNumber },
   });
 
-  if (!orderItem) {
-    return next(new AppError('Order item not found', 404));
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`order-${order._id}`).emit('order:updated', { orderId: order._id, total: order.total });
   }
 
   res.status(200).json({
     success: true,
     message: 'Order item removed successfully',
-    data: {},
+    data: { order },
   });
 });
+
 
 // @desc    Add order media
 // @route   POST /api/v1/orders/:id/media
@@ -2497,6 +2814,13 @@ exports.addOrderMedia = asyncHandler(async (req, res, next) => {
 
   if (!order) {
     return next(new AppError('Order not found', 404));
+  }
+
+  // Ownership guard — every sibling handler (getOrderMedia, addOrderItem,
+  // removeOrderItem) has this; only this one was missing it, which let any
+  // signed-in customer attach media and notes to anyone else's order.
+  if (req.user.role === 'customer' && order.customer?.toString() !== req.user.id) {
+    return next(new AppError('Not authorized', 403));
   }
 
   const { mediaUrl, note } = req.body;
@@ -2526,7 +2850,7 @@ exports.getOrderMedia = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order not found', 404));
   }
 
-  if (req.user.role === 'customer' && order.customer.toString() !== req.user.id) {
+  if (req.user.role === 'customer' && order.customer?.toString() !== req.user.id) {
     return next(new AppError('Not authorized', 403));
   }
 

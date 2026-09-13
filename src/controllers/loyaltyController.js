@@ -8,6 +8,13 @@ const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const { logAudit } = require('../utils/auditLogger.js');
 const notify = require('../utils/notify.js');
+const logger = require('../utils/logger.js');
+const {
+  loadLoyaltySettings,
+  walletCreditForPoints,
+  conversionAvailable,
+  publicLoyaltyTerms,
+} = require('../utils/loyaltyRates.js');
 
 // @desc    Get all loyalty tiers
 // @route   GET /api/v1/loyalty/tiers
@@ -152,6 +159,14 @@ exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
     return next(new AppError('Customer not found', 404));
   }
 
+  // Lifetime converted total, summed in the database. The Points page used to
+  // derive this from the ledger rows it happened to have fetched — page one,
+  // twenty rows — so it under-reported as soon as a customer had any history.
+  const [convertedAgg] = await LoyaltyLedger.aggregate([
+    { $match: { customerId: customer._id, type: 'convert' } },
+    { $group: { _id: null, points: { $sum: '$points' } } },
+  ]);
+
   res.status(200).json({
     success: true,
     message: 'Loyalty info fetched successfully',
@@ -159,17 +174,10 @@ exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
       pointsBalance: customer.loyaltyPointsBalance,
       lifetimePoints: customer.loyaltyLifetimePoints,
       tier: customer.loyaltyTierId,
-      conversionEnabled: settings?.walletConversionEnabled !== false,
-      walletConversionRate: settings?.walletConversionRate || 100,
-      minConvertPoints: settings?.minConvertPoints || 100,
-      pointsPerCurrency: settings?.pointsPerCurrency || 1,
-      // Redemption terms — the client renders these instead of hardcoding a rate,
-      // so the slider can never offer a discount the server will not honour.
-      redemptionEnabled:     settings?.redemptionEnabled !== false,
-      pointsRedemptionValue: settings?.pointsRedemptionValue > 0 ? settings.pointsRedemptionValue : 5,
-      minRedeemPoints:       settings?.minRedeemPoints || 0,
-      maxRedeemPercent:      settings?.maxRedeemPercent > 0 ? settings.maxRedeemPercent : 100,
-      maxRedeemPointsPerOrder: settings?.maxRedeemPointsPerOrder || 0,
+      totalConverted: Math.abs(convertedAgg?.points || 0),
+      // Every rate and switch the customer app renders comes from here, in one
+      // unit (points per ₦1). No screen derives a rate of its own.
+      ...publicLoyaltyTerms(settings),
     },
   });
 });
@@ -302,44 +310,77 @@ exports.adjustPoints = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/loyalty/redeem
 // @access  Private
 exports.redeemPoints = asyncHandler(async (req, res, next) => {
-  const { customerId, points, orderId } = req.body;
+  const { points, orderId } = req.body;
 
-  // Validate required fields
-  if (!customerId || !points || !orderId) {
-    return next(new AppError('Please provide customerId, points, and orderId', 400));
+  // ── Whose points are being spent ──────────────────────────────────────────
+  // customerId used to be taken from the request body with no ownership check
+  // at all, on a route guarded only by `protect`. Any signed-in customer could
+  // spend — and so destroy — any other customer's points, which are convertible
+  // to wallet money. A customer may now only ever redeem their own; staff keep
+  // the ability to redeem on a customer's behalf at the counter.
+  const isStaffRole = ['staff', 'admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
+  const customerId = isStaffRole && req.body.customerId ? req.body.customerId : req.user.customerId;
+
+  if (!customerId) {
+    return next(new AppError('No customer profile linked to this account', 400));
+  }
+  if (!isStaffRole && req.body.customerId && String(req.body.customerId) !== String(req.user.customerId)) {
+    return next(new AppError('Not authorized to redeem another customer\'s points', 403));
   }
 
-  // Validate points is a positive number
-  if (points <= 0) {
+  const requestedPoints = parseInt(points, 10);
+  if (!orderId) {
+    return next(new AppError('Please provide an orderId', 400));
+  }
+  if (!Number.isFinite(requestedPoints) || requestedPoints <= 0) {
     return next(new AppError('Points must be greater than 0', 400));
   }
 
-  // Get customer
-  const customer = await Customer.findById(customerId);
-  if (!customer) {
-    return next(new AppError('Customer not found', 404));
+  // Honour the same switches every other redemption path honours.
+  const settings = await loadLoyaltySettings();
+  if (!require('../utils/loyaltyRates.js').redemptionAvailable(settings)) {
+    return next(new AppError('Points redemption is currently unavailable.', 403, 'LOYALTY_REDEMPTION_DISABLED'));
   }
 
-  // Check if customer has enough points
-  if (customer.loyaltyPointsBalance < points) {
+  // Atomic check-and-deduct. This was a read, a compare and a save — three
+  // steps, so two concurrent calls both passed the balance check and the
+  // customer kept points they had already spent.
+  const customer = await Customer.findOneAndUpdate(
+    { _id: customerId, loyaltyPointsBalance: { $gte: requestedPoints } },
+    { $inc: { loyaltyPointsBalance: -requestedPoints } },
+    { new: true }
+  );
+  if (!customer) {
     return next(new AppError('Insufficient loyalty points', 400));
   }
 
-  // Calculate discount (1 point = ₦1)
-  const discountAmount = points;
+  // Discount comes from the configured redemption rate. This was
+  // `const discountAmount = points` — a third hardcoded rate (1 point = ₦1),
+  // different again from both the wallet page and checkout.
+  const discountAmount = require('../utils/loyaltyRates.js').discountForPoints(requestedPoints, settings);
 
-  // Deduct points
-  customer.loyaltyPointsBalance -= points;
-  await customer.save();
+  let transaction;
+  try {
+    transaction = await LoyaltyLedger.create({
+      customerId,
+      points: -requestedPoints,
+      type: 'redeem',
+      reason: `Redeemed for order ${orderId}`,
+      orderId,
+      balanceAfter: customer.loyaltyPointsBalance,
+    });
+  } catch (ledgerErr) {
+    // Points are already deducted — hand them back rather than lose them.
+    await Customer.findByIdAndUpdate(customerId, {
+      $inc: { loyaltyPointsBalance: requestedPoints },
+    }).catch((e) => logger.error(`[redeemPoints] CRITICAL point rollback failed: ${e.message}`));
 
-  // Create ledger transaction
-  const transaction = await LoyaltyLedger.create({
-    customerId,
-    points: -points,
-    type: 'redeem',
-    reason: `Redeemed for order ${orderId}`,
-    orderId,
-  });
+    if (ledgerErr.code === 11000) {
+      return next(new AppError('Points have already been redeemed for this order', 409));
+    }
+    logger.error(`[redeemPoints] Ledger write failed: ${ledgerErr.message}`);
+    return next(new AppError('Redemption could not be completed. Your points have not been deducted.', 500));
+  }
 
   // Emit Socket.io event for realtime update (if Socket.io is available)
   const io = req.app.get('io');
@@ -397,15 +438,96 @@ exports.getSettings = asyncHandler(async (req, res, next) => {
 // @desc    Update loyalty settings
 // @route   PATCH /api/v1/loyalty/settings
 // @access  Private (Admin)
+// Fields an admin may actually set. Object.assign(settings, req.body) copied
+// anything the request contained, including _id and fields that are not settings
+// at all, and applied no validation — a rate of 0 or a negative rate would have
+// been accepted and then divided by.
+const SETTING_BOOLEANS = [
+  'enabled', 'redemptionEnabled', 'walletConversionEnabled',
+  'redeemIncludesDelivery', 'redeemIncludesAddons',
+  'allowWithSubscription', 'weekendMultiplierEnabled',
+];
+// Rates: must be greater than zero, because every one of them is a divisor or a
+// multiplier on money.
+const SETTING_POSITIVE_NUMBERS = [
+  'pointsPerCurrency', 'redemptionPointsPerCurrency', 'walletConversionRate',
+];
+// Thresholds and bonuses: zero is a legitimate value ("no minimum", "no bonus").
+const SETTING_NON_NEGATIVE_NUMBERS = [
+  'minOrderAmount', 'maxPointsPerOrder', 'maxPointsPerDay',
+  'minRedeemPoints', 'minConvertPoints', 'maxRedeemPercent', 'maxRedeemPointsPerOrder',
+  'bonusStandardPercent', 'bonusExpressPercent', 'bonusPremiumPercent',
+  'bonusFirstOrderPoints', 'bonusSecondOrderPoints', 'weekendMultiplierPercent',
+  'bonusStainRemoval', 'bonusRush', 'bonusPickupDelivery',
+];
+
 exports.updateSettings = asyncHandler(async (req, res, next) => {
+  const update = {};
+
+  for (const key of SETTING_BOOLEANS) {
+    if (req.body[key] !== undefined) update[key] = Boolean(req.body[key]);
+  }
+
+  for (const key of SETTING_POSITIVE_NUMBERS) {
+    if (req.body[key] === undefined) continue;
+    const n = Number(req.body[key]);
+    if (!Number.isFinite(n) || n <= 0) {
+      return next(new AppError(`'${key}' must be a number greater than 0`, 400, 'VALIDATION_ERROR'));
+    }
+    update[key] = n;
+  }
+
+  for (const key of SETTING_NON_NEGATIVE_NUMBERS) {
+    if (req.body[key] === undefined) continue;
+    const n = Number(req.body[key]);
+    if (!Number.isFinite(n) || n < 0) {
+      return next(new AppError(`'${key}' must be a number of 0 or more`, 400, 'VALIDATION_ERROR'));
+    }
+    update[key] = n;
+  }
+
+  if (req.body.qualifyOnStatus !== undefined) {
+    if (!['paid', 'completed'].includes(req.body.qualifyOnStatus)) {
+      return next(new AppError("'qualifyOnStatus' must be 'paid' or 'completed'", 400, 'VALIDATION_ERROR'));
+    }
+    update.qualifyOnStatus = req.body.qualifyOnStatus;
+  }
+
+  if (update.maxRedeemPercent !== undefined && update.maxRedeemPercent > 100) {
+    return next(new AppError("'maxRedeemPercent' cannot exceed 100", 400, 'VALIDATION_ERROR'));
+  }
+
   let settings = await LoyaltySetting.findOne();
+  const before = settings ? settings.toObject() : null;
 
   if (!settings) {
-    settings = await LoyaltySetting.create(req.body);
+    settings = await LoyaltySetting.create(update);
   } else {
-    Object.assign(settings, req.body);
+    Object.assign(settings, update);
     await settings.save();
   }
+
+  // Rates are money. Record who changed them and what they were.
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'LOYALTY_SETTINGS_UPDATED',
+    targetType: 'LoyaltySetting',
+    targetId: settings._id.toString(),
+    before: before && {
+      walletConversionRate: before.walletConversionRate,
+      redemptionPointsPerCurrency: before.redemptionPointsPerCurrency,
+      enabled: before.enabled,
+      walletConversionEnabled: before.walletConversionEnabled,
+      redemptionEnabled: before.redemptionEnabled,
+    },
+    after: {
+      walletConversionRate: settings.walletConversionRate,
+      redemptionPointsPerCurrency: settings.redemptionPointsPerCurrency,
+      enabled: settings.enabled,
+      walletConversionEnabled: settings.walletConversionEnabled,
+      redemptionEnabled: settings.redemptionEnabled,
+    },
+  });
 
   res.status(200).json({
     success: true,
@@ -469,25 +591,34 @@ exports.convertPointsToWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Points must be a positive number', 400));
   }
 
-  // Load loyalty settings
-  const settings = await LoyaltySetting.findOne().lean();
-  if (!settings || !settings.enabled) {
-    return next(new AppError('Loyalty program is currently disabled', 400));
-  }
-  if (settings.walletConversionEnabled === false) {
-    return next(new AppError('Points-to-wallet conversion is currently disabled', 400));
+  // Settings are re-read from the database on every conversion, so a rate the
+  // customer's page loaded minutes ago can never be the one that is honoured.
+  const settings = await loadLoyaltySettings();
+
+  // conversionAvailable() covers the master programme switch as well as the
+  // channel switch — hiding a button is not enforcement, this is.
+  if (!conversionAvailable(settings)) {
+    return next(new AppError(
+      settings?.enabled === false
+        ? 'The loyalty programme is currently unavailable.'
+        : 'Points conversion is currently unavailable.',
+      403,
+      'LOYALTY_CONVERSION_DISABLED'
+    ));
   }
 
-  const conversionRate = settings.walletConversionRate || 100; // X points = ₦1
-  const minConvert     = settings.minConvertPoints     || 100;
+  const conversionRate = require('../utils/loyaltyRates.js').walletPointsPerNaira(settings);
+  const minConvert     = settings.minConvertPoints || 0;
 
-  if (points < minConvert) {
-    return next(new AppError(`Minimum ${minConvert} points required to convert`, 400));
+  if (minConvert > 0 && points < minConvert) {
+    return next(new AppError(`Minimum ${minConvert.toLocaleString()} points required to convert`, 400));
   }
 
-  const walletAmount = Math.floor(points / conversionRate);
+  // The wallet credit is computed here, from the current stored rate. The client
+  // sends a number of points and nothing else.
+  const walletAmount = walletCreditForPoints(points, settings);
   if (walletAmount <= 0) {
-    return next(new AppError(`Not enough points. ${conversionRate} points = ₦1`, 400));
+    return next(new AppError(`Not enough points. ${conversionRate.toLocaleString()} points = ₦1`, 400));
   }
 
   // Atomic deduction — prevents race condition double-spend
@@ -500,32 +631,59 @@ exports.convertPointsToWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('Insufficient points balance', 400));
   }
 
-  // Credit wallet — atomic upsert-and-credit
-  const wallet = await Wallet.findOneAndUpdate(
-    { customerId: req.user.customerId },
-    { $inc: { balance: walletAmount } },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
-  );
+  // ── Credit the wallet, or give the points back ────────────────────────────
+  // The points are already gone at this point. Everything from here is wrapped
+  // so that a failure returns them: previously a wallet write that threw left
+  // the customer with neither their points nor the credit, and nothing to
+  // reconcile from. There is no replica set guaranteed on this deployment, so
+  // this is a compensating rollback rather than a driver transaction.
+  let wallet;
+  try {
+    wallet = await Wallet.findOneAndUpdate(
+      { customerId: req.user.customerId },
+      { $inc: { balance: walletAmount } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
 
-  await WalletTransaction.create({
-    walletId: wallet._id,
-    customerId: req.user.customerId,
-    type: 'credit',
-    amount: walletAmount,
-    reason: `Points Conversion (${points.toLocaleString()} pts)`,
-    balanceAfter: wallet.balance,
-    source: 'loyalty',
-  });
+    await WalletTransaction.create({
+      walletId: wallet._id,
+      customerId: req.user.customerId,
+      type: 'credit',
+      amount: walletAmount,
+      reason: `Points Conversion (${points.toLocaleString()} pts)`,
+      balanceAfter: wallet.balance,
+      source: 'loyalty',
+    });
 
-  // Record in loyalty ledger
-  await LoyaltyLedger.create({
-    customerId: req.user.customerId,
-    points: -points,
-    type: 'convert',
-    source: 'conversion',
-    reason: `Converted ${points.toLocaleString()} pts → ₦${walletAmount.toLocaleString()} wallet credit`,
-    balanceAfter: updatedCustomer.loyaltyPointsBalance,
-  });
+    // Record in loyalty ledger
+    await LoyaltyLedger.create({
+      customerId: req.user.customerId,
+      points: -points,
+      type: 'convert',
+      source: 'conversion',
+      reason: `Converted ${points.toLocaleString()} pts → ₦${walletAmount.toLocaleString()} wallet credit`,
+      balanceAfter: updatedCustomer.loyaltyPointsBalance,
+      nairaAmount: walletAmount,
+    });
+  } catch (creditErr) {
+    logger.error(
+      `[convertPoints] Credit failed after deducting ${points} pts from customer ` +
+      `${req.user.customerId} — rolling back: ${creditErr.message}`
+    );
+
+    // Undo the wallet credit first if it landed, then return the points.
+    if (wallet) {
+      await Wallet.findOneAndUpdate(
+        { customerId: req.user.customerId },
+        { $inc: { balance: -walletAmount } }
+      ).catch((e) => logger.error(`[convertPoints] Wallet rollback failed: ${e.message}`));
+    }
+    await Customer.findByIdAndUpdate(req.user.customerId, {
+      $inc: { loyaltyPointsBalance: points },
+    }).catch((e) => logger.error(`[convertPoints] CRITICAL point rollback failed: ${e.message}`));
+
+    return next(new AppError('Conversion could not be completed. Your points have not been deducted.', 500));
+  }
 
   // Real-time updates
   const io = req.app.get('io');

@@ -368,5 +368,16 @@ OrderSchema.pre('validate', async function (next) {
 OrderSchema.index({ customer: 1, createdAt: -1 });
 OrderSchema.index({ status: 1 });
 OrderSchema.index({ 'payment.status': 1 });
+// Every dashboard and report aggregate matches on the top-level paymentStatus
+// (see paidOrderMatch()), not on payment.status — that one was the only indexed
+// of the pair, so revenue queries were collection scans.
+OrderSchema.index({ paymentStatus: 1, status: 1 });
+// Reporting and export windows are all createdAt ranges, usually narrowed by status.
+OrderSchema.index({ createdAt: -1 });
+// Staff dashboard tabs: assigned/unassigned pools and the walk-in list.
+OrderSchema.index({ assignedStaff: 1, status: 1 });
+OrderSchema.index({ orderSource: 1, status: 1 });
+// Walk-in orders are surfaced to a matching customer account by phone.
+OrderSchema.index({ 'walkInCustomer.phone': 1 });
 
 module.exports = mongoose.model('Order', OrderSchema);
