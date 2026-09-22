@@ -97,12 +97,20 @@ app.set('trust proxy', 1);
 app.use('/api', apiLimiter);
 
 // Health check
+// Identifies which build of the API is actually serving. Bump the revision when
+// a frontend starts depending on new API behaviour, so a stale deployment can
+// be told apart from a current one without server access.
+const API_REVISION = '2026-09-22.customer-portal-status';
+const STARTED_AT = new Date().toISOString();
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     success: true,
     message: 'Relux Laundry API is running.....',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    revision: API_REVISION,
+    startedAt: STARTED_AT,
   });
 });
 
