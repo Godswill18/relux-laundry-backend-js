@@ -115,6 +115,7 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
         unregistered: customerStats.unregistered,
         pendingVerification: customerStats.pendingVerification,
         deactivated: customerStats.deactivated,
+        notEligible: customerStats.notEligible,
         activationRate: customerStats.activationRate,
       },
       activeStaff,

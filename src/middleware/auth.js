@@ -43,6 +43,18 @@ exports.protect = asyncHandler(async (req, res, next) => {
       ));
     }
 
+    // Unverified customer signups have no session. Blocks tokens obtained
+    // before login enforced verification, on the next request. 401 so the
+    // customer app signs out; the code lets it say why. Customers only, and
+    // === false only — see authController.login.
+    if (req.user.role === 'customer' && req.user.emailVerified === false) {
+      return next(new AppError(
+        'Please verify your email address to continue.',
+        401,
+        'EMAIL_NOT_VERIFIED'
+      ));
+    }
+
     // Backfill customerId for users created before ensureCustomer was added.
     // Exits immediately if already set — no extra DB work for normal requests.
     if (!req.user.customerId) {

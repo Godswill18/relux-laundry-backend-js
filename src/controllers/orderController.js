@@ -26,7 +26,7 @@ const {
   normalizeEmail,
   resolveWalkInCustomer,
   portalUserFor,
-  portalStatusOf,
+  resolvePortalStatus,
   customerCanAccessOrder,
   customerOrderFilter,
   maskEmail,
@@ -558,7 +558,8 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     const portalUser = await portalUserFor(customerRecord._id);
     if (portalUser) orderCustomerId = portalUser._id;
     customerRecordInfo.customerRecordId = customerRecord._id;
-    customerRecordInfo.portalStatus = portalStatusOf(portalUser);
+    // This order is itself a walk-in, so the record has walk-in history.
+    customerRecordInfo.portalStatus = resolvePortalStatus({ user: portalUser, customer: customerRecord, hasWalkInHistory: true });
   } else {
     // Online order
     orderCustomerId = req.user.id;

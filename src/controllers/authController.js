@@ -9,6 +9,7 @@ const { generateOTP, splitName, sendTokenResponse, getTodayWAT } = require('../u
 const sendEmail = require('../utils/sendEmail.js');
 const ensureCustomer = require('../utils/ensureCustomer.js');
 const normalizePhone = require('../utils/normalizePhone.js');
+const { verifyEmailLink } = require('../utils/customerAppUrl.js');
 
 // @desc    Register user
 // @route   POST /api/v1/auth/register
@@ -112,6 +113,10 @@ exports.register = asyncHandler(async (req, res, next) => {
       <div style="text-align:center;margin:32px 0;">
         <span style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#1d4ed8;">${otp}</span>
       </div>
+      <div style="text-align:center;margin:8px 0 24px;">
+        <a href="${verifyEmailLink(user.email)}" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:bold;padding:12px 24px;border-radius:6px;">Verify my email</a>
+        <p style="font-size:12px;color:#6b7280;margin-top:8px;">Opens the verification page — enter the code above.</p>
+      </div>
       <p>If you did not create this account, you can safely ignore this email.</p>
       <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
       <p style="font-size:12px;color:#6b7280;">Relux Laundry &mdash; Your Trusted Laundry Partner</p>
@@ -166,6 +171,10 @@ exports.resendEmailVerification = asyncHandler(async (req, res, next) => {
       <p>Here is your new email verification code. It expires in <strong>10 minutes</strong>.</p>
       <div style="text-align:center;margin:32px 0;">
         <span style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#1d4ed8;">${otp}</span>
+      </div>
+      <div style="text-align:center;margin:8px 0 24px;">
+        <a href="${verifyEmailLink(user.email)}" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:bold;padding:12px 24px;border-radius:6px;">Verify my email</a>
+        <p style="font-size:12px;color:#6b7280;margin-top:8px;">Opens the verification page — enter the code above.</p>
       </div>
       <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
       <p style="font-size:12px;color:#6b7280;">Relux Laundry</p>
@@ -328,6 +337,29 @@ exports.login = asyncHandler(async (req, res, next) => {
     // Only reached after the password matched, so this never confirms an
     // account's existence to someone who does not already hold its credentials.
     return next(new AppError('Your account has been deactivated. Please contact support for assistance.', 403, ERROR_CODES.ACCOUNT_DEACTIVATED));
+  }
+
+  // Customers must finish signup (verify their email) before signing in.
+  // Registration sets the password BEFORE the code is verified, and login used
+  // to check only the password — so an unverified signup could sign straight
+  // in. Checked only after the password matched, so it reveals nothing to
+  // someone without the password.
+  //
+  //   • Customers only. Staff accounts get the schema default
+  //     emailVerified:false and never go through email verification.
+  //   • === false only. Accounts created before email verification existed have
+  //     no such field and must keep working.
+  if (user.role === 'customer' && user.emailVerified === false) {
+    // Same shape as errorHandler's responses, plus the address to verify. The
+    // caller proved the password, so it is safe to tell them which address
+    // (they may have signed in with their phone number).
+    const message = 'Please verify your email address before signing in. We can send you a new code.';
+    return res.status(403).json({
+      success: false,
+      data: { email: user.email },
+      message,
+      error: { code: ERROR_CODES.EMAIL_NOT_VERIFIED, message },
+    });
   }
 
 // Shift-based login restriction for staff role only

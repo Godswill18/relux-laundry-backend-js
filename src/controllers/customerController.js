@@ -116,6 +116,10 @@ exports.lookupCustomers = asyncHandler(async (req, res, next) => {
         customerStatus: c.customerStatus,
         orderCount: c.orderCount,
         needsReview: !!c.needsReview,
+        // Identifiers on the customer RECORD (safe to auto-match on) versus
+        // those only on the portal account (unverified — staff must confirm).
+        recordPhone: c.phone || null,
+        recordEmail: c.email || null,
       })),
     },
   });

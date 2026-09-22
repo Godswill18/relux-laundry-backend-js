@@ -46,6 +46,13 @@ const socketAuth = async (socket, next) => {
       return next(new Error('Authentication error: User account is deactivated'));
     }
 
+    // Same rule as login and protect(): unverified customer signups get no
+    // realtime access either.
+    if (user.role === 'customer' && user.emailVerified === false) {
+      logger.warn(`Socket connection rejected: email not verified (${socket.id}, userId: ${user._id})`);
+      return next(new Error('Authentication error: Please verify your email address'));
+    }
+
     const tokenVersion = decoded.jwtVersion ?? 0;
     if (tokenVersion !== user.jwtVersion) {
       logger.warn(`Socket connection rejected: stale token (${socket.id}, userId: ${user._id})`);

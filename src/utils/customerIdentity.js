@@ -71,13 +71,21 @@ async function portalUserFor(customerId) {
     .lean();
 }
 
-// UNREGISTERED | PENDING_VERIFICATION | ACTIVE | DEACTIVATED
-// Derived, never stored, so it cannot drift from the fields that enforce it.
-function portalStatusOf(user) {
-  if (!user) return 'UNREGISTERED';
-  if (user.isActive === false) return 'DEACTIVATED';
-  if (user.emailVerified === false) return 'PENDING_VERIFICATION';
-  return 'ACTIVE';
+// Portal status for a single customer — the JavaScript twin of the rule in
+// utils/customerQueries.customerBasePipeline (keep the two identical):
+//   DEACTIVATED → ACTIVE / PENDING_VERIFICATION (has an account)
+//   → UNREGISTERED ("Not Activated": walk-in history + phone/email, no account)
+//   → NOT_ELIGIBLE (no account, nothing to claim one with)
+// A missing value never means "not activated": emailVerified absent (accounts
+// that predate email verification) is ACTIVE.
+function resolvePortalStatus({ user, customer, hasWalkInHistory }) {
+  if (user && user.isActive === false) return 'DEACTIVATED';
+  if (customer?.status === 'suspended') return 'DEACTIVATED';
+  if (user && user.emailVerified === false) return 'PENDING_VERIFICATION';
+  if (user) return 'ACTIVE';
+  const walkIn = !!hasWalkInHistory || customer?.source === 'walk_in';
+  const contact = !!(String(customer?.phone || '').trim() || String(customer?.email || '').trim());
+  return walkIn && contact ? 'UNREGISTERED' : 'NOT_ELIGIBLE';
 }
 
 // ACTIVE | DEACTIVATED — the business's standing with the customer.
@@ -133,6 +141,44 @@ async function resolveWalkInCustomer({ name, phone, email, actor }) {
     return { customer: c, created: false };
   }
 
+  // ── No customer record matched — check registered ACCOUNTS ───────────────
+  // A registered customer's record can lack the phone they give at the counter
+  // (older accounts, or a phone contested at signup). Creating a new record
+  // then splits one person into "Activated" + "Not Activated".
+  //   • Verified match (verified email, or a phone the account actually
+  //     verified) → it is them: use their record and fill in the identifier.
+  //   • Unverified phone only → not proof. A portal phone is never verified,
+  //     and linking on it is how someone who registered with another person's
+  //     number received their orders. Create the walk-in record, flag both for
+  //     review; staff can pick the account explicitly after checking in person.
+  const variants = normPhone ? phoneVariants(normPhone) : [];
+  const accountOr = [];
+  if (normEmail) accountOr.push({ email: normEmail });
+  if (variants.length) accountOr.push({ phone: { $in: variants } });
+  const account = accountOr.length
+    ? await User.findOne({ role: 'customer', customerId: { $ne: null }, $or: accountOr })
+      .select('customerId email phone emailVerified isPhoneVerified').lean()
+    : null;
+
+  let reviewWith = null;
+  if (account?.customerId) {
+    const verifiedEmail = !!normEmail && account.email === normEmail && account.emailVerified !== false;
+    const verifiedPhone = account.isPhoneVerified === true && variants.includes(account.phone);
+    const record = await Customer.findById(account.customerId);
+    if (record && (verifiedEmail || verifiedPhone)) {
+      const fill = {};
+      if (!record.phone && normPhone) fill.phone = normPhone;
+      if (!record.email && normEmail) fill.email = normEmail;
+      if (Object.keys(fill).length) {
+        await Customer.updateOne({ _id: record._id }, { $set: fill }).catch((err) => {
+          if (err.code !== 11000) throw err;
+        });
+      }
+      return { customer: record, created: false };
+    }
+    if (record) reviewWith = record._id;
+  }
+
   // No match: create. The unique indexes on phone/email make a concurrent
   // double-create impossible — the loser re-reads the winner's record.
   try {
@@ -142,7 +188,19 @@ async function resolveWalkInCustomer({ name, phone, email, actor }) {
       email: normEmail || undefined,
       status: 'guest',
       source: 'walk_in',
+      ...(reviewWith ? {
+        needsReview: true,
+        reviewReason: 'walk-in phone matches a registered account whose phone is not verified — confirm and link',
+        reviewRelatedCustomerIds: [reviewWith],
+      } : {}),
     });
+    if (reviewWith) {
+      await Customer.updateOne(
+        { _id: reviewWith },
+        { $set: { needsReview: true, reviewReason: 'a walk-in record with this account\'s phone was created separately' },
+          $addToSet: { reviewRelatedCustomerIds: customer._id } }
+      ).catch((e) => logger.error(`[identity] review flag failed: ${e.message}`));
+    }
     await logAudit({
       actorUserId: actor?.id,
       action: 'CUSTOMER_CREATED_FROM_WALK_IN',
@@ -198,7 +256,7 @@ module.exports = {
   phoneVariants,
   findCustomersByIdentifiers,
   portalUserFor,
-  portalStatusOf,
+  resolvePortalStatus,
   customerStatusOf,
   resolveWalkInCustomer,
   IdentityConflictError,
