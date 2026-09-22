@@ -15,7 +15,7 @@ const PaystackTransaction = require('./models/PaystackTransaction.js');
 // same data the REST endpoints guard, so it has to check the same things.
 const Order = require('./models/Order.js');
 const ChatThread = require('./models/ChatThread.js');
-const normalizePhone = require('./utils/normalizePhone.js');
+const { customerCanAccessOrder } = require('./utils/customerIdentity.js');
 const {
   backgroundVerifyAndCredit,
   paystackRequest,
@@ -91,8 +91,8 @@ io.on('connection', (socket) => {
   // payment event in the business, or join-order / join-chat with any id and
   // watch another customer's order or read their support conversation. The
   // rules below mirror the REST equivalents exactly: getPayments is
-  // admin/manager, getOrder allows the linked customer or a phone-matched
-  // walk-in, and getChatThread compares customerId.
+  // admin/manager, getOrder allows the customer's account or linked customer
+  // record, and getChatThread compares customerId.
   const STAFF_ROLES = ['staff', 'admin', 'manager', 'receptionist', 'developer'];
   const isStaff = STAFF_ROLES.includes(socket.user.role);
 
@@ -117,25 +117,18 @@ io.on('connection', (socket) => {
     logger.info(`${userName} left payments room`);
   });
 
-  // Join order room — staff see any order; a customer only their own, including
-  // a walk-in matched on phone (which getOrders/getOrder also surface to them).
+  // Join order room — staff see any order; a customer only their own, through
+  // their account or linked customer record (never an unverified phone).
   socket.on('join-order', async (orderId) => {
     if (!orderId || !mongoose.isValidObjectId(orderId)) return;
 
     if (!isStaff) {
       try {
-        const order = await Order.findById(orderId)
-          .select('customer orderSource walkInCustomer')
-          .lean();
+        const order = await Order.findById(orderId).select('customer customerId').lean();
         if (!order) return deny(`order-${orderId}`, 'Order not found');
 
-        const linkedByUserId = order.customer && order.customer.toString() === userId;
-        const userPhone  = normalizePhone(socket.user.phone) || socket.user.phone;
-        const orderPhone = order.walkInCustomer?.phone;
-        const linkedByPhone = order.orderSource === 'offline' && orderPhone && userPhone &&
-          (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
-
-        if (!linkedByUserId && !linkedByPhone) {
+        // Same rule as the REST endpoints (see utils/customerIdentity).
+        if (!customerCanAccessOrder({ id: userId, customerId }, order)) {
           return deny(`order-${orderId}`, 'Not authorized to follow this order');
         }
       } catch (err) {

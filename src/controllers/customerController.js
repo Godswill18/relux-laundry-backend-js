@@ -3,50 +3,120 @@ const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const { logAudit } = require('../utils/auditLogger.js');
+const logger = require('../utils/logger.js');
+const { customerBasePipeline, customerFilterStage } = require('../utils/customerQueries.js');
 
-// @desc    Get all customers (Users with role=customer)
+// Shape one aggregated customer record the way the admin app already reads
+// rows (it used to receive User documents with customerId populated), so the
+// wallet, loyalty, edit and view screens keep working unchanged.
+//   _id               portal account id when there is one (what deactivate uses)
+//   userId            the same, explicit; null for a customer with no account
+//   customerRecordId  the Customer record — present for every customer
+function toCustomerRow(c) {
+  const u = c.user || null;
+  const { user, portalStatus, customerStatus, hasPortalAccount, tier, deactivatedByUser, reactivatedByUser, ...record } = c;
+  return {
+    _id: u?._id || c._id,
+    userId: u?._id || null,
+    customerRecordId: c._id,
+    name: u?.name || c.name,
+    email: u?.email || c.email || null,
+    phone: u?.phone || c.phone || null,
+    // Valid customer unless the business deactivated them. Not having a portal
+    // account is NOT inactive.
+    isActive: customerStatus !== 'DEACTIVATED',
+    createdAt: c.createdAt,
+    deactivatedAt: u?.deactivatedAt || null,
+    deactivatedBy: deactivatedByUser || null,
+    deactivationReason: u?.deactivationReason || null,
+    reactivatedAt: u?.reactivatedAt || null,
+    reactivatedBy: reactivatedByUser || null,
+    portalStatus,
+    customerStatus,
+    hasPortalAccount,
+    source: c.source || null,
+    needsReview: !!c.needsReview,
+    reviewReason: c.reviewReason || null,
+    customerId: { ...record, loyaltyTierId: tier || null },
+  };
+}
+
+// @desc    Get all customers — every customer record, with or without a portal account
 // @route   GET /api/v1/customers
 // @access  Private (Admin/Manager/Staff)
+// Query: search, portal (active|unregistered|pending|deactivated),
+//        status (active|deactivated), needsReview=true, page, limit
 exports.getCustomers = asyncHandler(async (req, res, next) => {
-  let query = { role: 'customer' };
+  const page  = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
 
-  if (req.query.status && req.query.status !== 'all') {
-    query.isActive = req.query.status === 'active';
-  }
+  const [result] = await Customer.aggregate([
+    ...customerBasePipeline(),
+    ...customerFilterStage(req.query),
+    {
+      $facet: {
+        total: [{ $count: 'n' }],
+        rows: [
+          { $sort: { createdAt: -1, _id: -1 } },
+          { $skip: (page - 1) * limit },
+          { $limit: limit },
+          { $lookup: { from: 'loyaltytiers', localField: 'loyaltyTierId', foreignField: '_id', as: 'tier', pipeline: [{ $project: { name: 1, rank: 1 } }] } },
+          { $addFields: { tier: { $arrayElemAt: ['$tier', 0] } } },
+          { $lookup: { from: 'users', localField: 'user.deactivatedBy', foreignField: '_id', as: 'deactivatedByUser', pipeline: [{ $project: { name: 1, role: 1 } }] } },
+          { $lookup: { from: 'users', localField: 'user.reactivatedBy', foreignField: '_id', as: 'reactivatedByUser', pipeline: [{ $project: { name: 1, role: 1 } }] } },
+          { $addFields: {
+            deactivatedByUser: { $arrayElemAt: ['$deactivatedByUser', 0] },
+            reactivatedByUser: { $arrayElemAt: ['$reactivatedByUser', 0] },
+          } },
+        ],
+      },
+    },
+  ]);
 
-  if (req.query.search) {
-    query.$or = [
-      { name: { $regex: req.query.search, $options: 'i' } },
-      { phone: { $regex: req.query.search, $options: 'i' } },
-      { email: { $regex: req.query.search, $options: 'i' } },
-    ];
-  }
-
-  const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 50;
-  const startIndex = (page - 1) * limit;
-
-  const total = await User.countDocuments(query);
-
-  const customers = await User.find(query)
-    .select('-password -otp -otpExpires')
-    .populate({
-      path: 'customerId',
-      populate: { path: 'loyaltyTierId', select: 'name rank' },
-    })
-    .sort('-createdAt')
-    .skip(startIndex)
-    .limit(limit);
-
+  const total = result?.total?.[0]?.n || 0;
   res.status(200).json({
     success: true,
     message: 'Customers fetched successfully',
-    data: { customers },
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
+    data: { customers: (result?.rows || []).map(toCustomerRow) },
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+// @desc    Find existing customers while creating an order at the counter
+// @route   GET /api/v1/customers/lookup?q=
+// @access  Private (staff roles that create walk-in orders)
+// Searches phone (any format), email, name and customer id. Name results help
+// staff pick; automatic matching when an order is saved still uses phone/email
+// only (see utils/customerIdentity).
+exports.lookupCustomers = asyncHandler(async (req, res, next) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) {
+    return res.status(200).json({ success: true, data: { customers: [] } });
+  }
+
+  const rows = await Customer.aggregate([
+    ...customerBasePipeline(),
+    ...customerFilterStage({ search: q }),
+    { $sort: { updatedAt: -1 } },
+    { $limit: 10 },
+    { $lookup: { from: 'orders', localField: '_id', foreignField: 'customerId', as: 'o', pipeline: [{ $project: { _id: 1 } }] } },
+    { $addFields: { orderCount: { $size: '$o' } } },
+    { $project: { o: 0 } },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      customers: rows.map((c) => ({
+        customerRecordId: c._id,
+        name: c.user?.name || c.name,
+        phone: c.phone || c.user?.phone || null,
+        email: c.email || c.user?.email || null,
+        portalStatus: c.portalStatus,
+        customerStatus: c.customerStatus,
+        orderCount: c.orderCount,
+        needsReview: !!c.needsReview,
+      })),
     },
   });
 });
@@ -193,97 +263,183 @@ exports.updateMyProfile = asyncHandler(async (req, res, next) => {
   });
 });
 
-// @desc    Suspend customer
-// @route   PUT /api/v1/customers/:id/suspend
-// @access  Private (Admin/Manager)
-exports.suspendCustomer = asyncHandler(async (req, res, next) => {
-  const customer = await Customer.findByIdAndUpdate(
-    req.params.id,
-    { status: 'suspended' },
-    { new: true }
-  );
+// ─── Customer account status ─────────────────────────────────────────────────
+//
+// Deactivation replaces deletion. The old deleteCustomer ran
+// Customer.findByIdAndDelete + User.findByIdAndDelete — a hard delete that left
+// every order, payment, wallet, ledger row and referral pointing at a record
+// that no longer existed.
+//
+// User.isActive is the one access switch. login, protect() and socketAuth
+// already enforce it, so flipping it is what actually blocks the account.
+// Customer.status only mirrors it for display ('suspended' / 'active'); it was
+// never enforced anywhere, so it must not become a second source of truth.
+//
+// Nothing financial is touched: balances, points, orders, payments and ledgers
+// are read-only here by construction.
 
-  if (!customer) {
-    return next(new AppError('Customer not found', 404));
+const mongoose = require('mongoose');
+
+
+async function changeCustomerStatus(req, res, next, { userId, activate, legacyAction }) {
+  if (!mongoose.isValidObjectId(userId)) {
+    return next(new AppError('Invalid customer ID', 400));
   }
 
-  await logAudit({
-    actorUserId: req.user.id,
-    action: 'CUSTOMER_SUSPENDED',
-    targetType: 'Customer',
-    targetId: req.params.id,
-    after: { status: 'suspended' },
-  });
+  // Never act on your own account through this path
+  if (String(userId) === String(req.user.id)) {
+    return next(new AppError('You cannot change the status of your own account', 400));
+  }
 
-  res.status(200).json({
-    success: true,
-    message: 'Customer suspended successfully',
-    data: { customer },
-  });
-});
+  const reason = typeof req.body?.reason === 'string'
+    ? req.body.reason.trim().slice(0, 500)
+    : '';
 
-// @desc    Delete customer (User + Customer doc)
-// @route   DELETE /api/v1/customers/:id
-// @access  Private (Admin only)
-exports.deleteCustomer = asyncHandler(async (req, res, next) => {
-  const user = await User.findOne({ _id: req.params.id, role: 'customer' });
+  const now = new Date();
+  const update = activate
+    ? {
+        $set: { isActive: true, reactivatedAt: now, reactivatedBy: req.user.id },
+      }
+    : {
+        $set: {
+          isActive: false,
+          deactivatedAt: now,
+          deactivatedBy: req.user.id,
+          deactivationReason: reason || undefined,
+        },
+        // Invalidates every JWT issued before now. protect() would already reject
+        // them via isActive, but bumping the version means tokens issued while
+        // deactivated stay dead after a later reactivation too.
+        $inc: { jwtVersion: 1 },
+      };
+
+  // Single-document conditional update: atomic in MongoDB, so two admins
+  // clicking at once cannot both "succeed", and status, actor, timestamp and
+  // reason can never be written partially. The filter is also what makes the
+  // "already deactivated / already active" answers race-free.
+  const user = await User.findOneAndUpdate(
+    {
+      _id: userId,
+      role: 'customer',
+      isActive: activate ? false : { $ne: false },
+    },
+    update,
+    { new: true }
+  ).select('-password -otp -otpExpires');
 
   if (!user) {
-    return next(new AppError('Customer not found', 404));
+    const existing = await User.findOne({ _id: userId, role: 'customer' }).select('isActive').lean();
+    if (!existing) return next(new AppError('Customer not found', 404));
+    return next(new AppError(
+      activate ? 'This customer account is already active' : 'This customer account is already deactivated',
+      409
+    ));
   }
 
-  // Hard delete of production data — record what was removed before it goes
-  const customerDoc = user.customerId
-    ? await Customer.findById(user.customerId).lean()
-    : null;
+  // Display mirror. Reactivation only lifts 'suspended' — a 'guest' profile is a
+  // walk-in record with its own meaning and is left alone.
+  if (user.customerId) {
+    try {
+      if (activate) {
+        await Customer.updateOne({ _id: user.customerId, status: 'suspended' }, { status: 'active' });
+      } else {
+        await Customer.updateOne({ _id: user.customerId }, { status: 'suspended' });
+      }
+    } catch (mirrorErr) {
+      // Access is governed by isActive, which is already committed. A failed
+      // mirror is cosmetic; log it rather than report a failure that did not happen.
+      logger.error(`[customerStatus] Customer.status mirror failed for ${user._id}: ${mirrorErr.message}`);
+    }
+  }
+
+  // Cut any live realtime connection. socketAuth only checks at connect time,
+  // so an already-open socket would otherwise keep streaming order updates.
+  if (!activate) {
+    const io = req.app.get('io');
+    if (io) {
+      io.in(`user-${user._id}`).disconnectSockets(true);
+      if (user.customerId) io.in(`user-${user.customerId}`).disconnectSockets(true);
+    }
+  }
 
   await logAudit({
     actorUserId: req.user.id,
-    action: 'CUSTOMER_DELETED',
+    action: activate ? 'CUSTOMER_REACTIVATED' : 'CUSTOMER_DEACTIVATED',
     targetType: 'Customer',
     targetId: user._id.toString(),
-    before: {
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
+    before: { status: activate ? 'DEACTIVATED' : 'ACTIVE' },
+    after:  { status: activate ? 'ACTIVE' : 'DEACTIVATED' },
+    metadata: {
       customerId: user.customerId ? String(user.customerId) : null,
-      loyaltyPointsBalance: customerDoc?.loyaltyPointsBalance ?? null,
-      lifetimeSpend: customerDoc?.lifetimeSpend ?? null,
+      name: user.name,
+      performedByRole: req.user.role,
+      reason: activate ? undefined : (reason || undefined),
+      ...(legacyAction ? { via: legacyAction } : {}),
     },
   });
 
-  // Delete the linked Customer profile doc if it exists
-  if (user.customerId) {
-    await Customer.findByIdAndDelete(user.customerId);
-  }
-
-  // Delete the User account
-  await User.findByIdAndDelete(user._id);
+  await user.populate([
+    { path: 'deactivatedBy', select: 'name role' },
+    { path: 'reactivatedBy', select: 'name role' },
+  ]);
 
   res.status(200).json({
     success: true,
-    message: 'Customer deleted successfully',
-    data: {},
+    message: activate ? 'Customer account reactivated' : 'Customer account deactivated',
+    data: { customer: user },
+  });
+}
+
+// @desc    Deactivate a customer account (access only — no data is removed)
+// @route   PATCH /api/v1/customers/:id/deactivate
+// @access  Private (Admin)
+exports.deactivateCustomer = asyncHandler((req, res, next) =>
+  changeCustomerStatus(req, res, next, { userId: req.params.id, activate: false })
+);
+
+// @desc    Reactivate a deactivated customer account
+// @route   PATCH /api/v1/customers/:id/reactivate
+// @access  Private (Admin)
+exports.reactivateCustomer = asyncHandler((req, res, next) =>
+  changeCustomerStatus(req, res, next, { userId: req.params.id, activate: true })
+);
+
+// @desc    DEPRECATED — formerly a hard delete. Now deactivates.
+// @route   DELETE /api/v1/customers/:id
+// @access  Private (Admin)
+//
+// Kept so a stale admin tab still open from before this release cannot fail
+// oddly — and, far more importantly, so it can never hard-delete again.
+exports.deleteCustomer = asyncHandler((req, res, next) => {
+  res.set('Deprecation', 'true');
+  res.set('Link', `</api/v1/customers/${req.params.id}/deactivate>; rel="successor-version"`);
+  return changeCustomerStatus(req, res, next, {
+    userId: req.params.id, activate: false, legacyAction: 'DELETE /customers/:id',
   });
 });
 
-// @desc    Activate customer
-// @route   PUT /api/v1/customers/:id/activate
-// @access  Private (Admin/Manager)
+// The legacy suspend/activate routes address the Customer profile _id rather
+// than the User _id, and flipped only the cosmetic Customer.status — so a
+// "suspended" customer could still log in. They now resolve the account and go
+// through the same core, leaving one status system instead of two.
+async function resolveUserIdFromProfile(profileId) {
+  if (!mongoose.isValidObjectId(profileId)) return null;
+  const u = await User.findOne({ customerId: profileId, role: 'customer' }).select('_id').lean();
+  return u?._id;
+}
+
+// @desc    DEPRECATED — use /deactivate
+// @route   PUT /api/v1/customers/:id/suspend   (:id = Customer profile id)
+exports.suspendCustomer = asyncHandler(async (req, res, next) => {
+  const userId = await resolveUserIdFromProfile(req.params.id);
+  if (!userId) return next(new AppError('Customer not found', 404));
+  return changeCustomerStatus(req, res, next, { userId, activate: false, legacyAction: 'PUT /customers/:id/suspend' });
+});
+
+// @desc    DEPRECATED — use /reactivate
+// @route   PUT /api/v1/customers/:id/activate  (:id = Customer profile id)
 exports.activateCustomer = asyncHandler(async (req, res, next) => {
-  const customer = await Customer.findByIdAndUpdate(
-    req.params.id,
-    { status: 'active' },
-    { new: true }
-  );
-
-  if (!customer) {
-    return next(new AppError('Customer not found', 404));
-  }
-
-  res.status(200).json({
-    success: true,
-    message: 'Customer activated successfully',
-    data: { customer },
-  });
+  const userId = await resolveUserIdFromProfile(req.params.id);
+  if (!userId) return next(new AppError('Customer not found', 404));
+  return changeCustomerStatus(req, res, next, { userId, activate: true, legacyAction: 'PUT /customers/:id/activate' });
 });

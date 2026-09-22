@@ -10,7 +10,7 @@ const User = require('../models/User.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const logger = require('../utils/logger.js');
-const normalizePhone = require('../utils/normalizePhone.js');
+const { customerCanAccessOrder } = require('../utils/customerIdentity.js');
 const notify = require('../utils/notify.js');
 const { logAudit } = require('../utils/auditLogger.js');
 
@@ -334,19 +334,10 @@ exports.initializePaystack = asyncHandler(async (req, res, next) => {
       return next(new AppError('Order not found', 404));
     }
 
-    // Ownership mirrors customerPayWithWallet: a direct customer link, or a
-    // walk-in matched on phone. Walk-ins have order.customer === null until the
-    // person signs up, and they are already surfaced to that account by
-    // getOrders/getOrder — checking only the direct link would lock them out of
-    // paying for an order they can see.
+    // Same ownership rule as every other customer action: the account or the
+    // customer record it is verifiably linked to — never an unverified phone.
     const isStaffRole = ['staff', 'admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
-    const linkedByUserId = resolvedOrder.customer && resolvedOrder.customer.toString() === req.user.id;
-    const userPhone  = normalizePhone(req.user.phone) || req.user.phone;
-    const orderPhone = resolvedOrder.walkInCustomer?.phone;
-    const linkedByPhone = resolvedOrder.orderSource === 'offline' && orderPhone && userPhone &&
-      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
-
-    if (!isStaffRole && !linkedByUserId && !linkedByPhone) {
+    if (!isStaffRole && !customerCanAccessOrder(req.user, resolvedOrder)) {
       return next(new AppError('Not authorized to pay for this order', 403));
     }
 

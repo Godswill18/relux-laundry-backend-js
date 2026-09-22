@@ -21,6 +21,17 @@ const PromoCode = require('../models/PromoCode.js');
 const PromoRedemption = require('../models/PromoRedemption.js');
 const DeliveryZone = require('../models/DeliveryZone.js');
 const PickupWindow = require('../models/PickupWindow.js');
+const mongoose = require('mongoose');
+const {
+  normalizeEmail,
+  resolveWalkInCustomer,
+  portalUserFor,
+  portalStatusOf,
+  customerCanAccessOrder,
+  customerOrderFilter,
+  maskEmail,
+  maskPhone,
+} = require('../utils/customerIdentity.js');
 const {
   loadLoyaltySettings,
   redemptionAvailable,
@@ -472,8 +483,16 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   let orderCustomerId = null;
   let orderCustomerRefId = null;
 
+  // Filled in for staff orders so the response can tell the counter whether
+  // an existing customer was found or a new record was created.
+  let customerRecordInfo = null;
+
   if (isOffline && isStaffRole) {
-    // Offline walk-in order — phone is the identity bridge to customer accounts
+    // ── Walk-in: every order belongs to a customer record ───────────────────
+    // A person becomes a customer the moment an order exists for them. This
+    // used to leave customerId null unless the phone happened to match a
+    // registered account, so walk-in customers were counted nowhere and had
+    // no record to activate later.
     if (!walkInCustomer || !walkInCustomer.name) {
       return next(new AppError('Walk-in customer name is required for offline orders', 400));
     }
@@ -481,18 +500,65 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       return next(new AppError('Walk-in customer phone number is required for offline orders', 400));
     }
 
-    // Normalize phone to E.164 before storing
+    // Normalize phone to E.164 before storing; email is optional.
     const normalized = normalizePhone(walkInCustomer.phone);
     if (normalized) walkInCustomer.phone = normalized;
-
-    // If a registered user has this phone, link the order to their account immediately
-    const matchedUser = await User.findOne({ phone: walkInCustomer.phone })
-      .select('_id customerId').lean();
-    if (matchedUser) {
-      orderCustomerId = matchedUser._id;
-      orderCustomerRefId = matchedUser.customerId;
+    const walkInEmail = normalizeEmail(walkInCustomer.email);
+    if (walkInCustomer.email && !walkInEmail) {
+      return next(new AppError('The email address entered is not valid', 400, ERROR_CODES.VALIDATION_ERROR));
     }
-    // If no account: customer and customerId remain null — linked when they sign up
+    walkInCustomer.email = walkInEmail || undefined;
+
+    let customerRecord;
+    if (req.body.customerRecordId) {
+      // Staff picked an existing customer from the lookup. Used as chosen —
+      // this is also how a phone/email conflict is resolved at the counter.
+      if (!mongoose.isValidObjectId(req.body.customerRecordId)) {
+        return next(new AppError('Invalid customer record', 400));
+      }
+      customerRecord = await Customer.findById(req.body.customerRecordId);
+      if (!customerRecord) {
+        return next(new AppError('Selected customer record not found', 404));
+      }
+      customerRecordInfo = { created: false, selected: true };
+    } else {
+      try {
+        const r = await resolveWalkInCustomer({
+          name: walkInCustomer.name,
+          phone: walkInCustomer.phone,
+          email: walkInEmail,
+          actor: req.user,
+        });
+        customerRecord = r.customer;
+        customerRecordInfo = { created: r.created, selected: false };
+      } catch (err) {
+        if (err.code !== 'IDENTITY_CONFLICT') throw err;
+        // Phone belongs to one customer, email to another. Never pick one
+        // automatically — the person at the counter chooses, then resubmits
+        // with customerRecordId. Contact details are masked.
+        return res.status(409).json({
+          success: false,
+          message: 'This phone number and email belong to two different customers. Choose the right customer to continue.',
+          error: { code: 'IDENTITY_CONFLICT' },
+          data: {
+            candidates: err.candidates.map((c) => ({
+              customerRecordId: c._id,
+              name: c.name,
+              phone: maskPhone(c.phone),
+              email: maskEmail(c.email),
+            })),
+          },
+        });
+      }
+    }
+
+    orderCustomerRefId = customerRecord._id;
+    // If this customer has a portal account, link it too so the order shows up
+    // on their dashboard immediately.
+    const portalUser = await portalUserFor(customerRecord._id);
+    if (portalUser) orderCustomerId = portalUser._id;
+    customerRecordInfo.customerRecordId = customerRecord._id;
+    customerRecordInfo.portalStatus = portalStatusOf(portalUser);
   } else {
     // Online order
     orderCustomerId = req.user.id;
@@ -958,7 +1024,9 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   res.status(201).json({
     success: true,
     message: 'Order created successfully',
-    data: { order },
+    // customerRecord tells the counter whether an existing customer was found
+    // or a new record was created (walk-in orders only).
+    data: { order, ...(customerRecordInfo ? { customerRecord: customerRecordInfo } : {}) },
   });
 });
 
@@ -978,18 +1046,17 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   // This prevents staff accounts logged into the customer UI from seeing all orders.
   const isCustomerScope = req.user.role === 'customer' || req.query.scope === 'customer';
 
-  // Customers (or any role in customer-scope mode) see their own orders + walk-in orders linked by phone
+  // Customers (or any role in customer-scope mode) see every order that belongs
+  // to them — placed online or at the counter — through their account or the
+  // customer record it is linked to. No date restriction: orders from before
+  // the account existed are theirs too.
+  //
+  // This used to also match walk-in orders by the phone on the account. That
+  // phone was never verified, so registering with someone else's number showed
+  // you their orders. Walk-in orders now carry customerId instead, and an
+  // account is only linked to a customer record through a verified identifier.
   if (isCustomerScope) {
-    const normalizedPhone = normalizePhone(req.user.phone);
-    const phoneConditions = [];
-    if (normalizedPhone) phoneConditions.push({ 'walkInCustomer.phone': normalizedPhone, orderSource: 'offline' });
-    // Also match un-normalized legacy phone as a fallback until backfill runs
-    if (req.user.phone && req.user.phone !== normalizedPhone) {
-      phoneConditions.push({ 'walkInCustomer.phone': req.user.phone, orderSource: 'offline' });
-    }
-    query = phoneConditions.length
-      ? { $or: [{ customer: req.user.id }, ...phoneConditions] }
-      : { customer: req.user.id };
+    query = customerOrderFilter(req.user);
   } else {
     query = {};
 
@@ -1278,16 +1345,8 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
   // Enforce ownership for customers and for any role using the customer-scope UI.
   // This prevents staff accounts logged into the customer UI from viewing others' orders.
   const isCustomerScope = req.user.role === 'customer' || req.query.scope === 'customer';
-  if (isCustomerScope) {
-    const linkedByUserId = order.customer && order.customer._id?.toString() === req.user.id;
-    const userPhone = normalizePhone(req.user.phone) || req.user.phone;
-    const orderPhone = order.walkInCustomer?.phone;
-    const linkedByPhone = order.orderSource === 'offline' && orderPhone &&
-      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
-
-    if (!linkedByUserId && !linkedByPhone) {
-      return next(new AppError('Not authorized to access this order', 403));
-    }
+  if (isCustomerScope && !customerCanAccessOrder(req.user, order)) {
+    return next(new AppError('Not authorized to access this order', 403));
   }
 
   res.status(200).json({
@@ -2316,14 +2375,8 @@ exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
   const order = await Order.findById(req.params.id);
   if (!order) return next(new AppError('Order not found', 404));
 
-  // Ownership check — supports direct customer link AND phone-matched walk-in orders
-  const linkedByUserId = order.customer && order.customer.toString() === req.user._id.toString();
-  const userPhone = normalizePhone(req.user.phone) || req.user.phone;
-  const orderPhone = order.walkInCustomer?.phone;
-  const linkedByPhone = order.orderSource === 'offline' && orderPhone &&
-    (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
-
-  if (!linkedByUserId && !linkedByPhone) {
+  // Ownership: the customer's account or customer record (see customerIdentity).
+  if (!customerCanAccessOrder(req.user, order)) {
     return next(new AppError('Not authorized to pay for this order', 403));
   }
 
@@ -2343,10 +2396,11 @@ exports.customerPayWithWallet = asyncHandler(async (req, res, next) => {
     return next(new AppError('No outstanding balance on this order', 400));
   }
 
-  // Resolve customer wallet — use order.customer if set; fall back to logged-in user for phone-matched walk-ins
-  const walletUserId = order.customer || req.user._id;
-  const orderUser = await User.findById(walletUserId).select('customerId').lean();
-  if (!orderUser?.customerId) {
+  // The payer pays from their own wallet. This resolved order.customer's
+  // wallet first, which is only the payer's when the order is linked through
+  // the account rather than the customer record.
+  const orderUser = { customerId: req.user.customerId };
+  if (!orderUser.customerId) {
     return next(new AppError('Customer wallet not found', 404));
   }
 
@@ -2425,18 +2479,9 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   // order.customer is null on a walk-in that has not been linked to an account
   // yet, and those orders ARE surfaced to a matching customer by getOrders /
   // getOrder — so this used to dereference null and 500 on a live code path.
-  // Matching mirrors customerPayWithWallet: direct link, or phone-matched walk-in.
-  if (req.user.role === 'customer') {
-    const linkedByUserId = order.customer && order.customer.toString() === req.user.id;
-
-    const userPhone  = normalizePhone(req.user.phone) || req.user.phone;
-    const orderPhone = order.walkInCustomer?.phone;
-    const linkedByPhone = order.orderSource === 'offline' && orderPhone && userPhone &&
-      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
-
-    if (!linkedByUserId && !linkedByPhone) {
-      return next(new AppError('Not authorized to cancel this order', 403));
-    }
+  // Same ownership rule as every other customer action (see customerIdentity).
+  if (req.user.role === 'customer' && !customerCanAccessOrder(req.user, order)) {
+    return next(new AppError('Not authorized to cancel this order', 403));
   }
 
   // Check if order can be cancelled
@@ -2954,7 +2999,6 @@ exports.getLeaderboard = asyncHandler(async (req, res) => {
       },
     },
     { $sort: { totalPoints: -1 } },
-    { $limit: TOP_N },
     {
       $lookup: {
         from: 'customers',
@@ -2964,6 +3008,11 @@ exports.getLeaderboard = asyncHandler(async (req, res) => {
       },
     },
     { $unwind: '$customer' },
+    // The leaderboard is shown to every customer, so a deactivated account's
+    // name is not published on it. Filtered before $limit so the board still
+    // fills its places. Their ledger rows are untouched — this is display only.
+    { $match: { 'customer.status': { $ne: 'suspended' } } },
+    { $limit: TOP_N },
     {
       $project: {
         _id: 0,
@@ -3026,56 +3075,14 @@ exports.getLeaderboard = asyncHandler(async (req, res) => {
 // @route   POST /api/v1/orders/backfill-walkin
 // @access  Private (Admin only)
 exports.backfillWalkIn = asyncHandler(async (req, res) => {
-  const walkInOrders = await Order.find({
-    orderSource: 'offline',
-    'walkInCustomer.phone': { $exists: true, $ne: null, $ne: '' },
-  }).lean();
-
-  const bulkOps = [];
-  let normalizedCount = 0;
-  let linkedCount = 0;
-
-  // Build a phone → user map for efficient lookups
-  const rawPhones = [...new Set(walkInOrders.map((o) => o.walkInCustomer?.phone).filter(Boolean))];
-  const normalizedMap = new Map(); // rawPhone → normalized
-  const userMap = new Map();       // normalized → { _id, customerId }
-
-  for (const raw of rawPhones) {
-    const normalized = normalizePhone(raw) || raw;
-    normalizedMap.set(raw, normalized);
-  }
-
-  const uniqueNormalized = [...new Set(normalizedMap.values())];
-  const matchedUsers = await User.find({ phone: { $in: uniqueNormalized } })
-    .select('_id customerId phone').lean();
-  for (const u of matchedUsers) userMap.set(u.phone, u);
-
-  for (const order of walkInOrders) {
-    const raw = order.walkInCustomer?.phone;
-    const normalized = normalizedMap.get(raw) || raw;
-    const matchedUser = userMap.get(normalized);
-    const update = {};
-
-    if (normalized !== raw) {
-      update['walkInCustomer.phone'] = normalized;
-      normalizedCount++;
-    }
-    if (matchedUser && order.customer?.toString() !== matchedUser._id.toString()) {
-      update.customer = matchedUser._id;
-      update.customerId = matchedUser.customerId;
-      linkedCount++;
-    }
-
-    if (Object.keys(update).length > 0) {
-      bulkOps.push({ updateOne: { filter: { _id: order._id }, update: { $set: update } } });
-    }
-  }
-
-  if (bulkOps.length > 0) await Order.bulkWrite(bulkOps);
-
+  // Previously linked walk-in orders to any account whose (unverified) phone
+  // matched — the same leak as the startup job. It now runs the phone
+  // normalization only; linking goes through customer records and verified
+  // identities (utils/migrations/linkWalkInCustomers).
+  await require('../utils/backfillWalkIn.js')();
   res.status(200).json({
     success: true,
-    message: `Backfill complete. Phones normalized: ${normalizedCount}, Orders linked to accounts: ${linkedCount}`,
-    data: { normalizedCount, linkedCount, totalProcessed: walkInOrders.length },
+    message: 'Walk-in phone numbers normalized. Orders are linked to customers through customer records — run the linkWalkInCustomers migration for historical orders.',
+    data: { linkedCount: 0 },
   });
 });

@@ -1,4 +1,6 @@
 const User = require('../models/User.js');
+const { customerCounts } = require('../utils/customerQueries.js');
+const { startOfMonthWAT } = require('../utils/helpers.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
 const { logAudit } = require('../utils/auditLogger.js');
@@ -73,21 +75,13 @@ exports.getUsers = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/users/customer-stats
 // @access  Private (admin, manager)
 exports.getCustomerStats = asyncHandler(async (req, res) => {
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-
-  const [total, active, newThisMonth, inactive] = await Promise.all([
-    User.countDocuments({ role: 'customer' }),
-    User.countDocuments({ role: 'customer', isActive: { $ne: false } }),
-    User.countDocuments({ role: 'customer', createdAt: { $gte: monthStart, $lte: monthEnd } }),
-    User.countDocuments({ role: 'customer', isActive: false }),
-  ]);
-
-  res.status(200).json({
-    success: true,
-    data: { total, active, newThisMonth, inactive },
-  });
+  // Counts customer RECORDS — walk-in customers included — not portal logins,
+  // which is what these cards used to count. Same definition as the customer
+  // list and the dashboard (utils/customerQueries). The original four keys keep
+  // their meaning for the existing cards; the portal breakdown is added.
+  // Month boundary in WAT, the business's timezone.
+  const counts = await customerCounts({ monthStart: startOfMonthWAT() });
+  res.status(200).json({ success: true, data: counts });
 });
 
 // @desc    Get single user
@@ -228,6 +222,16 @@ exports.deleteUser = asyncHandler(async (req, res, next) => {
   // Prevent deleting yourself
   if (user._id.toString() === req.user.id) {
     return next(new AppError('You cannot delete your own account', 400));
+  }
+
+  // Customers are never hard-deleted. This generic route could delete any
+  // user — customers included — bypassing the customer flow entirely and
+  // orphaning every order, payment, wallet and ledger row that referenced them.
+  if (user.role === 'customer') {
+    return next(new AppError(
+      'Customer accounts cannot be deleted. Deactivate the account instead.',
+      409
+    ));
   }
 
   await user.deleteOne();

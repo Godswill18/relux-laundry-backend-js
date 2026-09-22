@@ -1,5 +1,4 @@
 const User = require('../models/User.js');
-const Order = require('../models/Order.js');
 const WorkShift = require('../models/WorkShift.js');
 const Referral = require('../models/Referral.js');
 // const { clerkClient } = require('@clerk/express'); // Clerk disabled — using custom JWT auth
@@ -30,14 +29,28 @@ exports.register = asyncHandler(async (req, res, next) => {
   const phone = normalizePhone(rawPhone) || rawPhone.trim();
 
   // Check if user already exists
-  const existingUser = await User.findOne({ phone });
+  // Uniqueness is unchanged: a deactivated account still owns its phone and
+  // email, so registering again is refused rather than creating a duplicate
+  // customer beside the deactivated one. The message points to support, which
+  // is the recovery route, instead of implying the person can simply log in.
+  const existingUser = await User.findOne({ phone }).select('isActive').lean();
   if (existingUser) {
-    return next(new AppError('Phone number already registered', 400));
+    return next(new AppError(
+      existingUser.isActive === false
+        ? 'An account with this phone number exists but is deactivated. Please contact support for assistance.'
+        : 'Phone number already registered',
+      400
+    ));
   }
 
-  const existingEmail = await User.findOne({ email: email.toLowerCase() });
+  const existingEmail = await User.findOne({ email: email.toLowerCase() }).select('isActive').lean();
   if (existingEmail) {
-    return next(new AppError('Email address already registered', 400));
+    return next(new AppError(
+      existingEmail.isActive === false
+        ? 'An account with this email exists but is deactivated. Please contact support for assistance.'
+        : 'Email address already registered',
+      400
+    ));
   }
 
   // Generate email verification OTP before creating the user
@@ -60,16 +73,14 @@ exports.register = asyncHandler(async (req, res, next) => {
   user.referralCode = `REF-${user._id.toString().slice(-6).toUpperCase()}-${Date.now().toString(36).slice(-3).toUpperCase()}`;
   await user.save({ validateBeforeSave: false });
 
-  // Create linked Customer document for wallet/loyalty/orders
-  await ensureCustomer(user);
-
-  // Link any past walk-in orders whose phone matches this new account (fire-and-forget)
-  if (phone) {
-    Order.updateMany(
-      { orderSource: 'offline', 'walkInCustomer.phone': phone },
-      { $set: { customer: user._id, customerId: user.customerId } }
-    ).catch(() => {});
-  }
+  // No customer record is linked here. This used to link the new account to
+  // any record sharing its phone or email, and attach every walk-in order with
+  // that phone — before anything had been verified. Registering with someone
+  // else's number handed over their orders, wallet and points.
+  //
+  // The link now happens in verifyEmail, through the verified email only (see
+  // utils/ensureCustomer). A walk-in customer whose record has this email is
+  // linked to it there; nobody is linked by phone.
 
   // Apply referral code if provided — do this silently (never fail registration)
   if (referralCode && referralCode.trim()) {
@@ -200,6 +211,11 @@ exports.verifyEmail = asyncHandler(async (req, res, next) => {
   user.otpExpires = undefined;
   await user.save({ validateBeforeSave: false });
 
+  // Email is now proven — link the account to its customer record. If a
+  // walk-in record already holds this email, that record is claimed instead
+  // of creating a duplicate customer.
+  await ensureCustomer(user);
+
   // Now log the user in by returning a token
   await sendTokenResponse(user, 200, res);
 });
@@ -309,7 +325,9 @@ exports.login = asyncHandler(async (req, res, next) => {
 
   // Check if user account is active (manual admin control)
   if (!user.isActive) {
-    return next(new AppError('Your account has been deactivated. Contact an administrator.', 403, ERROR_CODES.ACCOUNT_DEACTIVATED));
+    // Only reached after the password matched, so this never confirms an
+    // account's existence to someone who does not already hold its credentials.
+    return next(new AppError('Your account has been deactivated. Please contact support for assistance.', 403, ERROR_CODES.ACCOUNT_DEACTIVATED));
   }
 
 // Shift-based login restriction for staff role only
@@ -445,9 +463,10 @@ exports.logout = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/auth/request-otp
 // @access  Public
 exports.requestOTP = asyncHandler(async (req, res, next) => {
-  const { phone } = req.body;
+  // Always the signed-in user's own phone — never one supplied in the body.
+  const phone = req.user.phone;
 
-  const user = await User.findOne({ phone });
+  const user = await User.findById(req.user.id);
 
   if (!user) {
     return next(new AppError('User not found', 404));
@@ -477,25 +496,12 @@ exports.requestOTP = asyncHandler(async (req, res, next) => {
 // @route   POST /api/v1/auth/verify-otp
 // @access  Public
 exports.verifyOTP = asyncHandler(async (req, res, next) => {
-  const { phone, otp } = req.body;
-
-  const user = await User.findOne({
-    phone,
-    otp,
-    otpExpires: { $gt: Date.now() },
-  });
-
-  if (!user) {
-    return next(new AppError('Invalid or expired OTP', 400));
-  }
-
-  // Clear OTP
-  user.otp = undefined;
-  user.otpExpires = undefined;
-  user.isPhoneVerified = true;
-  await user.save({ validateBeforeSave: false });
-
-  await sendTokenResponse(user, 200, res);
+  // Disabled. This logged a user in with nothing but a phone number and a
+  // 6-digit code — for any role, admins included — while no SMS was ever sent,
+  // codes came from Math.random, were stored in plaintext and had no attempt
+  // limit. No client uses it. Portal activation for existing customers goes
+  // through /auth/activation/* with email verification instead.
+  return next(new AppError('Phone sign-in is not available. Please sign in with your password.', 410));
 });
 
 // @desc    Forgot password — send OTP to registered email

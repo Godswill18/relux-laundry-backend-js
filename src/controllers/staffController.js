@@ -184,6 +184,16 @@ exports.deleteStaff = asyncHandler(async (req, res, next) => {
     return next(new AppError('Staff member not found', 404));
   }
 
+  // This route looks the target up by id with no role filter, and a customer
+  // ranks below every staff role — so it was a third way to hard-delete a
+  // customer. Customers are deactivated, never deleted.
+  if (user.role === 'customer') {
+    return next(new AppError(
+      'Customer accounts cannot be deleted. Deactivate the account instead.',
+      409
+    ));
+  }
+
   if (user._id.toString() === req.user.id) {
     return next(new AppError('You cannot delete your own account', 400));
   }

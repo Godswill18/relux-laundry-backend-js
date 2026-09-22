@@ -4,8 +4,75 @@ const User = require('../models/User.js');
 const Order = require('../models/Order.js');
 const logger = require('./logger.js');
 
+// ─── Production guard ────────────────────────────────────────────────────────
+// Both modes of this script are destructive: -i and -d each run
+// User.deleteMany() and Order.deleteMany() with no filter, wiping every
+// customer, staff account and order. The backend's .env holds the live
+// MONGODB_URI, so a stray `npm run seed` from that folder would erase production.
+//
+// NODE_ENV alone is not enough: the .env this runs against has had
+// NODE_ENV=development while pointing at the live remote cluster. So the check
+// is on where the database actually is.
+//
+//   • NODE_ENV=production        → always refused, no override.
+//   • local database             → allowed (localhost / 127.0.0.1 / ::1).
+//   • any remote database        → refused unless SEED_CONFIRM_DB is set to the
+//                                   exact database name, as a deliberate
+//                                   typed-out confirmation.
+//
+// Runs before mongoose.connect, so a refusal never opens a connection.
+const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]'];
+
+function describeTarget(uri) {
+  // Parse only what is needed; the URI itself (with credentials) is never logged.
+  const withoutScheme = uri.replace(/^mongodb(\+srv)?:\/\//, '');
+  const withoutCreds  = withoutScheme.replace(/^[^@/]*@/, '');
+  const [hostPart, rest = ''] = withoutCreds.split(/\/(.*)/s);
+  const hosts  = hostPart.split(',').map((h) => h.replace(/:\d+$/, '').toLowerCase());
+  const dbName = decodeURIComponent(rest.split('?')[0] || '');
+  const isLocal = !uri.startsWith('mongodb+srv') && hosts.length > 0 && hosts.every((h) => LOCAL_HOSTS.includes(h));
+  return { isLocal, dbName };
+}
+
+function assertSafeToSeed() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.error('Refusing to run: MONGODB_URI is not set.');
+    process.exit(1);
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    console.error(
+      'Refusing to run: NODE_ENV is "production".\n' +
+      'This script deletes every user and every order. It is never run in production.'
+    );
+    process.exit(1);
+  }
+
+  const { isLocal, dbName } = describeTarget(uri);
+  if (isLocal) return;
+
+  const confirmed = dbName && process.env.SEED_CONFIRM_DB === dbName;
+  if (!confirmed) {
+    console.error(
+      'Refusing to run: MONGODB_URI points at a REMOTE database' +
+      (dbName ? ` ("${dbName}")` : '') + '.\n' +
+      'This script deletes every user and every order before inserting sample data.\n\n' +
+      'If this really is a disposable database, confirm it by typing its name:\n' +
+      // Deliberately a placeholder, never the detected name: printing the real
+      // name here would hand over a ready-to-paste command for wiping it.
+      '  SEED_CONFIRM_DB=<database-name> npm run seed -- -i\n\n' +
+      'Never do this against the live Relux database.'
+    );
+    process.exit(1);
+  }
+
+  console.warn(`WARNING: seeding remote database "${dbName}" — confirmed via SEED_CONFIRM_DB.`);
+}
+
 // Connect to database
 const connectDB = async () => {
+  assertSafeToSeed();
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     logger.info('MongoDB Connected');

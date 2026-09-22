@@ -18,10 +18,24 @@ const CustomerSchema = new mongoose.Schema(
     loyaltyLifetimePoints: { type: Number, default: 0 },
     lifetimeSpend: { type: Number, default: 0 },
     loyaltyTierId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyTier' },
+
+    // How this record first came into existence. Optional: records created
+    // before this field existed simply have none.
+    source: { type: String, enum: ['walk_in', 'online', 'admin'] },
+
+    // Data-quality flag for records that may be the same person as another
+    // (e.g. a new account whose phone already belongs to a walk-in record).
+    // Records are never merged automatically; this marks them for a person to
+    // review. Cleared by an admin once resolved.
+    needsReview:   { type: Boolean, default: false },
+    reviewReason:  { type: String },
+    reviewRelatedCustomerIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Customer' }],
   },
   { timestamps: true }
 );
 
 CustomerSchema.index({ status: 1 });
+CustomerSchema.index({ needsReview: 1 });
+CustomerSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('Customer', CustomerSchema);

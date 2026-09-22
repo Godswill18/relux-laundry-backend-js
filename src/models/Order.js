@@ -119,6 +119,9 @@ const OrderSchema = new mongoose.Schema(
     walkInCustomer: {
       name: String,
       phone: String,
+      // Optional. Captured at the counter so the customer can later verify
+      // ownership by email and activate a portal account.
+      email: String,
     },
     // Staff member who created this order (populated for offline orders)
     createdByStaff: {
@@ -379,5 +382,7 @@ OrderSchema.index({ assignedStaff: 1, status: 1 });
 OrderSchema.index({ orderSource: 1, status: 1 });
 // Walk-in orders are surfaced to a matching customer account by phone.
 OrderSchema.index({ 'walkInCustomer.phone': 1 });
+// Order history is now read through the customer record.
+OrderSchema.index({ customerId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Order', OrderSchema);

@@ -32,8 +32,15 @@ exports.protect = asyncHandler(async (req, res, next) => {
       return next(new AppError('User no longer exists', 401));
     }
 
+    // Checked on every request, so an existing session stops working the moment
+    // an account is deactivated — no need to wait for the JWT to expire. Kept at
+    // 401 because the customer app logs out on 401; the code lets it say why.
     if (!req.user.isActive) {
-      return next(new AppError('User account is deactivated', 401));
+      return next(new AppError(
+        'Your account has been deactivated. Please contact support for assistance.',
+        401,
+        'ACCOUNT_DEACTIVATED'
+      ));
     }
 
     // Backfill customerId for users created before ensureCustomer was added.

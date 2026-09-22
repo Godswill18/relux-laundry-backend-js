@@ -3,7 +3,7 @@ const PromoRedemption = require('../models/PromoRedemption.js');
 const Order = require('../models/Order.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
-const normalizePhone = require('../utils/normalizePhone.js');
+const { customerCanAccessOrder } = require('../utils/customerIdentity.js');
 
 // @desc    Get all promo codes
 // @route   GET /api/v1/promos
@@ -215,22 +215,14 @@ exports.redeemPromoCode = asyncHandler(async (req, res, next) => {
   // orderId was taken from the body with no check that it belonged to anyone in
   // particular, so a customer could burn a campaign's global usage slots against
   // other people's orders — and, with usageLimit set, exhaust it outright.
-  const order = await Order.findById(orderId).select('customer orderSource walkInCustomer total pricing');
+  const order = await Order.findById(orderId).select('customer customerId total pricing');
   if (!order) {
     return next(new AppError('Order not found', 404));
   }
 
   const isStaffRole = ['staff', 'admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
-  if (!isStaffRole) {
-    const linkedByUserId = order.customer && order.customer.toString() === req.user.id;
-    const userPhone  = normalizePhone(req.user.phone) || req.user.phone;
-    const orderPhone = order.walkInCustomer?.phone;
-    const linkedByPhone = order.orderSource === 'offline' && orderPhone && userPhone &&
-      (orderPhone === userPhone || normalizePhone(orderPhone) === userPhone);
-
-    if (!linkedByUserId && !linkedByPhone) {
-      return next(new AppError('Not authorized to apply a promo code to this order', 403));
-    }
+  if (!isStaffRole && !customerCanAccessOrder(req.user, order)) {
+    return next(new AppError('Not authorized to apply a promo code to this order', 403));
   }
 
   const existingRedemption = await PromoRedemption.findOne({ orderId });

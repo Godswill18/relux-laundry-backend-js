@@ -4,6 +4,7 @@ const PayrollPeriod = require('../models/PayrollPeriod.js');
 const PayrollEntry = require('../models/PayrollEntry.js');
 const WorkShift = require('../models/WorkShift.js');
 const Attendance = require('../models/Attendance.js');
+const { customerCounts } = require('../utils/customerQueries.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const {
   paidOrderMatch,
@@ -83,8 +84,10 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
     { $limit: 5 },
   ]);
 
-  // Customer count
-  const totalCustomers = await User.countDocuments({ role: 'customer' });
+  // Unique customer records, walk-ins included — not portal logins, which is
+  // what this used to count. Same definition as the customer list.
+  const customerStats = await customerCounts({ monthStart: startOfMonthWAT() });
+  const totalCustomers = customerStats.total;
   const activeStaff = await User.countDocuments({ role: 'staff', isActive: true });
 
   res.status(200).json({
@@ -106,6 +109,14 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
         revenue: monthlyRevenue[0]?.total || 0,
       },
       totalCustomers,
+      // Portal adoption breakdown (additive — existing fields unchanged).
+      customerBreakdown: {
+        portalActive: customerStats.portalActive,
+        unregistered: customerStats.unregistered,
+        pendingVerification: customerStats.pendingVerification,
+        deactivated: customerStats.deactivated,
+        activationRate: customerStats.activationRate,
+      },
       activeStaff,
       recentOrders,
       topServices,

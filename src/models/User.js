@@ -81,6 +81,15 @@ const UserSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    // Account-status trail. isActive above stays the single access switch —
+    // login, protect() and socketAuth all enforce it — these only record who
+    // changed it, when and why. All optional: existing documents need no
+    // migration, and a missing value simply means "never deactivated".
+    deactivatedAt:      { type: Date },
+    deactivatedBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    deactivationReason: { type: String, trim: true, maxlength: 500 },
+    reactivatedAt:      { type: Date },
+    reactivatedBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     isPhoneVerified: {
       type: Boolean,
       default: false,
