@@ -1,4 +1,8 @@
 const mongoose = require('mongoose');
+// Loaded here, not looked up by name: nothing else requires Counter.js, so
+// mongoose.model('Counter') threw "Schema hasn't been registered for model
+// Counter" and every new order — online and walk-in — failed to save.
+const Counter = require('./Counter.js');
 
 // Snapshot of a selected add-on at the time of order creation.
 // Stored inline so future edits to the Addon doc don't change past orders.
@@ -280,7 +284,6 @@ const OrderSchema = new mongoose.Schema(
 // already issued, so switching an existing production month over to the counter
 // never reissues a number that is already printed on a ticket.
 async function nextOrderSequence(monthYear) {
-  const Counter = mongoose.model('Counter');
   const key = `order:${monthYear}`;
 
   // Fast path — counter already established for this month
