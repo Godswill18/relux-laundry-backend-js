@@ -100,7 +100,8 @@ app.use('/api', apiLimiter);
 // Identifies which build of the API is actually serving. Bump the revision when
 // a frontend starts depending on new API behaviour, so a stale deployment can
 // be told apart from a current one without server access.
-const API_REVISION = '2026-09-22.customer-portal-status';
+const API_REVISION = '2026-09-22.order-counter-fix';
+const { COMMIT_SHORT } = require('./utils/buildInfo.js');
 const STARTED_AT = new Date().toISOString();
 
 app.get('/health', (req, res) => {
@@ -110,6 +111,8 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     revision: API_REVISION,
+    // The exact git commit running — compare with the latest commit on main.
+    commit: COMMIT_SHORT,
     startedAt: STARTED_AT,
   });
 });
