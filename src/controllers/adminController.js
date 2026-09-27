@@ -5,6 +5,10 @@ const PayrollEntry = require('../models/PayrollEntry.js');
 const WorkShift = require('../models/WorkShift.js');
 const Attendance = require('../models/Attendance.js');
 const { customerCounts } = require('../utils/customerQueries.js');
+const {
+  READY_IMPLIED_STATUSES,
+  COLLECTED_IMPLIED_STATUSES,
+} = require('../utils/orderFulfilment.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const {
   paidOrderMatch,
@@ -208,6 +212,67 @@ exports.getOrderStats = asyncHandler(async (req, res, next) => {
     { $sort: { count: -1 } },
   ]);
 
+  // Garments (sum of line quantities, never a count of lines) across every
+  // order that wasn't cancelled. Orders placed before garment tracking are
+  // read from their status: 'ready'-or-later = all ready, delivered/completed =
+  // all collected.
+  const [garmentRow] = await Order.aggregate([
+    { $match: { status: { $ne: 'cancelled' } } },
+    {
+      $project: {
+        total: { $ifNull: ['$totalGarments', { $sum: '$items.quantity' }] },
+        tracked: { $eq: ['$itemTracking', true] },
+        status: 1,
+        readyG: '$readyGarments',
+        collectedG: '$collectedGarments',
+      },
+    },
+    {
+      $project: {
+        total: 1,
+        ready: {
+          $cond: ['$tracked', { $ifNull: ['$readyG', 0] },
+            { $cond: [{ $in: ['$status', READY_IMPLIED_STATUSES] }, '$total', 0] }],
+        },
+        collected: {
+          $cond: ['$tracked', { $ifNull: ['$collectedG', 0] },
+            { $cond: [{ $in: ['$status', COLLECTED_IMPLIED_STATUSES] }, '$total', 0] }],
+        },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: '$total' },
+        ready: { $sum: '$ready' },
+        collected: { $sum: '$collected' },
+        partiallyReadyOrders: {
+          $sum: { $cond: [{ $and: [{ $gt: ['$ready', 0] }, { $lt: ['$ready', '$total'] }] }, 1, 0] },
+        },
+        partiallyCollectedOrders: {
+          $sum: { $cond: [{ $and: [{ $gt: ['$collected', 0] }, { $lt: ['$collected', '$total'] }] }, 1, 0] },
+        },
+      },
+    },
+  ]);
+  const g = garmentRow || { total: 0, ready: 0, collected: 0, partiallyReadyOrders: 0, partiallyCollectedOrders: 0 };
+
+  // Garments and line revenue per service — one order can now hold several
+  // services, which the order-level serviceType above cannot show.
+  const garmentsByService = await Order.aggregate([
+    { $match: { status: { $ne: 'cancelled' } } },
+    { $unwind: '$items' },
+    {
+      $group: {
+        _id: { $ifNull: ['$items.serviceName', { $ifNull: ['$items.serviceType', 'Unspecified'] }] },
+        garments: { $sum: '$items.quantity' },
+        lines: { $sum: 1 },
+        amount: { $sum: { $add: [{ $ifNull: ['$items.total', 0] }, { $ifNull: ['$items.addonsTotal', 0] }] } },
+      },
+    },
+    { $sort: { garments: -1 } },
+  ]);
+
   res.status(200).json({
     success: true,
     message: 'Order statistics fetched successfully',
@@ -216,6 +281,16 @@ exports.getOrderStats = asyncHandler(async (req, res, next) => {
       ordersByService,
       ordersByType,
       paymentMethods,
+      garments: {
+        total: g.total,
+        processing: g.total - g.ready,
+        readyAwaitingCollection: g.ready - g.collected,
+        collected: g.collected,
+        outstanding: g.total - g.collected,
+        partiallyReadyOrders: g.partiallyReadyOrders,
+        partiallyCollectedOrders: g.partiallyCollectedOrders,
+      },
+      garmentsByService,
     },
   });
 });

@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Service = require('../models/Service.js');
 const ServiceCategory = require('../models/ServiceCategory.js');
 const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
@@ -718,6 +719,64 @@ exports.getAddons = asyncHandler(async (req, res) => {
   });
 });
 
+// scope + eligibleServiceIds + garmentPricing, validated. Returns only the
+// keys that were sent, or throws an AppError. `effectiveType` is the add-on's
+// type after this request (the incoming `type`, or its current one on an
+// update) — garmentPricing only makes sense on a fixed-value add-on: a
+// percentage add-on already varies by garment through the line's unit price.
+async function parseAddonScope(body, effectiveType) {
+  const out = {};
+  if (body.scope !== undefined) {
+    if (!['order', 'item'].includes(body.scope)) {
+      throw new AppError('Scope must be "order" (whole order) or "item" (per garment)', 400);
+    }
+    out.scope = body.scope;
+  }
+  if (body.eligibleServiceIds !== undefined) {
+    const ids = Array.isArray(body.eligibleServiceIds) ? body.eligibleServiceIds : [];
+    const unique = [...new Set(ids.map(String))];
+    if (unique.some((id) => !mongoose.isValidObjectId(id))) {
+      throw new AppError('One of the selected services is not valid', 400);
+    }
+    if (unique.length) {
+      const found = await Service.countDocuments({ _id: { $in: unique } });
+      if (found !== unique.length) throw new AppError('One of the selected services no longer exists', 400);
+    }
+    out.eligibleServiceIds = unique;
+  }
+  if (body.garmentPricing !== undefined) {
+    const rows = Array.isArray(body.garmentPricing) ? body.garmentPricing : [];
+    if (rows.length && effectiveType !== 'fixed') {
+      throw new AppError('Per-garment pricing only applies to a fixed-amount add-on', 400);
+    }
+    const serviceIds = [...new Set(rows.map((r) => r?.serviceId).filter(Boolean).map(String))];
+    if (serviceIds.some((id) => !mongoose.isValidObjectId(id))) {
+      throw new AppError('One of the selected services is not valid', 400);
+    }
+    if (serviceIds.length) {
+      const found = await Service.countDocuments({ _id: { $in: serviceIds } });
+      if (found !== serviceIds.length) throw new AppError('One of the selected services no longer exists', 400);
+    }
+    const seen = new Set();
+    out.garmentPricing = rows.map((r, i) => {
+      const garmentName = String(r?.garmentName || '').trim();
+      if (!garmentName) throw new AppError(`Garment price row ${i + 1}: garment name is required`, 400);
+      const price = Number(r?.price);
+      if (!Number.isFinite(price) || price < 0) {
+        throw new AppError(`Garment price row ${i + 1} (${garmentName}): enter a price of 0 or more`, 400);
+      }
+      const serviceId = r?.serviceId ? String(r.serviceId) : undefined;
+      const key = `${garmentName.toLowerCase()}::${serviceId || ''}`;
+      if (seen.has(key)) {
+        throw new AppError(`Garment price row ${i + 1}: "${garmentName}" is listed twice for the same service`, 400);
+      }
+      seen.add(key);
+      return { garmentName, serviceId, price: Math.round(price) };
+    });
+  }
+  return out;
+}
+
 // @desc    Create add-on
 // @route   POST /api/v1/services/addons
 // @access  Private (Admin/Manager)
@@ -740,12 +799,15 @@ exports.createAddon = asyncHandler(async (req, res, next) => {
     return next(new AppError(`Add-on "${name.trim()}" already exists`, 400));
   }
 
+  const scopeFields = await parseAddonScope(req.body, type);
+
   const addon = await Addon.create({
     name: name.trim(),
     type,
     value: Number(value),
     description: description || '',
     displayOrder: displayOrder != null ? Number(displayOrder) : 0,
+    ...scopeFields,
   });
 
   res.status(201).json({
@@ -775,10 +837,21 @@ exports.updateAddon = asyncHandler(async (req, res, next) => {
     }
     addon.type = type;
   }
-  if (value !== undefined) addon.value = Number(value);
+  if (value !== undefined) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return next(new AppError('Value must be 0 or positive', 400));
+    if ((type ?? addon.type) === 'percentage' && n > 100) {
+      return next(new AppError('Percentage value cannot exceed 100', 400));
+    }
+    addon.value = n;
+  }
   if (description !== undefined) addon.description = description;
   if (displayOrder !== undefined) addon.displayOrder = Number(displayOrder);
   if (active !== undefined) addon.active = Boolean(active);
+  // Changing scope, eligibility or garment pricing only affects orders placed
+  // from now on — existing orders keep the add-on exactly as it was priced
+  // (every order line snapshots its own unitPrice at creation time).
+  Object.assign(addon, await parseAddonScope(req.body, type ?? addon.type));
 
   await addon.save();
   res.status(200).json({
@@ -796,8 +869,10 @@ exports.deleteAddon = asyncHandler(async (req, res, next) => {
   const addon = await Addon.findById(req.params.id);
   if (!addon) return next(new AppError('Add-on not found', 404));
 
-  // Check if this add-on is referenced by any orders
-  const inUse = await Order.countDocuments({ 'addons.addonId': addon._id });
+  // Check if this add-on is referenced by any orders — at order level or on a line
+  const inUse = await Order.countDocuments({
+    $or: [{ 'addons.addonId': addon._id }, { 'items.addons.addonId': addon._id }],
+  });
   if (inUse > 0) {
     // Soft-delete: deactivate so it no longer appears in selection UIs
     addon.active = false;

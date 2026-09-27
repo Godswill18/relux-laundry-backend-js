@@ -198,49 +198,54 @@ Get current user profile.
 **POST** `/orders`  
 🔒 Protected
 
-Create a new laundry order.
+Create a new laundry order. An order is a set of **lines**: one garment, a quantity and one
+service per line, plus optional per-garment add-ons. The same garment can appear on several
+lines with different services.
+
+Every price is set by the server from the price list (`ServiceCategory` = one garment under one
+service). `unitPrice`, `total` and `pricing` in the request are ignored. Staff may add a line that
+is not in the price list by sending `itemType` + `unitPrice` instead of `categoryId`; it is saved
+with `priceSource: "manual"`. Customers must use `categoryId`.
 
 **Request Body:**
 ```json
 {
-  "serviceType": "wash-iron",
-  "orderType": "pickup-delivery",
+  "orderType": "walk-in",
   "items": [
-    {
-      "itemType": "shirt",
-      "quantity": 5,
-      "description": "White shirts"
-    },
-    {
-      "itemType": "trouser",
-      "quantity": 3,
-      "description": "Black trousers"
-    }
+    { "categoryId": "<Shirt under Wash Only>",   "quantity": 2 },
+    { "categoryId": "<Shirt under Wash & Iron>", "quantity": 3,
+      "addons": [{ "addonId": "<Starch>", "quantity": 2 }],
+      "notes": "stain on one collar" },
+    { "categoryId": "<Suit under Dry Cleaning>", "quantity": 1 }
   ],
-  "pickupAddress": {
-    "street": "123 Main St",
-    "city": "Lagos",
-    "state": "Lagos"
-  },
-  "deliveryAddress": {
-    "street": "123 Main St",
-    "city": "Lagos",
-    "state": "Lagos"
-  },
-  "pickupDate": "2024-02-05T10:00:00Z",
-  "scheduledPickupTime": "10:00 AM",
-  "specialInstructions": "Handle with care",
-  "pricing": {
-    "subtotal": 5000,
-    "pickupFee": 500,
-    "deliveryFee": 500,
-    "discount": 0,
-    "tax": 450,
-    "total": 6450
-  },
+  "addons": [{ "addonId": "<an order-level add-on>" }],
   "paymentMethod": "cash"
 }
 ```
+
+Validation (HTTP 400 with a message naming the line): quantities must be whole numbers ≥ 1; an
+add-on quantity cannot exceed its line's quantity; the item/service must be active; a per-garment
+add-on (`scope: "item"`) must be allowed for the line's service and cannot be sent at order level;
+an order-level add-on cannot be put on a line.
+
+Each saved line carries `serviceId`, `serviceName`, `unitPrice`, `total` (service charge),
+`addons[]` (`name`, `quantity`, `unitPrice`, `total`), `addonsTotal`, `lineTotal`, and the garment
+counters `readyQuantity` / `collectedQuantity`. `pricing.addOnsFee` includes line add-ons;
+`pricing.itemAddOnsFee` shows that share. The order carries `totalGarments` (sum of quantities),
+`readyGarments`, `collectedGarments` and `fulfilmentStatus`
+(`processing | partially_ready | ready | partially_collected | collected`).
+
+A fixed-amount, item-scope add-on (`Addon.type: "fixed"`, `scope: "item"`) may price differently by
+garment — e.g. Stain Removal is ₦500 on a Shirt but ₦1,000 on a Bedsheet — via
+`Addon.garmentPricing: [{ garmentName, serviceId?, price }]`, set through
+`POST/PUT /services/addons`. `serviceId` narrows an entry to one service; omitted, it applies to
+that garment under any service. A garment+service match wins over a garment-only match, which
+wins over the add-on's flat `value`. Each order line's `addons[].unitPrice` is resolved once at
+order time and snapshotted — changing `garmentPricing` later never touches an existing order.
+
+Every add-on total across an order can be aggregated client-side from `order.items[].addons[]`
+(sum `quantity` and `total` per `addonId`) — there is no separate summary endpoint, since the
+figures are always derivable from the per-line detail, which remains the source of truth.
 
 **Response (201):**
 ```json
@@ -380,6 +385,48 @@ GET /orders?page=1&limit=10&status=pending
   "reason": "Customer requested cancellation"
 }
 ```
+
+Refused (400) once any garment on the order has been collected.
+
+### 8. Mark Garments Ready
+**POST** `/orders/:id/items/ready`  
+🔒 Staff, Receptionist, Manager, Admin
+
+```json
+{ "items": [{ "itemId": "<line _id>", "quantity": 3 }], "notes": "optional" }
+```
+`{ "all": true }` marks everything still processing. `{ "undo": true, "items": [...] }` moves
+garments back to processing (a correction; never below what has been collected). When every
+garment is ready, an order that was still being processed moves to `ready` automatically.
+
+### 9. Collect Garments (partial or full)
+**POST** `/orders/:id/collections`  
+🔒 Staff, Receptionist, Manager, Admin
+
+```json
+{
+  "items": [{ "itemId": "<line _id>", "quantity": 2 }],
+  "collectedBy": { "name": "Ada", "phone": "080..." },
+  "orderCode": "9WH3U6",
+  "notes": "optional",
+  "idempotencyKey": "<uuid per attempt>"
+}
+```
+Only garments that are ready and not yet collected can be released — anything more is refused
+with the available number. Each call creates a separate collection record (`sequence` 1, 2, …).
+`orderCode`, when sent, must match the order's code. Retrying with the same `idempotencyKey`
+returns the original collection. When the last garment is collected the order becomes
+`completed` if it is paid; otherwise it stays open and the response has `awaitingPayment: true`.
+Concurrent requests for the same garments cannot both succeed.
+
+### 10. Collection History
+**GET** `/orders/:id/collections`  
+🔒 Protected (customers: own orders only; staff identities are omitted for customers)
+
+`GET /orders/:id` also returns `order.fulfilment` (garment summary per line) and
+`order.collections`. `GET /orders?fulfilment=ready_for_collection|partially_ready|partially_collected|ready|collected`
+filters the list; `GET /orders/counts?include=fulfilment` and `/orders/staff-counts?include=fulfilment`
+add counter indicators.
 
 ---
 

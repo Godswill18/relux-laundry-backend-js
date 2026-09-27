@@ -4,9 +4,9 @@ const Order = require('../models/Order.js');
 // The file and any existing documents are left in place deliberately — dropping
 // them is a separate, reviewable cleanup.
 const OrderMedia = require('../models/OrderMedia.js');
+const OrderCollection = require('../models/OrderCollection.js');
 const Customer = require('../models/Customer.js');
 const ServiceLevelConfig = require('../models/ServiceLevelConfig.js');
-const Addon = require('../models/Addon.js');
 const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
@@ -15,7 +15,6 @@ const StageDurationSetting = require('../models/StageDurationSetting.js');
 const LoyaltyLedger = require('../models/LoyaltyLedger.js');
 const LoyaltySetting = require('../models/LoyaltySetting.js');
 const User = require('../models/User.js');
-const ServiceCategory = require('../models/ServiceCategory.js');
 const LoyaltyTier = require('../models/LoyaltyTier.js');
 const PromoCode = require('../models/PromoCode.js');
 const PromoRedemption = require('../models/PromoRedemption.js');
@@ -51,6 +50,21 @@ const {
   getTodayWAT,
 } = require('../utils/helpers.js');
 const notify = require('../utils/notify.js');
+const { priceOrderItems, priceOrderAddons } = require('../utils/orderPricing.js');
+const {
+  summarizeFulfilment,
+  applyCounters,
+  initialTrackingFields,
+  saveGuarded,
+  ensureTracking,
+  applyReady,
+  markAllReady,
+  applyCollect,
+  runFulfilmentChange,
+  syncFulfilmentForStatus,
+  saveWithStatusSync,
+  notifyFulfilment,
+} = require('../utils/orderFulfilment.js');
 const normalizePhone = require('../utils/normalizePhone.js');
 const logger = require('../utils/logger.js');
 const { logAudit } = require('../utils/auditLogger.js');
@@ -92,14 +106,6 @@ async function computeStageDeadline(status) {
     stageDeadlineAt: new Date(Date.now() + minutes * 60 * 1000),
   };
 }
-
-// Care-type multipliers — single source of truth on the backend
-const CARE_TYPE_MULTIPLIERS = {
-  'wash-fold': 1,
-  'wash-only': 1,
-  'iron-only': 0.6,
-  'wash-iron': 1.5,
-};
 
 // ─── Promo code resolution (server-side) ─────────────────────────────────────
 // Mirrors every check in promoController.validatePromoCode so a discount can never
@@ -479,6 +485,21 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   // Auto-classify: staff/admin/manager always creates walk-in (offline); customers always create online
   const isOffline = isStaffRole;
 
+  // ── Lines: priced on the server, before anything is written ──────────────
+  // Every line is validated and priced from the price list here (garment +
+  // service + quantity + per-garment add-ons), so a bad request fails before a
+  // walk-in customer record is created for it. Prices in the request are
+  // ignored. Staff may add a counter item that is not in the price list;
+  // customers may not. See utils/orderPricing.js.
+  const {
+    items: pricedItems,
+    subtotal: baseSubtotal,
+    itemAddonsFee,
+  } = await priceOrderItems(items, { allowManual: isStaffRole, tracked: true });
+
+  // Order-level add-ons (fixed per order, or % of the item subtotal)
+  const { addons: resolvedAddons, fee: orderAddonsFee } = await priceOrderAddons(addonsPayload, baseSubtotal);
+
   // Determine the customer for this order
   let orderCustomerId = null;
   let orderCustomerRefId = null;
@@ -576,29 +597,6 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     }
   }
 
-  // Validate that every item includes a serviceType
-  if (Array.isArray(items) && items.length > 0) {
-    const missing = items.find((item) => !item.serviceType);
-    if (missing) {
-      return next(new AppError(`Item "${missing.itemType || 'unknown'}" is missing a service type`, 400));
-    }
-  }
-
-  // Recompute unitPrice from DB for every item — never trust frontend price
-  let pricedItems = items || [];
-  if (pricedItems.length > 0) {
-    pricedItems = await Promise.all(
-      pricedItems.map(async (item) => {
-        if (!item.categoryId) return item; // walk-in items without a category pass through
-        const category = await ServiceCategory.findById(item.categoryId).select('basePrice').lean();
-        if (!category) return item; // unknown category — leave as-is
-        const multiplier = CARE_TYPE_MULTIPLIERS[item.serviceType] ?? 1;
-        const unitPrice = Math.round(category.basePrice * multiplier);
-        return { ...item, unitPrice, total: unitPrice * (item.quantity || 1) };
-      })
-    );
-  }
-
   // Service-level surcharge: look up percentage from DB (dynamic, admin-controlled)
   let resolvedServiceLevelId   = null;
   let resolvedServiceLevelName = serviceLevel || 'standard';
@@ -623,30 +621,13 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     }
   }
 
-  const baseSubtotal = pricedItems.reduce((acc, item) => acc + (item.unitPrice || 0) * (item.quantity || 1), 0);
   const serviceFee   = Math.round(baseSubtotal * serviceLevelPct / 100 * 100) / 100;
 
-  // Add-ons fee: resolve from DB — dynamic, admin-controlled
-  let addOnsFee = 0;
-  const resolvedAddons = [];
-  if (Array.isArray(addonsPayload) && addonsPayload.length > 0) {
-    for (const a of addonsPayload) {
-      if (!a.addonId) continue;
-      const addonDoc = await Addon.findById(a.addonId).lean();
-      if (!addonDoc || !addonDoc.active) continue;
-      const calculatedAmount = addonDoc.type === 'fixed'
-        ? addonDoc.value
-        : Math.round(baseSubtotal * addonDoc.value / 100);
-      addOnsFee += calculatedAmount;
-      resolvedAddons.push({
-        addonId: addonDoc._id,
-        name: addonDoc.name,
-        type: addonDoc.type,
-        value: addonDoc.value,
-        calculatedAmount,
-      });
-    }
-  }
+  // Every add-on charge: the order-level ones plus each line's per-garment
+  // add-ons. Kept in the one existing addOnsFee field so every receipt, report
+  // and total that already reads it stays correct; itemAddOnsFee records the
+  // line share for the breakdown.
+  const addOnsFee = orderAddonsFee + itemAddonsFee;
 
   // ── Pickup / delivery fees (server-derived) ───────────────────────────────
   // These used to be taken straight from the request body. Every other money
@@ -790,9 +771,12 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     serviceFee,
     addOnsFee
   );
+  orderPricing.itemAddOnsFee = itemAddonsFee;
 
   // Create order
   const orderDoc = {
+    // Garments are tracked per line from the start (ready / collected counts)
+    ...initialTrackingFields(pricedItems),
     customer: orderCustomerId,
     customerId: orderCustomerRefId || undefined,
     orderSource: isOffline ? 'offline' : 'online',
@@ -1110,6 +1094,14 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       }
       if (req.query.serviceType) query.serviceType = req.query.serviceType;
       if (req.query.customer) query.customer = req.query.customer;
+      // A customer's full history by their customer record — walk-in orders
+      // included, which ?customer= (the portal account) cannot find.
+      if (req.query.customerId) {
+        if (!mongoose.isValidObjectId(req.query.customerId)) {
+          return next(new AppError('Invalid customer', 400, ERROR_CODES.VALIDATION_ERROR));
+        }
+        query.customerId = new mongoose.Types.ObjectId(String(req.query.customerId));
+      }
       if (req.query.orderSource) query.orderSource = req.query.orderSource;
 
       if (req.query.assignedStaff === 'me') {
@@ -1128,6 +1120,27 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       } else if (req.query.deliveredBy) {
         query.deliveredBy = req.query.deliveredBy;
       }
+    }
+
+    // Garment filters for the counter: ?fulfilment=
+    //   partially_ready | ready | partially_collected | collected
+    //   ready_for_collection — at least one garment ready and not yet collected
+    //                          (orders placed before tracking: status 'ready')
+    const fulfilmentFilter = String(req.query.fulfilment || '');
+    if (['partially_ready', 'ready', 'partially_collected', 'collected'].includes(fulfilmentFilter)) {
+      query.fulfilmentStatus = fulfilmentFilter;
+      if (!query.status) query.status = { $ne: 'cancelled' };
+    } else if (fulfilmentFilter === 'ready_for_collection') {
+      query.$and = [
+        ...(query.$and || []),
+        { status: { $nin: ['cancelled', 'delivered', 'completed', 'out-for-delivery'] } },
+        {
+          $or: [
+            { itemTracking: true, $expr: { $gt: ['$readyGarments', '$collectedGarments'] } },
+            { itemTracking: { $ne: true }, status: 'ready' },
+          ],
+        },
+      ];
     }
 
     // Delivery-role: restrict to delivery-type orders only.
@@ -1159,12 +1172,26 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     delete query.$or;
     // NB: query.$and is intentionally preserved — it carries the delivery-role
     // scope, which a search must not be able to escape.
-    query.$or = [
+    const searchOr = [
       { orderNumber: regex },
       { code: regex },
       { 'walkInCustomer.name': regex },
       { 'walkInCustomer.phone': regex },
     ];
+    // Online orders carry no walk-in name/phone — find them through the
+    // customer record and the portal account instead. A phone typed as 080…
+    // also matches +234… by its last 9 digits.
+    const digits = raw.replace(/\D/g, '');
+    const phoneTail = digits.length >= 7 ? new RegExp(digits.slice(-9)) : null;
+    const personMatch = [{ name: regex }, ...(phoneTail ? [{ phone: phoneTail }] : [])];
+    const [matchedCustomers, matchedUsers] = await Promise.all([
+      Customer.find({ $or: personMatch }).select('_id').limit(200).lean(),
+      User.find({ role: 'customer', $or: personMatch }).select('_id').limit(200).lean(),
+    ]);
+    if (matchedCustomers.length) searchOr.push({ customerId: { $in: matchedCustomers.map((c) => c._id) } });
+    if (matchedUsers.length) searchOr.push({ customer: { $in: matchedUsers.map((u) => u._id) } });
+    if (phoneTail) searchOr.push({ 'walkInCustomer.phone': phoneTail });
+    query.$or = searchOr;
   }
 
   // Pagination
@@ -1197,7 +1224,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Orders fetched successfully',
-    data: { orders },
+    data: { orders: orders.map((o) => withFulfilment(o, { customerScope: isCustomerScope })) },
     pagination: {
       page,
       limit,
@@ -1206,6 +1233,71 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     },
   });
 });
+
+// Counter indicators for open orders: how many are partly ready, have garments
+// waiting to be collected, or have been partly collected — and the garments
+// behind those numbers. Orders placed before garment tracking are read from
+// their status (a legacy order at 'ready' has all its garments waiting).
+async function fulfilmentIndicators() {
+  const [row] = await Order.aggregate([
+    { $match: { status: { $nin: ['cancelled', 'delivered', 'completed'] } } },
+    {
+      $project: {
+        status: 1,
+        total: { $ifNull: ['$totalGarments', { $sum: '$items.quantity' }] },
+        tracked: { $eq: ['$itemTracking', true] },
+        readyG: '$readyGarments',
+        collectedG: '$collectedGarments',
+      },
+    },
+    {
+      $project: {
+        status: 1,
+        total: 1,
+        ready: {
+          $cond: ['$tracked', { $ifNull: ['$readyG', 0] },
+            { $cond: [{ $in: ['$status', ['ready', 'out-for-delivery']] }, '$total', 0] }],
+        },
+        collected: { $cond: ['$tracked', { $ifNull: ['$collectedG', 0] }, 0] },
+      },
+    },
+    {
+      $project: {
+        status: 1,
+        total: 1,
+        ready: 1,
+        collected: 1,
+        // Waiting at the counter — not on a delivery run
+        waiting: {
+          $cond: [{ $eq: ['$status', 'out-for-delivery'] }, 0, { $subtract: ['$ready', '$collected'] }],
+        },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        partiallyReady: {
+          $sum: { $cond: [{ $and: [{ $gt: ['$ready', 0] }, { $lt: ['$ready', '$total'] }, { $eq: ['$collected', 0] }] }, 1, 0] },
+        },
+        readyForCollection: { $sum: { $cond: [{ $gt: ['$waiting', 0] }, 1, 0] } },
+        partiallyCollected: {
+          $sum: { $cond: [{ $and: [{ $gt: ['$collected', 0] }, { $lt: ['$collected', '$total'] }] }, 1, 0] },
+        },
+        garmentsProcessing: { $sum: { $subtract: ['$total', '$ready'] } },
+        garmentsAwaitingCollection: { $sum: '$waiting' },
+        garmentsOutstanding: { $sum: { $subtract: ['$total', '$collected'] } },
+      },
+    },
+  ]);
+  return {
+    partiallyReady: row?.partiallyReady || 0,
+    readyForCollection: row?.readyForCollection || 0,
+    partiallyCollected: row?.partiallyCollected || 0,
+    garmentsProcessing: row?.garmentsProcessing || 0,
+    garmentsAwaitingCollection: row?.garmentsAwaitingCollection || 0,
+    garmentsOutstanding: row?.garmentsOutstanding || 0,
+  };
+}
 
 // @desc    Get staff-specific tab counts per status (11-workflow)
 // @route   GET /api/v1/orders/staff-counts
@@ -1243,9 +1335,14 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
 
   const byStatus = Object.fromEntries(STATUSES.map((s, i) => [s, results[i]]));
 
+  // Garment indicators only on request (?include=fulfilment): the staff app
+  // sums every value in this response, so an object here would corrupt the
+  // total on any client that predates it.
+  const includeFulfilment = String(req.query.include || '').split(',').includes('fulfilment');
+
   res.status(200).json({
     success: true,
-    data: byStatus,
+    data: { ...byStatus, ...(includeFulfilment ? { fulfilment: await fulfilmentIndicators() } : {}) },
   });
 });
 
@@ -1271,9 +1368,12 @@ exports.getOrderCounts = asyncHandler(async (req, res) => {
     .filter((s) => !['delivered', 'completed', 'cancelled'].includes(s))
     .reduce((sum, s) => sum + byStatus[s], 0);
 
+  // Additive and only on request (?include=fulfilment) — see getStaffCounts
+  const includeFulfilment = String(req.query.include || '').split(',').includes('fulfilment');
+
   res.status(200).json({
     success: true,
-    data: { ...byStatus, total, active },
+    data: { ...byStatus, total, active, ...(includeFulfilment ? { fulfilment: await fulfilmentIndicators() } : {}) },
   });
 });
 
@@ -1315,7 +1415,10 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
 
   res.status(200).json({
     success: true,
-    data: { totalRevenue, todayRevenue, totalOrders, activeOrders, pendingPayments, todayOrders },
+    data: {
+      totalRevenue, todayRevenue, totalOrders, activeOrders, pendingPayments, todayOrders,
+      fulfilment: await fulfilmentIndicators(),
+    },
   });
 });
 
@@ -1337,7 +1440,8 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
     .populate('serviceLevelId', 'name percentageAdjustment priorityLevel')
     .populate('statusHistory.updatedBy', 'name role')
     .populate('deliveryZoneId', 'name fee rushFee radiusKm')
-    .populate('pickupWindowId', 'startTime endTime dayOfWeek baseFee');
+    .populate('pickupWindowId', 'startTime endTime dayOfWeek baseFee')
+    .populate('fulfilmentHistory.by', 'name role');
 
   if (!order) {
     return next(new AppError('Order not found', 404));
@@ -1350,10 +1454,16 @@ exports.getOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Not authorized to access this order', 403));
   }
 
+  // Garment picture + collection history (orders placed before tracking have
+  // no collection records — their fulfilment is marked recorded: false).
+  const collections = order.itemTracking
+    ? await OrderCollection.find({ orderId: order._id }).sort('sequence').populate('releasedBy', 'name role').lean()
+    : [];
+
   res.status(200).json({
     success: true,
     message: 'Order fetched successfully',
-    data: { order },
+    data: { order: withFulfilment(order, { customerScope: isCustomerScope, collections }) },
   });
 });
 
@@ -1402,20 +1512,22 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
   // ── Items + price recalculation ────────────────────────────────────────────
   let newTotal = previousTotal;
 
+  let itemsChanged = false;
   if (req.body.items !== undefined) {
-    // Re-price every item from DB — never trust frontend prices
-    const pricedItems = await Promise.all(
-      req.body.items.map(async (item) => {
-        if (!item.categoryId) return item;
-        const category = await ServiceCategory.findById(item.categoryId).select('basePrice').lean();
-        if (!category) return item;
-        const MULTIPLIERS = { 'wash-fold': 1, 'wash-only': 1, 'iron-only': 0.6, 'wash-iron': 1.5 };
-        const multiplier = MULTIPLIERS[item.serviceType] ?? 1;
-        const unitPrice = Math.round(category.basePrice * multiplier);
-        return { ...item, unitPrice, total: unitPrice * (item.quantity || 1) };
-      })
-    );
+    // Priced on the server (see utils/orderPricing). A line sent back with its
+    // _id keeps the price agreed when it was ordered and its garment counts;
+    // a line whose garments are already ready or collected can't be removed,
+    // reduced below what's ready, or switched to another item/service.
+    const {
+      items: pricedItems,
+      itemAddonsFee,
+    } = await priceOrderItems(req.body.items, {
+      allowManual: true,
+      existingItems: order.items,
+      tracked: !!order.itemTracking,
+    });
     order.items = pricedItems;
+    itemsChanged = true;
 
     // Recalculate full pricing — look up service level from DB
     const currentSLId = req.body.serviceLevelId || order.serviceLevelId;
@@ -1433,38 +1545,25 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     const baseSubtotal = pricedItems.reduce((acc, i) => acc + (i.unitPrice || 0) * (i.quantity || 1), 0);
     const serviceFee = Math.round(baseSubtotal * updateSLPct / 100 * 100) / 100;
 
-    // Resolve add-ons fee from DB (or fall back to existing if not provided)
-    let addOnsFee = 0;
+    // Order-level add-ons: re-resolved when sent, otherwise the order-level
+    // share already charged is kept as it was. Line add-ons always come from
+    // the lines just priced.
+    let orderAddonsFee;
     if (Array.isArray(req.body.addons)) {
-      const addonsForUpdate = [];
-      for (const a of req.body.addons) {
-        if (!a.addonId) continue;
-        const addonDoc = await Addon.findById(a.addonId).lean();
-        if (!addonDoc || !addonDoc.active) continue;
-        const base = pricedItems.reduce((acc, i) => acc + (i.unitPrice || 0) * (i.quantity || 1), 0);
-        const calculatedAmount = addonDoc.type === 'fixed'
-          ? addonDoc.value
-          : Math.round(base * addonDoc.value / 100);
-        addOnsFee += calculatedAmount;
-        addonsForUpdate.push({
-          addonId: addonDoc._id,
-          name: addonDoc.name,
-          type: addonDoc.type,
-          value: addonDoc.value,
-          calculatedAmount,
-        });
-      }
-      order.addons = addonsForUpdate;
+      const resolved = await priceOrderAddons(req.body.addons, baseSubtotal);
+      order.addons = resolved.addons;
+      orderAddonsFee = resolved.fee;
     } else {
-      // No addons change — preserve existing add-ons fee from pricing
-      addOnsFee = order.pricing?.addOnsFee || 0;
+      orderAddonsFee = Math.max(0, (order.pricing?.addOnsFee || 0) - (order.pricing?.itemAddOnsFee || 0));
     }
+    const addOnsFee = orderAddonsFee + itemAddonsFee;
 
     const pickupFee   = req.body.pickupFee   !== undefined ? Number(req.body.pickupFee)   : (order.pricing?.pickupFee   || 0);
     const deliveryFee = req.body.deliveryFee !== undefined ? Number(req.body.deliveryFee) : (order.pricing?.deliveryFee || 0);
     const discount    = req.body.discount    !== undefined ? Number(req.body.discount)    : (order.pricing?.discount    || 0);
 
     const newPricing = calculateOrderPricing(pricedItems, pickupFee, deliveryFee, discount, serviceFee, addOnsFee);
+    newPricing.itemAddOnsFee = itemAddonsFee;
     order.pricing = newPricing;
     order.total   = newPricing.total;
     // Keep the top-level mirror in step with pricing.deliveryFee — createOrder
@@ -1479,6 +1578,14 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
   }
 
   order.lastUpdatedById = req.user.id;
+
+  // Commit changed lines first, conditional on nobody having marked or
+  // collected garments on this order since it was read — and before any money
+  // moves below, so a rejected edit can never have issued a refund.
+  if (itemsChanged) {
+    applyCounters(order);
+    await saveGuarded(order);
+  }
 
   // ── Price-difference handling + wallet refund ──────────────────────────────
   const difference = Math.round((previousTotal - newTotal) * 100) / 100; // positive = overpaid → refund
@@ -1626,6 +1733,14 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     ));
   }
 
+  // Garments already handed to the customer can't be un-released by cancelling
+  if (status === 'cancelled' && order.itemTracking && (order.collectedGarments || 0) > 0) {
+    return next(new AppError(
+      `${order.collectedGarments} garment(s) on this order have already been collected, so it can't be cancelled.`,
+      400
+    ));
+  }
+
   const previousStatus = order.status;
 
   if (order.status === 'cancelled') {
@@ -1665,7 +1780,20 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     notes,
   });
 
-  await order.save();
+  // Keep the garments consistent with a whole-order status: 'ready' marks every
+  // garment ready; 'delivered'/'completed' also records the hand-over of
+  // everything still outstanding as a collection. Saved together, and only if
+  // nobody moved garments on this order in the meantime.
+  if (order.itemTracking) {
+    const statusCollection = syncFulfilmentForStatus(order, status, req.user);
+    // The status notification below already tells the customer it's ready
+    if (status === 'ready' && !order.readyNotifications?.fullAt) {
+      order.set('readyNotifications.fullAt', new Date());
+    }
+    await saveWithStatusSync(order, statusCollection);
+  } else {
+    await order.save();
+  }
 
   await logAudit({
     actorUserId: req.user.id,
@@ -1838,10 +1966,17 @@ exports.lookupByQR = asyncHandler(async (req, res, next) => {
     ? []
     : ['updateStatus', 'updatePayment', 'assignStaff'];
 
+  // Garment picture + collection history, same as GET /orders/:id — lets the
+  // scan-to-deliver screen offer partial collection (release only what's
+  // ready) instead of forcing every scan to mean "the whole order left".
+  const collections = order.itemTracking
+    ? await OrderCollection.find({ orderId: order._id }).sort('sequence').populate('releasedBy', 'name role').lean()
+    : [];
+
   res.status(200).json({
     success: true,
     message: isCancelled ? 'This order has been cancelled' : 'Order found',
-    data: { order, allowedActions, isCancelled },
+    data: { order: withFulfilment(order, { collections }), allowedActions, isCancelled },
   });
 });
 
@@ -1891,7 +2026,13 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
     timestamp: new Date(),
   });
 
-  await order.save();
+  // Delivered = every outstanding garment handed over, recorded as a collection
+  if (order.itemTracking) {
+    const deliveryCollection = syncFulfilmentForStatus(order, 'delivered', req.user, { source: 'delivery_scan' });
+    await saveWithStatusSync(order, deliveryCollection);
+  } else {
+    await order.save();
+  }
 
   const io = req.app.get('io');
 
@@ -2490,6 +2631,14 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order cannot be cancelled', 400));
   }
 
+  // Garments already handed over can't be un-released by cancelling
+  if (order.itemTracking && (order.collectedGarments || 0) > 0) {
+    return next(new AppError(
+      `${order.collectedGarments} garment(s) on this order have already been collected, so it can't be cancelled.`,
+      400
+    ));
+  }
+
   const statusBeforeCancel = order.status;
 
   order.status = 'cancelled';
@@ -2700,6 +2849,11 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
 // server-derived component already settled on this order.
 async function recalculateOrderTotal(order) {
   const previousTotal = order.total || 0;
+  const subtotal = order.items.reduce((a, i) => a + (i.unitPrice || 0) * (i.quantity || 1), 0);
+  // addOnsFee = the order-level add-ons already charged (kept as they were)
+  // plus every line's per-garment add-ons (which move with the lines).
+  const itemAddOnsFee = order.items.reduce((a, i) => a + (i.addonsTotal || 0), 0);
+  const orderAddOnsFee = Math.max(0, (order.pricing?.addOnsFee || 0) - (order.pricing?.itemAddOnsFee || 0));
   const pricing = calculateOrderPricing(
     order.items,
     order.pricing?.pickupFee   || 0,
@@ -2707,10 +2861,10 @@ async function recalculateOrderTotal(order) {
     order.pricing?.discount    || 0,
     // Service-level surcharge is a percentage of the item subtotal, so it has to
     // move with the items rather than be carried over as a frozen figure.
-    Math.round((order.items.reduce((a, i) => a + (i.unitPrice || 0) * (i.quantity || 1), 0))
-      * (order.serviceLevelPercentage || 0) / 100 * 100) / 100,
-    order.pricing?.addOnsFee || 0
+    Math.round(subtotal * (order.serviceLevelPercentage || 0) / 100 * 100) / 100,
+    orderAddOnsFee + itemAddOnsFee
   );
+  pricing.itemAddOnsFee = itemAddOnsFee;
   order.pricing = pricing;
   order.total   = pricing.total;
   return { previousTotal, newTotal: pricing.total };
@@ -2735,47 +2889,18 @@ exports.addOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
-  const { itemType, categoryId, serviceType, serviceName, description, condition, careType } = req.body;
-  const quantity = parseInt(req.body.quantity, 10);
-
-  if (!Number.isFinite(quantity) || quantity < 1) {
-    return next(new AppError('Quantity must be a whole number of at least 1', 400, ERROR_CODES.VALIDATION_ERROR));
-  }
-
-  // Price from the DB — never from the request body
-  let unitPrice = 0;
-  let categoryName;
-  if (categoryId) {
-    const category = await ServiceCategory.findById(categoryId).select('basePrice name').lean();
-    if (!category) {
-      return next(new AppError('Service category not found', 404));
-    }
-    categoryName = category.name;
-    unitPrice = Math.round(category.basePrice * (CARE_TYPE_MULTIPLIERS[serviceType] ?? 1));
-  } else if (req.user.role !== 'customer' && req.body.unitPrice !== undefined) {
-    // Counter-entered item with no catalogue category — staff set the price,
-    // clamped so it can never be negative.
-    const manual = Number(req.body.unitPrice);
-    unitPrice = Number.isFinite(manual) && manual > 0 ? Math.round(manual) : 0;
-  }
-
-  order.items.push({
-    itemType: itemType || categoryName || 'Item',
-    serviceType,
-    serviceName,
-    quantity,
-    unitPrice,
-    total: unitPrice * quantity,
-    careType,
-    categoryId,
-    categoryName,
-    description,
-    condition,
+  // Same pricing and validation as order creation — price from the DB, never
+  // from the request body; a counter item outside the price list is 'manual'.
+  const { items: [line] } = await priceOrderItems([{ ...req.body, _id: undefined }], {
+    allowManual: true,
+    tracked: !!order.itemTracking,
   });
+  order.items.push(line);
 
   const { previousTotal, newTotal } = await recalculateOrderTotal(order);
   order.lastUpdatedById = req.user.id;
-  await order.save();
+  applyCounters(order);
+  await saveGuarded(order);
 
   await logAudit({
     actorUserId: req.user.id,
@@ -2784,7 +2909,15 @@ exports.addOrderItem = asyncHandler(async (req, res, next) => {
     targetId: order._id.toString(),
     before: { total: previousTotal },
     after: { total: newTotal },
-    metadata: { orderNumber: order.orderNumber, itemType: itemType || categoryName, quantity, unitPrice },
+    metadata: {
+      orderNumber: order.orderNumber,
+      itemType: line.itemType,
+      serviceName: line.serviceName,
+      quantity: line.quantity,
+      unitPrice: line.unitPrice,
+      addons: line.addons.map((a) => ({ name: a.name, quantity: a.quantity })),
+      priceSource: line.priceSource,
+    },
   });
 
   const io = req.app.get('io');
@@ -2822,12 +2955,29 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Order item not found', 404));
   }
 
-  const removed = { itemType: item.itemType, quantity: item.quantity, unitPrice: item.unitPrice };
+  // A line whose garments are ready or already handed over is part of the
+  // order's history — removing it would erase that.
+  if ((item.readyQuantity || 0) > 0 || (item.collectedQuantity || 0) > 0) {
+    return next(new AppError(
+      `Garments on "${item.itemType}" are already marked ready or collected, so the line can't be removed.`,
+      400,
+      ERROR_CODES.VALIDATION_ERROR
+    ));
+  }
+
+  const removed = {
+    itemType: item.itemType,
+    serviceName: item.serviceName,
+    quantity: item.quantity,
+    unitPrice: item.unitPrice,
+    addonsTotal: item.addonsTotal || 0,
+  };
   item.deleteOne();
 
   const { previousTotal, newTotal } = await recalculateOrderTotal(order);
   order.lastUpdatedById = req.user.id;
-  await order.save();
+  applyCounters(order);
+  await saveGuarded(order);
 
   await logAudit({
     actorUserId: req.user.id,
@@ -2851,6 +3001,253 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
   });
 });
 
+// ─── Garment readiness & collection ──────────────────────────────────────────
+// See utils/orderFulfilment.js for the model. Every handler below changes the
+// order through runFulfilmentChange, which re-reads the order, validates the
+// request against the latest counts, and saves conditionally (inside a
+// transaction on Atlas) — so concurrent requests can never over-release.
+
+// Order as returned to a client, with its garment picture attached. Customers
+// get their garments and collection history but not internal staff detail.
+function withFulfilment(order, { customerScope = false, collections } = {}) {
+  const payload = typeof order.toObject === 'function' ? order.toObject() : { ...order };
+  payload.fulfilment = summarizeFulfilment(payload);
+  if (collections) {
+    payload.collections = customerScope
+      ? collections.map(({ releasedBy, releasedByRole, idempotencyKey, notes, ...rest }) => rest)
+      : collections.map(({ idempotencyKey, ...rest }) => rest);
+  }
+  if (customerScope) delete payload.fulfilmentHistory;
+  return payload;
+}
+
+// Emit the realtime events a garment change produces.
+function emitFulfilmentUpdate(req, order, changes = {}) {
+  const io = req.app.get('io');
+  if (!io) return;
+  io.to(`order-${order._id}`).emit('order:updated', {
+    orderId: order._id,
+    status: order.status,
+    fulfilmentStatus: order.fulfilmentStatus,
+    fulfilment: summarizeFulfilment(order),
+  });
+  if (changes.statusChangedTo) {
+    io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: order.status });
+    io.emit('order:status-updated', {
+      orderId: order._id,
+      status: order.status,
+      updatedById: String(req.user.id),
+      updatedByName: req.user.name || '',
+    });
+    io.emit('order:timer-updated', {
+      orderId: order._id, status: order.status, stageDeadlineAt: null, stageDurationMinutes: null,
+    });
+  }
+}
+
+// When garments moved the workflow status, record it exactly as a status change
+// through the status control would be — and when that closes the order, run
+// the same loyalty and referral rewards.
+async function afterFulfilmentStatusChange(req, order, changes, reason) {
+  if (!changes.statusChangedTo) return;
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_STATUS_CHANGED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    before: { status: changes.previousStatus },
+    after: { status: changes.statusChangedTo },
+    metadata: { orderNumber: order.orderNumber, source: reason },
+  });
+  if (changes.statusChangedTo === 'completed') {
+    const io = req.app.get('io');
+    await processReferralReward(order, 'completed', io).catch((e) =>
+      logger.error(`[fulfilment] Referral processing failed for ${order.orderNumber}: ${e.message}`));
+    await awardOrderPoints(order, io).catch((e) =>
+      logger.error(`[fulfilment] Loyalty award failed for ${order.orderNumber}: ${e.message}`));
+  }
+}
+
+// @desc    Mark garments ready — or, with undo, move them back to processing
+// @route   POST /api/v1/orders/:id/items/ready
+// @body    { items: [{ itemId, quantity }] } | { all: true }, undo?: boolean, notes?: string
+// @access  Private (staff, receptionist, manager, admin)
+exports.markItemsReady = asyncHandler(async (req, res, next) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return next(new AppError('Order not found', 404));
+  const { items, all, notes } = req.body || {};
+  const undo = req.body?.undo === true;
+  const cleanNotes = typeof notes === 'string' ? notes.trim().slice(0, 500) || undefined : undefined;
+
+  let moved = 0;
+  const { order, changes } = await runFulfilmentChange(req.params.id, req.user, (o) => {
+    if (o.status === 'cancelled') throw new AppError('This order is cancelled', 400);
+    ensureTracking(o, req.user);
+    if (all === true && !undo) {
+      moved = markAllReady(o, req.user, { notes: cleanNotes });
+      if (!moved) throw new AppError('Every garment on this order is already ready', 400, ERROR_CODES.VALIDATION_ERROR);
+    } else {
+      moved = applyReady(o, items, req.user, { undo, notes: cleanNotes })
+        .reduce((sum, e) => sum + e.quantity, 0);
+    }
+  });
+
+  await logAudit({
+    actorUserId: req.user.id,
+    action: undo ? 'ORDER_ITEMS_READY_UNDONE' : 'ORDER_ITEMS_MARKED_READY',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    after: { readyGarments: order.readyGarments, totalGarments: order.totalGarments, fulfilmentStatus: order.fulfilmentStatus },
+    metadata: {
+      orderNumber: order.orderNumber,
+      quantity: moved,
+      items: order.fulfilmentHistory?.[order.fulfilmentHistory.length - 1]?.items,
+      notes: cleanNotes,
+    },
+  });
+  await afterFulfilmentStatusChange(req, order, changes, 'garments_ready');
+  emitFulfilmentUpdate(req, order, changes);
+  if (!undo) await notifyFulfilment(req.app.get('io'), order, changes);
+
+  const summary = summarizeFulfilment(order);
+  res.status(200).json({
+    success: true,
+    message: undo
+      ? `${moved} garment(s) moved back to processing`
+      : `${moved} garment(s) marked ready — ${summary.readyGarments} of ${summary.totalGarments} now ready`,
+    data: { order: withFulfilment(order), statusChangedTo: changes.statusChangedTo },
+  });
+});
+
+// @desc    Release ready garments to the customer (partial or full collection)
+// @route   POST /api/v1/orders/:id/collections
+// @body    { items: [{ itemId, quantity }], collectedBy?: { name, phone }, orderCode?, notes?, idempotencyKey? }
+// @access  Private (staff, receptionist, manager, admin)
+exports.collectItems = asyncHandler(async (req, res, next) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return next(new AppError('Order not found', 404));
+  const { items, collectedBy, orderCode, notes } = req.body || {};
+  const idempotencyKey = typeof req.body?.idempotencyKey === 'string'
+    ? req.body.idempotencyKey.trim().slice(0, 100) || undefined
+    : undefined;
+
+  // A retried request returns the collection it already made
+  const replay = async () => {
+    const existing = await OrderCollection.findOne({ orderId: req.params.id, idempotencyKey })
+      .populate('releasedBy', 'name role').lean();
+    if (!existing) return false;
+    const current = await Order.findById(req.params.id);
+    res.status(200).json({
+      success: true,
+      message: 'This collection was already recorded',
+      data: { order: withFulfilment(current), collection: existing, replayed: true },
+    });
+    return true;
+  };
+  if (idempotencyKey && await replay()) return;
+
+  const text = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined);
+  const who = collectedBy && typeof collectedBy === 'object'
+    ? { name: text(collectedBy.name, 120), phone: text(collectedBy.phone, 30) }
+    : undefined;
+  const code = text(orderCode, 20);
+
+  let result;
+  try {
+    result = await runFulfilmentChange(req.params.id, req.user, (o) => {
+      if (o.status === 'cancelled') throw new AppError('This order is cancelled', 400);
+      // The code on the customer's receipt, when the counter checks it. Checked
+      // for every collection — each visit is verified on its own.
+      if (code && o.code && code.toUpperCase() !== String(o.code).toUpperCase()) {
+        throw new AppError('The order code entered does not match this order', 400, ERROR_CODES.VALIDATION_ERROR);
+      }
+      ensureTracking(o, req.user);
+      return {
+        collection: applyCollect(o, items, req.user, {
+          method: 'counter',
+          collectedBy: who && (who.name || who.phone) ? who : undefined,
+          verification: code ? 'order_code' : 'none',
+          notes: text(notes, 500),
+          idempotencyKey,
+        }),
+      };
+    });
+  } catch (err) {
+    // Two identical requests raced: the loser returns the winner's record
+    if (err.code === 11000 && err.keyPattern?.idempotencyKey && await replay()) return;
+    throw err;
+  }
+
+  const { order, collection, changes } = result;
+  await logAudit({
+    actorUserId: req.user.id,
+    action: 'ORDER_ITEMS_COLLECTED',
+    targetType: 'Order',
+    targetId: order._id.toString(),
+    after: {
+      collectedGarments: order.collectedGarments,
+      totalGarments: order.totalGarments,
+      fulfilmentStatus: order.fulfilmentStatus,
+    },
+    metadata: {
+      orderNumber: order.orderNumber,
+      collectionId: collection._id,
+      sequence: collection.sequence,
+      items: collection.items,
+      quantity: collection.totalQuantity,
+      verification: collection.verification,
+      paymentStatus: order.paymentStatus,
+    },
+  });
+  await afterFulfilmentStatusChange(req, order, changes, 'garments_collected');
+  emitFulfilmentUpdate(req, order, changes);
+  await notifyFulfilment(req.app.get('io'), order, changes, { collection });
+
+  const summary = summarizeFulfilment(order);
+  let message = `Collection #${collection.sequence} recorded — ${collection.totalQuantity} garment(s) released.`;
+  if (summary.outstandingGarments > 0) {
+    message += ` ${summary.awaitingCollection} ready and ${summary.processingGarments} still processing remain.`;
+  } else if (changes.awaitingPayment) {
+    message += ' All garments collected — payment is still outstanding, so the order stays open.';
+  } else {
+    message += ' All garments collected.';
+  }
+
+  res.status(201).json({
+    success: true,
+    message,
+    data: {
+      order: withFulfilment(order),
+      collection: collection.toObject(),
+      awaitingPayment: changes.awaitingPayment,
+      statusChangedTo: changes.statusChangedTo,
+    },
+  });
+});
+
+// @desc    Collection history for an order
+// @route   GET /api/v1/orders/:id/collections
+// @access  Private (customers: own orders only)
+exports.getOrderCollections = asyncHandler(async (req, res, next) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return next(new AppError('Order not found', 404));
+  const order = await Order.findById(req.params.id);
+  if (!order) return next(new AppError('Order not found', 404));
+
+  const customerScope = req.user.role === 'customer' || req.query.scope === 'customer';
+  if (customerScope && !customerCanAccessOrder(req.user, order)) {
+    return next(new AppError('Not authorized to access this order', 403));
+  }
+
+  const collections = await OrderCollection.find({ orderId: order._id })
+    .sort('sequence')
+    .populate('releasedBy', 'name role')
+    .lean();
+  const payload = withFulfilment(order, { customerScope, collections });
+
+  res.status(200).json({
+    success: true,
+    message: 'Collections fetched successfully',
+    data: { collections: payload.collections, fulfilment: payload.fulfilment },
+  });
+});
 
 // @desc    Add order media
 // @route   POST /api/v1/orders/:id/media

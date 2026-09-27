@@ -51,11 +51,17 @@ function resolveCustomer(order) {
   };
 }
 
+// One entry per order line — garment, quantity, service and any per-garment
+// add-ons — led by the garment count (sum of quantities, not of lines).
 function formatItems(order) {
   if (!Array.isArray(order.items) || order.items.length === 0) return 'N/A';
-  return order.items
-    .map((i) => `${i.categoryName || i.itemType || 'Item'} x${i.quantity}`)
-    .join(', ');
+  const garments = order.items.reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const lines = order.items.map((i) => {
+    const service = i.serviceName && i.serviceName !== 'laundry' ? ` (${i.serviceName})` : '';
+    const addons = (i.addons || []).map((a) => ` + ${a.name || 'Add-on'} x${a.quantity}`).join('');
+    return `${i.categoryName || i.itemType || 'Item'} x${i.quantity}${service}${addons}`;
+  });
+  return `${garments} garment${garments === 1 ? '' : 's'}: ${lines.join(', ')}`;
 }
 
 function formatAddons(order) {

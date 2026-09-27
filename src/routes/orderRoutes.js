@@ -24,11 +24,20 @@ const {
   scanDelivery,
   addOrderItem,
   removeOrderItem,
+  markItemsReady,
+  collectItems,
+  getOrderCollections,
   addOrderMedia,
   getOrderMedia,
   backfillWalkIn,
 } = require('../controllers/orderController.js');
 const { exportOrdersExcel, exportOrdersPDF } = require('../controllers/exportController.js');
+const {
+  getOrderNotes,
+  createOrderNote,
+  updateOrderNote,
+  deleteOrderNote,
+} = require('../controllers/orderNoteController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
 const { orderLimiter } = require('../middleware/rateLimiter.js');
@@ -72,6 +81,25 @@ router.put('/:id/cancel', authorize('customer', 'staff', 'admin', 'manager', 're
 // as PUT /:id. These previously carried no authorize() at all.
 router.post('/:id/items', authorize('staff', 'admin', 'manager', 'receptionist'), addOrderItem);
 router.delete('/:id/items/:itemId', authorize('staff', 'admin', 'manager', 'receptionist'), removeOrderItem);
+
+// Garment readiness and collection — counter actions. Delivery agents are
+// excluded: a delivery is recorded through the delivered status / scan.
+router.post('/:id/items/ready', authorize('staff', 'admin', 'manager', 'receptionist'), markItemsReady);
+router.post('/:id/collections', authorize('staff', 'admin', 'manager', 'receptionist'), collectItems);
+// Customers may read the history of their own orders (checked in the handler)
+router.get('/:id/collections', getOrderCollections);
+
+// Internal staff handover notes — never reachable by a customer. Deliberately
+// not gated by VIEW_ORDERS-style read access alone: only the counter/processing
+// roles that actually work an order can see or leave notes on it.
+const NOTE_ROLES = ['staff', 'admin', 'manager', 'receptionist', 'developer'];
+router.route('/:id/notes')
+  .get(authorize(...NOTE_ROLES), getOrderNotes)
+  .post(authorize(...NOTE_ROLES), createOrderNote);
+router.patch('/:id/notes/:noteId', authorize(...NOTE_ROLES), updateOrderNote);
+// Deleting (soft) is a manager/admin action — not every staff member may
+// remove another person's operational history.
+router.delete('/:id/notes/:noteId', authorize('admin', 'manager', 'developer'), deleteOrderNote);
 
 // Order media
 router.get('/:id/media', getOrderMedia);
