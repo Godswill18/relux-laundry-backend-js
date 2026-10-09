@@ -339,7 +339,27 @@ const OrderSchema = new mongoose.Schema(
       priorityHandling: Boolean,
       multiplierPercent: Number,
     },
-    // Countdown timer fields — set each time status changes to a timed stage
+    // ── Service-level SLA (utils/orderSla.js) ───────────────────────────────
+    // Server time of the move to confirmed: the one start of the SLA clock.
+    // Absent on legacy orders and never back-filled.
+    confirmedAt: { type: Date },
+    // Snapshot of the service level's processing time at confirmation, so a
+    // later settings change never moves a promise already made.
+    slaServiceLevelId: { type: mongoose.Schema.Types.ObjectId, ref: 'ServiceLevelConfig' },
+    slaServiceLevelName: { type: String },
+    slaHours: { type: Number },
+    // Estimated completion = confirmedAt + slaHours. The one deadline every UI shows.
+    slaDueAt: { type: Date },
+    // Copies of slaDueAt / its "due soon" point, present only while the order
+    // is still processing. Drive the Overdue / Due soon filters and alerts.
+    slaActiveDueAt: { type: Date },
+    slaDueSoonAt: { type: Date },
+    // When the whole order was ready. Preserved for on-time / late reporting.
+    readyAt: { type: Date },
+    // One alert per milestone per order, so staff are not spammed.
+    slaNotified: { dueSoonAt: Date, overdueAt: Date },
+    // DEPRECATED — the old per-stage countdown (StageDurationSetting). No longer
+    // written; kept so existing documents still read cleanly.
     stageDeadlineAt: { type: Date },
     stageDurationMinutes: { type: Number },
     // When the pickup and delivery legs actually happened. Both were already being
@@ -495,6 +515,42 @@ OrderSchema.pre('validate', async function (next) {
   next();
 });
 
+// ── Service SLA ──────────────────────────────────────────────────────────
+// Remember the status the document was loaded with: a move out of pending /
+// cancelled is what starts the clock.
+OrderSchema.post('init', function () {
+  this.$locals.prevStatus = this.status;
+});
+
+OrderSchema.pre('save', async function (next) {
+  try {
+    const { applySla } = require('../utils/orderSla.js');
+    this.$locals.slaChanges = await applySla(this);
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+OrderSchema.post('save', function () {
+  const changes = this.$locals.slaChanges;
+  this.$locals.prevStatus = this.status;
+  if (!changes || !changes.length) return;
+  this.$locals.slaChanges = [];
+  const { logAudit } = require('../utils/auditLogger.js');
+  for (const c of changes) {
+    logAudit({
+      actorUserId: c.actorId || this.lastUpdatedById,
+      action: c.action,
+      targetType: 'Order',
+      targetId: String(this._id),
+      before: c.before,
+      after: c.after,
+      metadata: { orderNumber: this.orderNumber, reason: c.reason },
+    });
+  }
+});
+
 // Add indexes for better query performance
 OrderSchema.index({ customer: 1, createdAt: -1 });
 OrderSchema.index({ status: 1 });
@@ -514,5 +570,11 @@ OrderSchema.index({ 'walkInCustomer.phone': 1 });
 OrderSchema.index({ customerId: 1, createdAt: -1 });
 // Counter filters: partially ready / ready for collection / partially collected.
 OrderSchema.index({ fulfilmentStatus: 1, createdAt: -1 });
+// SLA list filters (Overdue / Due soon) and the alert monitor. Sparse: legacy
+// and finished orders carry no value and stay out of the index.
+OrderSchema.index({ slaActiveDueAt: 1 }, { sparse: true });
+OrderSchema.index({ slaDueSoonAt: 1 }, { sparse: true });
+// SLA performance reports window on when processing finished.
+OrderSchema.index({ readyAt: 1 }, { sparse: true });
 
 module.exports = mongoose.model('Order', OrderSchema);

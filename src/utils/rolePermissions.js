@@ -65,7 +65,9 @@ const DEFAULT_ROLE_PERMISSIONS = {
   ],
 
   developer: [
-    // Full access — superset of admin
+    // Full access — superset of admin. MANAGE_SERVICE_SLA is developer-only by
+    // default; the developer grants it to other roles in Roles & Permissions.
+    'MANAGE_SERVICE_SLA',
     'VIEW_ORDERS', 'CREATE_ORDER', 'EDIT_ORDER', 'DELETE_ORDER',
     'ASSIGN_STAFF', 'UPDATE_ORDER_STATUS',
     'VIEW_CUSTOMERS', 'CREATE_CUSTOMER', 'EDIT_CUSTOMER', 'DELETE_CUSTOMER',

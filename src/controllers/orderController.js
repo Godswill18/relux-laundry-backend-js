@@ -11,7 +11,6 @@ const Wallet = require('../models/Wallet.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
 const Referral = require('../models/Referral.js');
 const ReferralSetting = require('../models/ReferralSetting.js');
-const StageDurationSetting = require('../models/StageDurationSetting.js');
 const LoyaltyLedger = require('../models/LoyaltyLedger.js');
 const LoyaltySetting = require('../models/LoyaltySetting.js');
 const User = require('../models/User.js');
@@ -65,6 +64,7 @@ const {
   saveWithStatusSync,
   notifyFulfilment,
 } = require('../utils/orderFulfilment.js');
+const { buildSlaView, slaFilter, resolveServiceLevel } = require('../utils/orderSla.js');
 const normalizePhone = require('../utils/normalizePhone.js');
 const logger = require('../utils/logger.js');
 const { logAudit } = require('../utils/auditLogger.js');
@@ -79,32 +79,15 @@ const ORDER_STATUSES = [
 // Statuses an order does not move on from under normal operation
 const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled'];
 
-// Statuses that have a countdown timer
-const TIMED_STAGES = new Set(['confirmed', 'picked-up', 'in_progress', 'washing', 'ironing', 'out-for-delivery']);
-
-// Fallback durations (minutes) used when StageDurationSetting has no DB document yet
-const DEFAULT_STAGE_DURATIONS = {
-  'confirmed':          15,
-  'picked-up':          90,
-  'in_progress':        180,
-  'washing':            240,
-  'ironing':            90,
-  'out-for-delivery':   120,
-};
-
 /**
- * Returns { stageDeadlineAt, stageDurationMinutes } for the given status.
- * Always resolves — uses DB settings if available, falls back to hardcoded defaults.
+ * DEPRECATED — the per-stage countdown (StageDurationSetting) restarted on
+ * every progress change, which is exactly what the processing timer must not
+ * do. The timer now comes from the order's service level (utils/orderSla.js).
+ * Kept as a no-op so the existing call sites and socket payloads stay valid;
+ * the fields it fed are cleared rather than written.
  */
-async function computeStageDeadline(status) {
-  if (!TIMED_STAGES.has(status)) return { stageDeadlineAt: null, stageDurationMinutes: null };
-  const durations = await StageDurationSetting.findOne().lean();
-  const minutes = (durations && durations[status]) ? durations[status] : DEFAULT_STAGE_DURATIONS[status];
-  if (!minutes || minutes <= 0) return { stageDeadlineAt: null, stageDurationMinutes: null };
-  return {
-    stageDurationMinutes: minutes,
-    stageDeadlineAt: new Date(Date.now() + minutes * 60 * 1000),
-  };
+async function computeStageDeadline() {
+  return { stageDeadlineAt: null, stageDurationMinutes: null };
 }
 
 // ─── Promo code resolution (server-side) ─────────────────────────────────────
@@ -1011,7 +994,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     message: 'Order created successfully',
     // customerRecord tells the counter whether an existing customer was found
     // or a new record was created (walk-in orders only).
-    data: { order, ...(customerRecordInfo ? { customerRecord: customerRecordInfo } : {}) },
+    data: { order: withFulfilment(order), ...(customerRecordInfo ? { customerRecord: customerRecordInfo } : {}) },
   });
 });
 
@@ -1122,6 +1105,13 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       }
     }
 
+    // SLA filters: ?sla=overdue|due_soon|running (open, timed orders only)
+    const slaCondition = slaFilter(String(req.query.sla || ''));
+    if (slaCondition) {
+      Object.assign(query, slaCondition);
+      if (!query.status) query.status = { $nin: ['cancelled', 'delivered', 'completed'] };
+    }
+
     // Garment filters for the counter: ?fulfilment=
     //   partially_ready | ready | partially_collected | collected
     //   ready_for_collection — at least one garment ready and not yet collected
@@ -1224,7 +1214,10 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Orders fetched successfully',
-    data: { orders: orders.map((o) => withFulfilment(o, { customerScope: isCustomerScope })) },
+    data: {
+      orders: orders.map((o) => withFulfilment(o, { customerScope: isCustomerScope })),
+      serverTime: new Date().toISOString(),
+    },
     pagination: {
       page,
       limit,
@@ -1289,7 +1282,14 @@ async function fulfilmentIndicators() {
       },
     },
   ]);
+  const now = new Date();
+  const [slaOverdue, slaDueSoon] = await Promise.all([
+    Order.countDocuments({ ...slaFilter('overdue', now), status: { $nin: ['cancelled', 'delivered', 'completed'] } }),
+    Order.countDocuments({ ...slaFilter('due_soon', now), status: { $nin: ['cancelled', 'delivered', 'completed'] } }),
+  ]);
   return {
+    slaOverdue,
+    slaDueSoon,
     partiallyReady: row?.partiallyReady || 0,
     readyForCollection: row?.readyForCollection || 0,
     partiallyCollected: row?.partiallyCollected || 0,
@@ -1491,6 +1491,36 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
   const previousPaymentMethod = order.payment?.method;
   const previousPaymentStatus = order.paymentStatus;
 
+  // ── Service level after confirmation ───────────────────────────────────────
+  // The level sets both the price and the promised completion time. Before
+  // confirmation it can change freely (the timer snapshots whatever level the
+  // order has when it is confirmed). After confirmation a change moves a
+  // promise the customer was already given, so it must be deliberate: the
+  // request carries a reason, the deadline is recalculated from the original
+  // confirmation time, and the change is audited (see utils/orderSla.js).
+  if (order.confirmedAt && (req.body.serviceLevelId !== undefined || req.body.serviceLevel !== undefined)) {
+    let changesLevel = false;
+    if (req.body.serviceLevelId) {
+      const current = order.slaServiceLevelId || order.serviceLevelId || (await resolveServiceLevel(order))?._id;
+      changesLevel = String(req.body.serviceLevelId) !== String(current || '');
+    } else if (req.body.serviceLevel) {
+      const currentName = order.slaServiceLevelName || order.serviceLevelName || order.serviceLevel || '';
+      changesLevel = String(req.body.serviceLevel).trim().toLowerCase() !== currentName.trim().toLowerCase();
+    }
+    if (changesLevel) {
+      const reason = typeof req.body.serviceLevelChangeReason === 'string' ? req.body.serviceLevelChangeReason.trim() : '';
+      if (!reason) {
+        return next(new AppError(
+          'This order is already confirmed. Changing its service level changes the price and the promised completion time — give a reason for the change.',
+          409,
+          'SERVICE_LEVEL_CHANGE_NEEDS_REASON'
+        ));
+      }
+      if (reason.length > 500) return next(new AppError('Reason is too long (max 500 characters)', 400, ERROR_CODES.VALIDATION_ERROR));
+      order.$locals.slaLevelChange = { reason, actorId: req.user.id };
+    }
+  }
+
   // ── Non-item fields ────────────────────────────────────────────────────────
   const scalarFields = [
     'serviceType', 'orderType', 'pickupAddress', 'deliveryAddress',
@@ -1679,12 +1709,13 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
       paymentMethod: order.payment?.method,
       total: order.total,
     });
+    emitSlaUpdate(io, order);
   }
 
   res.status(200).json({
     success: true,
     message: 'Order updated successfully',
-    data: { order, priceDifference: difference, refundIssued, refundAmount },
+    data: { order: withFulfilment(order), priceDifference: difference, refundIssued, refundAmount },
   });
 });
 
@@ -1718,7 +1749,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     return res.status(200).json({
       success: true,
       message: `Order is already ${status}`,
-      data: { order },
+      data: { order: withFulfilment(order) },
     });
   }
 
@@ -1879,6 +1910,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       stageDeadlineAt,
       stageDurationMinutes,
     });
+    emitSlaUpdate(io, order);
   }
 
   // Notify customer of status change
@@ -1900,7 +1932,10 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     if (resolvedCustomerId) {
       const notifBody = walletRefundIssued
         ? `Your order ${order.orderNumber} has been cancelled. A refund of ₦${refundAmount.toLocaleString()} has been credited to your wallet.`
-        : `Your order ${order.orderNumber} is now ${label}.`;
+        : `Your order ${order.orderNumber} is now ${label}.${
+          status === 'confirmed' && order.slaDueAt
+            ? ` Estimated ready by ${new Date(order.slaDueAt).toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}.`
+            : ''}`;
       await notify(io, {
         type: 'order_status_updated',
         title: 'Order Update',
@@ -1935,7 +1970,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'Order status updated successfully',
-    data: { order },
+    data: { order: withFulfilment(order) },
   });
 });
 
@@ -2140,12 +2175,13 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
       stageDeadlineAt: acceptDeadline,
       stageDurationMinutes: acceptDuration,
     });
+    emitSlaUpdate(io, order);
   }
 
   res.status(200).json({
     success: true,
     message: 'Order accepted successfully',
-    data: { order },
+    data: { order: withFulfilment(order) },
   });
 });
 
@@ -2923,12 +2959,13 @@ exports.addOrderItem = asyncHandler(async (req, res, next) => {
   const io = req.app.get('io');
   if (io) {
     io.to(`order-${order._id}`).emit('order:updated', { orderId: order._id, total: order.total });
+    emitSlaUpdate(io, order);
   }
 
   res.status(201).json({
     success: true,
     message: 'Order item added successfully',
-    data: { order },
+    data: { order: withFulfilment(order) },
   });
 });
 
@@ -2992,12 +3029,13 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
   const io = req.app.get('io');
   if (io) {
     io.to(`order-${order._id}`).emit('order:updated', { orderId: order._id, total: order.total });
+    emitSlaUpdate(io, order);
   }
 
   res.status(200).json({
     success: true,
     message: 'Order item removed successfully',
-    data: { order },
+    data: { order: withFulfilment(order) },
   });
 });
 
@@ -3012,6 +3050,8 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
 function withFulfilment(order, { customerScope = false, collections } = {}) {
   const payload = typeof order.toObject === 'function' ? order.toObject() : { ...order };
   payload.fulfilment = summarizeFulfilment(payload);
+  // Same SLA payload for every viewer — deadlines are never role-dependent.
+  payload.sla = buildSlaView(payload);
   if (collections) {
     payload.collections = customerScope
       ? collections.map(({ releasedBy, releasedByRole, idempotencyKey, notes, ...rest }) => rest)
@@ -3019,6 +3059,16 @@ function withFulfilment(order, { customerScope = false, collections } = {}) {
   }
   if (customerScope) delete payload.fulfilmentHistory;
   return payload;
+}
+
+// SLA changes only on confirmation, readiness, cancellation or an edit — never
+// per second — so a single event on those moments is all clients need.
+function emitSlaUpdate(io, order) {
+  if (!io || !order) return;
+  const sla = buildSlaView(order);
+  // Only the order's own room and staff — a global emit would show every
+  // customer the item types of everyone else's order.
+  io.to(`order-${order._id}`).to('admin').emit('order:sla-updated', { orderId: order._id, status: order.status, sla });
 }
 
 // Emit the realtime events a garment change produces.
@@ -3030,7 +3080,9 @@ function emitFulfilmentUpdate(req, order, changes = {}) {
     status: order.status,
     fulfilmentStatus: order.fulfilmentStatus,
     fulfilment: summarizeFulfilment(order),
+    sla: buildSlaView(order),
   });
+  emitSlaUpdate(io, order);
   if (changes.statusChangedTo) {
     io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: order.status });
     io.emit('order:status-updated', {

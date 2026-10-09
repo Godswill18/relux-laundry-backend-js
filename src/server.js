@@ -7,6 +7,7 @@ const logger = require('./utils/logger.js');
 const mongoose = require('mongoose');
 const socketAuth = require('./middleware/socketAuth.js');
 const { startShiftScheduler } = require('./utils/shiftScheduler.js');
+const { startSlaMonitor } = require('./utils/slaMonitor.js');
 const allowedOrigins = require('./config/allowedOrigins.js');
 const backfillWalkIn = require('./utils/backfillWalkIn.js');
 const { acquireJobLock, releaseJobLock, withJobLock } = require('./utils/jobLock.js');
@@ -193,6 +194,7 @@ app.set('io', io);
 
 // Start shift scheduler for auto-logout
 startShiftScheduler(io);
+startSlaMonitor(io);
 
 // ─── Graceful shutdown ───────────────────────────────────────────────────────
 // PM2 sends SIGINT on restart. Releasing the job leases here means the next

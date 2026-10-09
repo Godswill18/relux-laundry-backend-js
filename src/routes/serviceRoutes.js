@@ -34,6 +34,7 @@ const {
 } = require('../controllers/serviceController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
+const { getServiceLevelSlas, setServiceLevelSlas, getSlaPerformance } = require('../controllers/slaController.js');
 
 // ---- Static routes MUST come before /:id to avoid ObjectId cast errors ----
 
@@ -44,6 +45,11 @@ router.put('/categories/:id', protect, authorize('admin', 'manager'), updateCate
 router.delete('/categories/:id', protect, authorize('admin'), deleteCategoryFlat);
 
 // Service Level routes
+// Service Level Timer Settings — before '/levels/:id' so 'sla' is not read as an id
+router.get('/levels/sla', protect, authorize('admin', 'manager', 'staff', 'receptionist'), getServiceLevelSlas);
+router.get('/levels/sla/performance', protect, authorize('admin', 'manager'), getSlaPerformance);
+// Door open to back-office roles; MANAGE_SERVICE_SLA (developer-granted) enforced in the controller
+router.put('/levels/sla', protect, authorize('admin', 'manager', 'staff', 'receptionist'), setServiceLevelSlas);
 router.get('/levels', protect, getServiceLevels);
 router.post('/levels', protect, authorize('admin', 'manager'), createServiceLevel);
 router.put('/levels/:id', protect, authorize('admin', 'manager'), updateServiceLevel);

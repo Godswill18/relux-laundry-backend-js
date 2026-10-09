@@ -31,6 +31,18 @@ const ServiceLevelConfigSchema = new mongoose.Schema(
       min: 1,
       max: 10,
     },
+    // Promised processing time in hours, counted from order confirmation.
+    // Unset = no timer for this level. Changed only through the Service Level
+    // Timer Settings (PUT /services/levels/:id/sla), which is permission-gated
+    // and audited; the general level edit ignores it. Copied onto each order at
+    // confirmation, so changing it never moves an existing order's deadline.
+    slaHours: {
+      type: Number,
+      min: 0.25,
+      max: 720,
+    },
+    slaUpdatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    slaUpdatedAt: { type: Date },
     active: {
       type: Boolean,
       default: true,

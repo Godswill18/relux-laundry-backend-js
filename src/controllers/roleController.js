@@ -3,6 +3,7 @@ const User = require('../models/User.js');
 const AuditLog = require('../models/AuditLog.js');
 const asyncHandler = require('../utils/asyncHandler.js');
 const AppError = require('../utils/appError.js');
+const { SLA_PERMISSION } = require('../utils/orderSla.js');
 
 // @desc    Get all roles (auto-seeds defaults on first call when DB is empty)
 // @route   GET /api/v1/roles
@@ -51,6 +52,9 @@ exports.getRole = asyncHandler(async (req, res, next) => {
 // @access  Private (Admin)
 exports.createRole = asyncHandler(async (req, res, next) => {
   const { name, permissions } = req.body;
+  if (Array.isArray(permissions) && permissions.includes(SLA_PERMISSION) && req.user.role !== 'developer') {
+    return next(new AppError('Only the Superadmin can grant the Service SLA permission', 403));
+  }
 
   const existing = await Role.findOne({ name });
   if (existing) {
@@ -76,12 +80,27 @@ exports.updateRole = asyncHandler(async (req, res, next) => {
     return next(new AppError('Role not found', 404));
   }
 
-  // Admin role permissions are locked — block UI edits
-  if (role.name === 'admin') {
-    return next(new AppError('Admin role permissions cannot be modified', 403));
+  const oldPermissions = [...role.permissions];
+  const isDeveloper = req.user.role === 'developer';
+  const hadSla = oldPermissions.includes(SLA_PERMISSION);
+  const nextPerms = req.body.permissions !== undefined ? req.body.permissions : oldPermissions;
+  const slaChanged = nextPerms.includes(SLA_PERMISSION) !== hadSla;
+
+  // The Service SLA permission is the developer's to give or take away.
+  if (slaChanged && !isDeveloper) {
+    return next(new AppError('Only the Superadmin can grant or remove the Service SLA permission', 403));
   }
 
-  const oldPermissions = [...role.permissions];
+  // Admin role permissions are locked — the one exception is the developer
+  // granting or removing the Service SLA permission; nothing else may change.
+  if (role.name === 'admin') {
+    const others = (list) => [...list].filter((x) => x !== SLA_PERMISSION).sort().join('|');
+    const touchesOther = req.body.name !== undefined && req.body.name !== role.name
+      || others(nextPerms) !== others(oldPermissions);
+    if (!(isDeveloper && slaChanged) || touchesOther) {
+      return next(new AppError('Admin role permissions cannot be modified', 403));
+    }
+  }
 
   if (req.body.permissions !== undefined) role.permissions = req.body.permissions;
   if (req.body.description !== undefined) role.description = req.body.description;
