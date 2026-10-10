@@ -458,14 +458,29 @@ exports.updateDetails = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/auth/updatepassword
 // @access  Private
 exports.updatePassword = asyncHandler(async (req, res, next) => {
+  const { currentPassword, newPassword } = req.body || {};
+  // Same floor as the reset flow. Without this a missing newPassword reached
+  // user.save() as `undefined` and surfaced as a 500.
+  if (typeof currentPassword !== 'string' || !currentPassword) {
+    return next(new AppError('Please enter your current password', 400));
+  }
+  if (typeof newPassword !== 'string' || newPassword.length < 6) {
+    return next(new AppError('New password must be at least 6 characters', 400));
+  }
+  if (newPassword === currentPassword) {
+    return next(new AppError('New password must be different from your current password', 400));
+  }
+
   const user = await User.findById(req.user.id).select('+password');
 
   // Check current password
-  if (!(await user.comparePassword(req.body.currentPassword))) {
-    return next(new AppError('Current password is incorrect', 401));
+  // 400, not 401: the session is fine, the typed password is wrong. Clients treat
+  // 401 as "session expired" and sign the customer out.
+  if (!(await user.comparePassword(currentPassword))) {
+    return next(new AppError('Current password is incorrect', 400));
   }
 
-  user.password = req.body.newPassword;
+  user.password = newPassword;
   await user.save();
 
   await sendTokenResponse(user, 200, res);

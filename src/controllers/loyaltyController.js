@@ -1,5 +1,6 @@
 const LoyaltyTier = require('../models/LoyaltyTier.js');
 const LoyaltyLedger = require('../models/LoyaltyLedger.js');
+const ReferralSetting = require('../models/ReferralSetting.js');
 const LoyaltySetting = require('../models/LoyaltySetting.js');
 const Customer = require('../models/Customer.js');
 const Wallet = require('../models/Wallet.js');
@@ -149,10 +150,11 @@ exports.deleteTier = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/loyalty/me
 // @access  Private
 exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
-  const [customer, settings] = await Promise.all([
+  const [customer, settings, referralSettings] = await Promise.all([
     Customer.findById(req.user.customerId)
       .populate('loyaltyTierId', 'name rank multiplierPercent discountPercent freePickup freeDelivery priorityTurnaround'),
     LoyaltySetting.findOne().lean(),
+    ReferralSetting.findOne().sort('-createdAt').lean(),
   ]);
 
   if (!customer) {
@@ -167,6 +169,14 @@ exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
     { $group: { _id: null, points: { $sum: '$points' } } },
   ]);
 
+  // Points earned per source, over the whole ledger. Read-only, like the total
+  // above: the page used to add up the twenty rows it had fetched.
+  const earnedBySource = await LoyaltyLedger.aggregate([
+    { $match: { customerId: customer._id, points: { $gt: 0 }, source: { $in: ['order', 'referral'] } } },
+    { $group: { _id: '$source', points: { $sum: '$points' } } },
+  ]);
+  const earned = Object.fromEntries(earnedBySource.map((r) => [r._id, r.points]));
+
   res.status(200).json({
     success: true,
     message: 'Loyalty info fetched successfully',
@@ -175,6 +185,14 @@ exports.getMyLoyalty = asyncHandler(async (req, res, next) => {
       lifetimePoints: customer.loyaltyLifetimePoints,
       tier: customer.loyaltyTierId,
       totalConverted: Math.abs(convertedAgg?.points || 0),
+      earnedFromOrders: earned.order || 0,
+      earnedFromReferrals: earned.referral || 0,
+      // What a referrer is promised — shown on the page, applied by the referral flow.
+      referral: {
+        enabled: referralSettings ? referralSettings.enabled !== false : true,
+        referrerLoyaltyPoints: referralSettings?.referrerLoyaltyPoints || 0,
+        referrerRewardAmount: referralSettings ? (referralSettings.referrerRewardAmount ?? 0) : 1000,
+      },
       // Every rate and switch the customer app renders comes from here, in one
       // unit (points per ₦1). No screen derives a rate of its own.
       ...publicLoyaltyTerms(settings),

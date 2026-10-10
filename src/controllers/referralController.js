@@ -50,14 +50,31 @@ async function creditLoyalty(userId, points, reason) {
 // @route   GET /api/v1/referrals/me
 // @access  Private
 exports.getMyReferrals = asyncHandler(async (req, res, next) => {
-  const referrals = await Referral.find({ referrerUserId: req.user.id })
-    .populate('refereeUserId', 'name email phone')
-    .sort('-createdAt');
+  const [referrals, settings] = await Promise.all([
+    // Display name only. A referrer is not shown the friend's email or phone.
+    Referral.find({ referrerUserId: req.user.id })
+      .populate('refereeUserId', 'name')
+      .sort('-createdAt'),
+    ReferralSetting.findOne().sort('-createdAt').lean(),
+  ]);
+
+  // The terms the page describes — read from the same settings the reward
+  // flow uses, so the screen never states a reward the system won't pay.
+  const terms = {
+    enabled: settings ? settings.enabled !== false : true,
+    referrerRewardAmount: settings ? (settings.referrerRewardAmount ?? 0) : 1000,
+    refereeRewardAmount: settings?.refereeRewardAmount ?? 0,
+    referrerLoyaltyPoints: settings?.referrerLoyaltyPoints ?? 0,
+    refereeLoyaltyPoints: settings?.refereeLoyaltyPoints ?? 0,
+    qualifyOnStatus: settings?.qualifyOnStatus || 'completed',
+    minOrderCount: settings?.minOrderCount || 1,
+    minOrderAmount: settings?.minOrderAmount || 0,
+  };
 
   res.status(200).json({
     success: true,
     message: 'Referrals fetched successfully',
-    data: { referrals },
+    data: { referrals, terms },
   });
 });
 

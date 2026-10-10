@@ -3446,6 +3446,9 @@ exports.getLeaderboard = asyncHandler(async (req, res) => {
       $group: {
         _id: '$customerId',
         totalPoints: { $sum: '$points' },
+        // Distinct orders that earned points in the period. Referral and
+        // manual earnings carry no order, so they do not count as orders.
+        orderIds: { $addToSet: '$orderId' },
       },
     },
     { $sort: { totalPoints: -1 } },
@@ -3469,6 +3472,9 @@ exports.getLeaderboard = asyncHandler(async (req, res) => {
         customerId: '$_id',
         name: '$customer.name',
         totalPoints: 1,
+        orderCount: {
+          $size: { $filter: { input: '$orderIds', as: 'o', cond: { $ne: ['$$o', null] } } },
+        },
       },
     },
   ];
@@ -3504,9 +3510,15 @@ exports.getLeaderboard = asyncHandler(async (req, res) => {
           },
         },
         { $sort: { totalPoints: -1 } },
+        // Same population as the board above, so "your rank" and your row agree.
+        {
+          $lookup: { from: 'customers', localField: '_id', foreignField: '_id', as: 'customer' },
+        },
+        { $unwind: '$customer' },
+        { $match: { 'customer.status': { $ne: 'suspended' } } },
       ]);
       const idx = results.findIndex((r) => r._id.toString() === myId);
-      return idx === -1 ? null : { rank: idx + 1, totalPoints: results[idx].totalPoints };
+      return idx === -1 ? null : { rank: idx + 1, totalPoints: results[idx].totalPoints, customerId: myId };
     };
 
     [myWeeklyRank, myMonthlyRank] = await Promise.all([
