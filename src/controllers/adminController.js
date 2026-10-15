@@ -12,12 +12,14 @@ const {
 const asyncHandler = require('../utils/asyncHandler.js');
 const {
   paidOrderMatch,
+  revenuePipeline,
   orderRevenueField,
   startOfTodayWAT,
   startOfMonthWAT,
   startOfWeekWAT,
   watDayStart,
   watDayEnd,
+  getTodayWAT,
 } = require('../utils/helpers.js');
 
 // @desc    Get dashboard stats
@@ -33,6 +35,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   const startOfWeek = startOfWeekWAT();
 
   const startOfMonth = startOfMonthWAT();
+  // Upper bound for every revenue window: the end of today (WAT).
+  const endOfTodayExclusive = new Date(watDayEnd(getTodayWAT()).getTime() + 1);
 
   // Today's stats
   const todayOrders = await Order.countDocuments({
@@ -40,8 +44,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   });
 
   const todayRevenue = await Order.aggregate([
-    { $match: { ...paidOrderMatch(), createdAt: { $gte: today } } },
-    { $group: { _id: null, total: { $sum: orderRevenueField() } } },
+    ...revenuePipeline({ from: today, to: endOfTodayExclusive }),
+    { $group: { _id: null, total: { $sum: '$revenueAmount' } } },
   ]);
 
   const todayPending = await Order.countDocuments({
@@ -60,8 +64,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   });
 
   const weeklyRevenue = await Order.aggregate([
-    { $match: { ...paidOrderMatch(), createdAt: { $gte: startOfWeek } } },
-    { $group: { _id: null, total: { $sum: orderRevenueField() } } },
+    ...revenuePipeline({ from: startOfWeek, to: endOfTodayExclusive }),
+    { $group: { _id: null, total: { $sum: '$revenueAmount' } } },
   ]);
 
   // Monthly stats
@@ -70,8 +74,8 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   });
 
   const monthlyRevenue = await Order.aggregate([
-    { $match: { ...paidOrderMatch(), createdAt: { $gte: startOfMonth } } },
-    { $group: { _id: null, total: { $sum: orderRevenueField() } } },
+    ...revenuePipeline({ from: startOfMonth, to: endOfTodayExclusive }),
+    { $group: { _id: null, total: { $sum: '$revenueAmount' } } },
   ]);
 
   // Recent orders
@@ -83,7 +87,12 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
   // Top services
   const topServices = await Order.aggregate([
     { $match: { status: { $nin: ['cancelled'] } } },
-    { $group: { _id: '$serviceType', count: { $sum: 1 }, revenue: { $sum: orderRevenueField() } } },
+    { $group: {
+      _id: '$serviceType',
+      count: { $sum: 1 },
+      // Revenue: paid, non-cancelled orders only
+      revenue: { $sum: { $cond: [{ $and: [{ $ne: ['$status', 'cancelled'] }, { $eq: ['$paymentStatus', 'paid'] }] }, orderRevenueField(), 0] } },
+    } },
     { $sort: { count: -1 } },
     { $limit: 5 },
   ]);
@@ -135,44 +144,35 @@ exports.getDashboardStats = asyncHandler(async (req, res, next) => {
 exports.getRevenueReport = asyncHandler(async (req, res, next) => {
   const { startDate, endDate, groupBy = 'day' } = req.query;
 
-  const match = paidOrderMatch();
+  // Revenue = paid, non-cancelled orders, bucketed on the payment date
+  // (revenueAt), in WAT. Date filters are WAT calendar days.
+  const from = startDate ? watDayStart(String(startDate).slice(0, 10)) : undefined;
+  const to = endDate ? new Date(watDayEnd(String(endDate).slice(0, 10)).getTime() + 1) : undefined;
 
-  // Date filters are WAT calendar days. `new Date('2026-08-01')` parses as UTC
-  // midnight, which is 01:00 WAT — an hour of orders landed on the wrong day.
-  if (startDate) {
-    match.createdAt = { $gte: watDayStart(String(startDate).slice(0, 10)) };
-  }
-
-  if (endDate) {
-    match.createdAt = { ...match.createdAt, $lte: watDayEnd(String(endDate).slice(0, 10)) };
-  }
-
+  const tz = '+01:00';
   let groupByFormat;
   switch (groupBy) {
-    case 'day':
-      groupByFormat = { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } };
-      break;
     case 'week':
-      groupByFormat = { $week: '$createdAt' };
+      groupByFormat = { $week: { date: '$revenueAt', timezone: tz } };
       break;
     case 'month':
-      groupByFormat = { $dateToString: { format: '%Y-%m', date: '$createdAt' } };
+      groupByFormat = { $dateToString: { format: '%Y-%m', date: '$revenueAt', timezone: tz } };
       break;
     case 'year':
-      groupByFormat = { $year: '$createdAt' };
+      groupByFormat = { $year: { date: '$revenueAt', timezone: tz } };
       break;
     default:
-      groupByFormat = { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } };
+      groupByFormat = { $dateToString: { format: '%Y-%m-%d', date: '$revenueAt', timezone: tz } };
   }
 
   const revenue = await Order.aggregate([
-    { $match: match },
+    ...revenuePipeline({ from, to }),
     {
       $group: {
         _id: groupByFormat,
-        totalRevenue: { $sum: orderRevenueField() },
+        totalRevenue: { $sum: '$revenueAmount' },
         orderCount: { $sum: 1 },
-        avgOrderValue: { $avg: orderRevenueField() },
+        avgOrderValue: { $avg: '$revenueAmount' },
       },
     },
     { $sort: { _id: 1 } },
@@ -374,7 +374,16 @@ exports.getStaffProductivity = asyncHandler(async (req, res, next) => {
       $group: {
         _id: '$assignedStaff',
         orderCount: { $sum: 1 },
-        totalRevenue: { $sum: orderRevenueField() },
+        // Revenue counts only paid, non-cancelled orders (helpers.paidOrderMatch)
+        totalRevenue: {
+          $sum: {
+            $cond: [
+              { $and: [{ $ne: ['$status', 'cancelled'] }, { $eq: ['$paymentStatus', 'paid'] }] },
+              orderRevenueField(),
+              0,
+            ],
+          },
+        },
         completedOrders: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
         inProgressOrders: {
           $sum: {

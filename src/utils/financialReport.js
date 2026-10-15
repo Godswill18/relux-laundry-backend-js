@@ -18,6 +18,7 @@
 const Order = require('../models/Order.js');
 const PaystackTransaction = require('../models/PaystackTransaction.js');
 const WalletTransaction = require('../models/WalletTransaction.js');
+const { revenuePipeline } = require('./helpers.js');
 
 const WAT_OFFSET_MS = 60 * 60 * 1000; // Africa/Lagos is a fixed UTC+1 (no DST)
 const EPS = 0.01;
@@ -367,10 +368,78 @@ async function outstandingModel({ search } = {}) {
   };
 }
 
+// ── Revenue (the headline figure) ───────────────────────────────────────────
+// REVENUE = orders whose payment status is PAID, in any status except
+// CANCELLED (helpers.paidOrderMatch — the same rule the dashboards use),
+// counted at the order's final total and dated by payment date
+// (helpers.revenuePipeline → revenueAt), bucketed in WAT.
+async function revenueModel(range) {
+  const rows = await Order.aggregate([
+    ...revenuePipeline({ from: range.from, to: range.to }),
+    { $project: {
+      orderNumber: 1, revenueAt: 1, revenueAmount: 1, createdAt: 1, status: 1, paymentStatus: 1,
+      payment: 1, pricing: 1, total: 1, discountAmount: 1, serviceLevelName: 1, serviceLevel: 1,
+      walkInCustomer: 1, customer: 1, customerId: 1,
+    } },
+    { $sort: { revenueAt: -1 } },
+  ]);
+  await Order.populate(rows, populateCustomer);
+
+  // Integrity: what the payment ledger says was actually received for each
+  // revenue order. Revenue is still the order total (the definition), but any
+  // order whose ledger disagrees is surfaced, never hidden.
+  const ev = rows.length ? await loadEventsForOrders(rows.map((r) => r._id)) : { payments: [], refunds: [] };
+  const paid = sumByOrder(ev.payments);
+  const refunded = sumByOrder(ev.refunds);
+
+  const out = rows.map((o) => {
+    const id = String(o._id);
+    const ledgerNet = r2((paid.get(id) || 0) - (refunded.get(id) || 0));
+    const amount = r2(o.revenueAmount || 0);
+    return {
+      orderId: id, orderNumber: o.orderNumber, customer: customerOf(o),
+      orderDate: o.createdAt, orderStatus: o.status, paidAt: o.payment?.paidAt || null, revenueAt: o.revenueAt,
+      amount, discount: discountOf(o), method: o.payment?.method || 'unknown',
+      serviceLevel: levelOf(o), ledgerReceived: ledgerNet,
+      ledgerMismatch: Math.abs(ledgerNet - amount) > EPS,
+      dateEstimated: !o.payment?.paidAt, // no payment date recorded → creation date used
+    };
+  });
+
+  const total = r2(out.reduce((t, r) => t + r.amount, 0));
+  const byDay = {}; const byMethod = {}; const byLevel = {};
+  for (const r of out) {
+    const d = watDay(r.revenueAt);
+    (byDay[d] ||= { revenue: 0, orders: 0 }); byDay[d].revenue += r.amount; byDay[d].orders += 1;
+    (byMethod[r.method] ||= { revenue: 0, orders: 0 }); byMethod[r.method].revenue += r.amount; byMethod[r.method].orders += 1;
+    (byLevel[r.serviceLevel] ||= { revenue: 0, orders: 0 }); byLevel[r.serviceLevel].revenue += r.amount; byLevel[r.serviceLevel].orders += 1;
+  }
+  const daily = [];
+  for (let d = 1; d <= range.daysInMonth; d += 1) {
+    const key = `${range.year}-${String(range.month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    daily.push({ date: key, revenue: r2(byDay[key]?.revenue || 0), orders: byDay[key]?.orders || 0 });
+  }
+  const mism = out.filter((r) => r.ledgerMismatch);
+  return {
+    rows: out,
+    total,
+    orders: out.length,
+    averageOrder: out.length ? r2(total / out.length) : 0,
+    daily,
+    methods: Object.entries(byMethod).map(([method, v]) => ({ method, revenue: r2(v.revenue), orders: v.orders })).sort((a, b) => b.revenue - a.revenue),
+    serviceLevels: Object.entries(byLevel).map(([level, v]) => ({ level, revenue: r2(v.revenue), orders: v.orders })).sort((a, b) => b.revenue - a.revenue),
+    integrity: {
+      ledgerMismatchOrders: mism.length,
+      ledgerMismatchAmount: r2(mism.reduce((t, r) => t + (r.amount - r.ledgerReceived), 0)),
+      estimatedDateOrders: out.filter((r) => r.dateEstimated).length,
+    },
+  };
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 async function getSummary(range) {
-  const [pm, om, out, unrecorded] = await Promise.all([
-    paymentMonthModel(range), orderMonthModel(range), outstandingModel(), loadUnrecordedRefunds(),
+  const [rev, pm, om, out, unrecorded] = await Promise.all([
+    revenueModel(range), paymentMonthModel(range), orderMonthModel(range), outstandingModel(), loadUnrecordedRefunds(),
   ]);
   const net = r2(pm.grossTotal - pm.refundTotal);
 
@@ -382,10 +451,20 @@ async function getSummary(range) {
     serviceLevels: sum(pm.byLevel, (v) => v.gross - v.refunds),
     paidOrdersTable: r2(pm.paidRows.reduce((s, r) => s + r.paidThisMonth, 0)),
   };
+  // Revenue rebuilt through every grouping shown on screen and in the export.
+  const revChecks = {
+    days: r2(rev.daily.reduce((t, d) => t + d.revenue, 0)),
+    methods: r2(rev.methods.reduce((t, m) => t + m.revenue, 0)),
+    serviceLevels: r2(rev.serviceLevels.reduce((t, m) => t + m.revenue, 0)),
+    table: r2(rev.rows.reduce((t, r) => t + r.amount, 0)),
+  };
+  const revenueOk = Object.values(revChecks).every((v) => Math.abs(v - rev.total) < EPS);
+  const paymentsOk = Math.abs(checks.methods - net) < EPS && Math.abs(checks.days - net) < EPS
+    && Math.abs(checks.serviceLevels - net) < EPS && Math.abs(checks.paidOrdersTable - pm.grossTotal) < EPS;
   const reconciliation = {
-    ok: Math.abs(checks.methods - net) < EPS && Math.abs(checks.days - net) < EPS
-      && Math.abs(checks.serviceLevels - net) < EPS && Math.abs(checks.paidOrdersTable - pm.grossTotal) < EPS,
-    net, grossPaymentsTableTotal: checks.paidOrdersTable, ...checks,
+    ok: revenueOk && paymentsOk,
+    revenue: { ok: revenueOk, total: rev.total, ...revChecks },
+    payments: { ok: paymentsOk, net, grossPaymentsTableTotal: checks.paidOrdersTable, ...checks },
   };
 
   const daily = [];
@@ -399,6 +478,16 @@ async function getSummary(range) {
 
   return {
     period: { year: range.year, month: range.month, timezone: 'Africa/Lagos', from: range.from, to: range.to },
+    revenue: {
+      definition: 'Orders with payment status Paid in any status except Cancelled, at the order total, dated by payment date (WAT).',
+      total: rev.total,
+      orders: rev.orders,
+      averageOrder: rev.averageOrder,
+      daily: rev.daily,
+      methods: rev.methods,
+      serviceLevels: rev.serviceLevels,
+      integrity: rev.integrity,
+    },
     financial: {
       basis: 'payment date',
       grossCollected: pm.grossTotal, refunds: pm.refundTotal, netCollected: net,
@@ -421,7 +510,7 @@ async function getSummary(range) {
     unrecordedRefunds: { orders: unrecorded.length, amount: r2(unrecorded.reduce((s, o) => s + (o.payment?.amount || 0), 0)) },
     reconciliation,
     notes: [
-      'Collected revenue is money received by payment date. Order totals are reported separately by creation date.',
+      'Revenue = paid orders in any status except cancelled, dated by payment date. Payments received is a separate ledger view.',
       'Wallet top-ups are not revenue; only wallet payments applied to orders are counted.',
       'Cash/POS/transfer payments have no per-instalment record; the amount is dated to the last recorded payment.',
     ],
@@ -437,6 +526,14 @@ async function getPaidOrders(range, { search, page, limit } = {}) {
   return { ...paginate(rows, page, limit), totals: { orders: rows.length, collected: filteredTotal }, allRows: rows };
 }
 
+async function getRevenueOrders(range, { search, page, limit } = {}) {
+  const rev = await revenueModel(range);
+  const q = String(search || '').toLowerCase();
+  const rows = rev.rows.filter((r) => !q
+    || [r.orderNumber, r.customer.name, r.customer.phone, r.customer.email].some((v) => String(v || '').toLowerCase().includes(q)));
+  return { ...paginate(rows, page, limit), totals: { orders: rows.length, revenue: r2(rows.reduce((t, r) => t + r.amount, 0)) }, allRows: rows };
+}
+
 async function getOutstanding({ search, page, limit } = {}) {
   const out = await outstandingModel({ search });
   return { ...paginate(out.rows, page, limit), totals: out.totals, allRows: out.rows };
@@ -446,15 +543,25 @@ async function getTrend(endYear, endMonth, months = 12) {
   const end = monthRange(endYear, endMonth);
   const startDate = new Date(Date.UTC(end.year, end.month - months, 1) - WAT_OFFSET_MS);
   const range = { from: startDate, to: end.to };
-  const { payments, refunds } = await loadEvents(range);
+  const [{ payments, refunds }, revRows] = await Promise.all([
+    loadEvents(range),
+    Order.aggregate([
+      ...revenuePipeline(range),
+      { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$revenueAt', timezone: '+01:00' } }, revenue: { $sum: '$revenueAmount' }, orders: { $sum: 1 } } },
+    ]),
+  ]);
   const buckets = {};
   for (let i = months - 1; i >= 0; i -= 1) {
     const d = new Date(Date.UTC(end.year, end.month - 1 - i, 1));
-    buckets[d.toISOString().slice(0, 7)] = { collected: 0, refunds: 0 };
+    buckets[d.toISOString().slice(0, 7)] = { revenue: 0, revenueOrders: 0, collected: 0, refunds: 0 };
   }
+  for (const r of revRows) if (buckets[r._id]) { buckets[r._id].revenue = r.revenue; buckets[r._id].revenueOrders = r.orders; }
   for (const e of payments) { const k = watMonthKey(e.at); if (buckets[k]) buckets[k].collected += e.amount; }
   for (const e of refunds) { const k = watMonthKey(e.at); if (buckets[k]) buckets[k].refunds += e.amount; }
-  return Object.entries(buckets).map(([month, v]) => ({ month, collected: r2(v.collected), refunds: r2(v.refunds), net: r2(v.collected - v.refunds) }));
+  return Object.entries(buckets).map(([month, v]) => ({
+    month, revenue: r2(v.revenue), revenueOrders: v.revenueOrders,
+    collected: r2(v.collected), refunds: r2(v.refunds), net: r2(v.collected - v.refunds),
+  }));
 }
 
 async function getAnomalies({ limit = 100 } = {}) {
@@ -475,5 +582,5 @@ async function getAnomalies({ limit = 100 } = {}) {
 }
 
 module.exports = {
-  monthRange, watDay, derive, getSummary, getPaidOrders, getOutstanding, getTrend, getAnomalies, loadEventsForOrders, EPS, r2,
+  monthRange, watDay, derive, getSummary, getPaidOrders, getRevenueOrders, getOutstanding, getTrend, getAnomalies, loadEventsForOrders, EPS, r2,
 };

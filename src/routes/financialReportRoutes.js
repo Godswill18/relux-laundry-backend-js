@@ -9,6 +9,7 @@ router.use(protect, c.requireFinancialAccess);
 
 router.get('/summary', c.summary);
 router.get('/paid-orders', c.paidOrders);
+router.get('/revenue-orders', c.revenueOrders);
 router.get('/outstanding-orders', c.outstandingOrders);
 router.get('/revenue-trend', c.trend);
 router.get('/anomalies', c.anomalies);
