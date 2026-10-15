@@ -11,7 +11,7 @@ const { acquireJobLock } = require('./jobLock.js');
 const { slaFilter } = require('./orderSla.js');
 
 const INTERVAL = 60 * 1000;
-const OPEN = { $nin: ['cancelled', 'delivered', 'completed'] };
+const OPEN = { $nin: ['cancelled', 'completed'] };
 
 async function sweep(io, now = new Date()) {
   // Overdue first so an order that skipped "due soon" is not announced twice.

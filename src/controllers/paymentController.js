@@ -130,6 +130,11 @@ exports.getPayment = asyncHandler(async (req, res, next) => {
 // @route   GET /api/v1/payments/order/:orderId
 // @access  Private
 exports.getPaymentByOrder = asyncHandler(async (req, res, next) => {
+  if (req.user.role === 'customer') {
+    const own = await Order.findOne({ _id: req.params.orderId, customerId: req.user.customerId }).select('_id').lean();
+    if (!own) return next(new AppError('Payment not found for this order', 404));
+  }
+
   const payment = await Payment.findOne({ orderId: req.params.orderId })
     .populate('confirmedById', 'name');
 
@@ -487,6 +492,10 @@ exports.verifyPaystack = asyncHandler(async (req, res, next) => {
   const transaction = await PaystackTransaction.findOne({ reference });
   if (!transaction) {
     logger.warn(`[verifyPaystack] Transaction not found: ${reference}`);
+    return next(new AppError('Transaction not found', 404));
+  }
+
+  if (req.user.role === 'customer' && String(transaction.customerId) !== String(req.user.customerId)) {
     return next(new AppError('Transaction not found', 404));
   }
 

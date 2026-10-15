@@ -26,6 +26,19 @@ const {
 
 // Connect to database
 connectDB();
+// Loud reminder if retired order statuses are still stored (see
+// utils/migrations/canonicalOrderStatus.js). Read-only.
+mongoose_ready_check();
+function mongoose_ready_check() {
+  const mongoose = require('mongoose');
+  mongoose.connection.once('open', async () => {
+    try {
+      const { LEGACY_DB_VALUES } = require('./utils/orderStatus.js');
+      const n = await mongoose.connection.db.collection('orders').countDocuments({ status: { $in: LEGACY_DB_VALUES } });
+      if (n > 0) console.warn(`[order-status] ${n} order(s) still hold a retired status — run: node src/utils/migrations/canonicalOrderStatus.js --apply`);
+    } catch { /* informational only */ }
+  });
+}
 
 const PORT = process.env.PORT || 5000;
 

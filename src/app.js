@@ -16,6 +16,7 @@ const authRoutes = require('./routes/authRoutes.js');
 const userRoutes = require('./routes/userRoutes.js');
 const orderRoutes = require('./routes/orderRoutes.js');
 const adminRoutes = require('./routes/adminRoutes.js');
+const financialReportRoutes = require('./routes/financialReportRoutes.js');
 const webhookRoutes = require('./routes/webhookRoutes.js');
 const customerRoutes = require('./routes/customerRoutes.js');
 const roleRoutes = require('./routes/roleRoutes.js');
@@ -53,9 +54,16 @@ app.use(cors(corsOptions));
 // Security headers — configured before static files so CORP is set correctly.
 // crossOriginResourcePolicy: cross-origin allows <img> tags on other origins to
 // load images served from this API without ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
+// HSTS is left to the TLS-terminating proxy; X-Powered-By is removed here.
+app.disable('x-powered-by');
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
 }));
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  next();
+});
 
 // Serve uploaded files (images, etc.) from the project root /uploads directory.
 // __dirname here is src/, so we go one level up to reach the project root.
@@ -65,8 +73,8 @@ app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRoutes);
 
 // Body parser
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // Cookie parser
 app.use(cookieParser());
@@ -89,11 +97,17 @@ if (process.env.NODE_ENV === 'development') {
 app.use(requestLogger);
 
 // ✅ Add this before rate limiter and routes
-app.set('trust proxy', 1);
+// Number of reverse-proxy hops in front of the app (never `true`).
+app.set('trust proxy', Number.parseInt(process.env.TRUST_PROXY_HOPS, 10) || 1);
 
 // API rate limiting.
 // Re-enabled — this had been commented out, leaving every endpoint except auth
 // and order-creation completely unthrottled.
+app.use('/api', (req, res, next) => {
+  // Authenticated API responses must never be cached by browsers/proxies.
+  res.setHeader('Cache-Control', 'no-store, private');
+  next();
+});
 app.use('/api', apiLimiter);
 
 // Health check
@@ -123,6 +137,8 @@ app.use(`/api/${API_VERSION}/auth`, authRoutes);
 app.use(`/api/${API_VERSION}/users`, userRoutes);
 app.use(`/api/${API_VERSION}/orders`, orderRoutes);
 app.use(`/api/${API_VERSION}/admin`, staffGate, adminRoutes);
+// Developer-only financial reports (role enforced inside the router as well).
+app.use(`/api/${API_VERSION}/reports/financial`, staffGate, financialReportRoutes);
 app.use(`/api/${API_VERSION}/customers`, customerRoutes);
 app.use(`/api/${API_VERSION}/roles`, staffGate, roleRoutes);
 app.use(`/api/${API_VERSION}/services`, serviceRoutes);

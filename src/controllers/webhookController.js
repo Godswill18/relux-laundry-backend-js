@@ -152,7 +152,9 @@ exports.handlePaystackWebhook = async (req, res) => {
     .update(rawBody)
     .digest('hex');
 
-  if (signature !== expected) {
+  const sigBuf = Buffer.from(String(signature || ''), 'utf8');
+  const expBuf = Buffer.from(String(expected), 'utf8');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
     logger.warn('Paystack webhook: invalid signature — request ignored');
     return;
   }

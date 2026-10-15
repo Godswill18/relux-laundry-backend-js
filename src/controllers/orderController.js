@@ -69,15 +69,11 @@ const normalizePhone = require('../utils/normalizePhone.js');
 const logger = require('../utils/logger.js');
 const { logAudit } = require('../utils/auditLogger.js');
 
-// Every status an order may hold — mirrors the enum on OrderSchema.status.
-// Used to reject unknown values with a 400 instead of a raw Mongoose error.
-const ORDER_STATUSES = [
-  'draft', 'pending', 'confirmed', 'in_progress', 'picked-up', 'washing',
-  'ironing', 'ready', 'out-for-delivery', 'delivered', 'completed', 'cancelled',
-];
-
-// Statuses an order does not move on from under normal operation
-const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled'];
+// The six canonical order statuses, the legacy-value normaliser and the
+// terminal set all live in utils/orderStatus.js — never redefine them here.
+const {
+  ORDER_STATUSES, TERMINAL_STATUSES, normalizeOrderStatus,
+} = require('../utils/orderStatus.js');
 
 /**
  * DEPRECATED — the per-stage countdown (StageDurationSetting) restarted on
@@ -1037,7 +1033,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     } else if (req.query.tab === 'mine') {
       // Orders assigned to this staff member that are still active
       query.assignedStaff = req.user.id;
-      query.status = { $nin: ['completed', 'delivered', 'cancelled'] };
+      query.status = { $nin: TERMINAL_STATUSES };
     } else if (req.query.tab === 'offline') {
       // Offline walk-in orders created by this staff member
       query.orderSource = 'offline';
@@ -1048,13 +1044,14 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
         { assignedStaff: req.user.id },
         { createdByStaff: req.user.id },
       ];
-      query.status = { $in: ['completed', 'delivered'] };
+      query.status = 'completed';
     } else if (req.query.statusTab) {
       // --- 11-status workflow tab (Admin & Staff pages) ---
       const st = req.query.statusTab;
       const isAdminRole = ['admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
 
-      query.status = st;
+      // Legacy tab names (washing, out-for-delivery…) resolve to their status.
+      query.status = normalizeOrderStatus(st).status || st;
       // All statuses: staff see all orders globally.
       // When ?myOrders=true: filter to only orders this staff is involved with.
       if (!isAdminRole && req.query.myOrders === 'true') {
@@ -1069,11 +1066,11 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     } else {
       // Manual filters
       if (req.query.excludeCompleted === 'true') {
-        query.status = { $nin: ['delivered', 'completed', 'cancelled'] };
+        query.status = { $nin: TERMINAL_STATUSES };
       } else if (req.query.doneOnly === 'true') {
-        query.status = { $in: ['delivered', 'completed'] };
+        query.status = 'completed';
       } else if (req.query.status) {
-        query.status = req.query.status;
+        query.status = normalizeOrderStatus(req.query.status).status || req.query.status;
       }
       if (req.query.serviceType) query.serviceType = req.query.serviceType;
       if (req.query.customer) query.customer = req.query.customer;
@@ -1109,7 +1106,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     const slaCondition = slaFilter(String(req.query.sla || ''));
     if (slaCondition) {
       Object.assign(query, slaCondition);
-      if (!query.status) query.status = { $nin: ['cancelled', 'delivered', 'completed'] };
+      if (!query.status) query.status = { $nin: TERMINAL_STATUSES };
     }
 
     // Garment filters for the counter: ?fulfilment=
@@ -1123,7 +1120,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     } else if (fulfilmentFilter === 'ready_for_collection') {
       query.$and = [
         ...(query.$and || []),
-        { status: { $nin: ['cancelled', 'delivered', 'completed', 'out-for-delivery'] } },
+        { status: { $nin: TERMINAL_STATUSES } },
         {
           $or: [
             { itemTracking: true, $expr: { $gt: ['$readyGarments', '$collectedGarments'] } },
@@ -1233,10 +1230,11 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
 // their status (a legacy order at 'ready' has all its garments waiting).
 async function fulfilmentIndicators() {
   const [row] = await Order.aggregate([
-    { $match: { status: { $nin: ['cancelled', 'delivered', 'completed'] } } },
+    { $match: { status: { $nin: TERMINAL_STATUSES } } },
     {
       $project: {
         status: 1,
+        deliveryStatus: 1,
         total: { $ifNull: ['$totalGarments', { $sum: '$items.quantity' }] },
         tracked: { $eq: ['$itemTracking', true] },
         readyG: '$readyGarments',
@@ -1246,10 +1244,11 @@ async function fulfilmentIndicators() {
     {
       $project: {
         status: 1,
+        deliveryStatus: 1,
         total: 1,
         ready: {
           $cond: ['$tracked', { $ifNull: ['$readyG', 0] },
-            { $cond: [{ $in: ['$status', ['ready', 'out-for-delivery']] }, '$total', 0] }],
+            { $cond: [{ $eq: ['$status', 'ready'] }, '$total', 0] }],
         },
         collected: { $cond: ['$tracked', { $ifNull: ['$collectedG', 0] }, 0] },
       },
@@ -1257,12 +1256,13 @@ async function fulfilmentIndicators() {
     {
       $project: {
         status: 1,
+        deliveryStatus: 1,
         total: 1,
         ready: 1,
         collected: 1,
         // Waiting at the counter — not on a delivery run
         waiting: {
-          $cond: [{ $eq: ['$status', 'out-for-delivery'] }, 0, { $subtract: ['$ready', '$collected'] }],
+          $cond: [{ $eq: ['$deliveryStatus', 'out_for_delivery'] }, 0, { $subtract: ['$ready', '$collected'] }],
         },
       },
     },
@@ -1284,8 +1284,8 @@ async function fulfilmentIndicators() {
   ]);
   const now = new Date();
   const [slaOverdue, slaDueSoon] = await Promise.all([
-    Order.countDocuments({ ...slaFilter('overdue', now), status: { $nin: ['cancelled', 'delivered', 'completed'] } }),
-    Order.countDocuments({ ...slaFilter('due_soon', now), status: { $nin: ['cancelled', 'delivered', 'completed'] } }),
+    Order.countDocuments({ ...slaFilter('overdue', now), status: { $nin: TERMINAL_STATUSES } }),
+    Order.countDocuments({ ...slaFilter('due_soon', now), status: { $nin: TERMINAL_STATUSES } }),
   ]);
   return {
     slaOverdue,
@@ -1308,11 +1308,7 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
   // scope=mine (default) → orders this staff is involved with
   const scope = req.query.scope || 'mine';
 
-  const STATUSES = [
-    'pending', 'confirmed', 'picked-up', 'in_progress',
-    'washing', 'ironing', 'ready', 'out-for-delivery',
-    'delivered', 'completed', 'cancelled',
-  ];
+  const STATUSES = ORDER_STATUSES;
 
   const results = await Promise.all(
     STATUSES.map((s) => {
@@ -1350,11 +1346,7 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
 // @route   GET /api/v1/orders/counts
 // @access  Private (staff, admin, manager)
 exports.getOrderCounts = asyncHandler(async (req, res) => {
-  const STATUSES = [
-    'pending', 'confirmed', 'picked-up', 'in_progress',
-    'washing', 'ironing', 'ready', 'out-for-delivery',
-    'delivered', 'completed', 'cancelled',
-  ];
+  const STATUSES = ORDER_STATUSES;
 
   const results = await Promise.all(
     STATUSES.map((s) => Order.countDocuments({ status: s }))
@@ -1365,7 +1357,7 @@ exports.getOrderCounts = asyncHandler(async (req, res) => {
   // Convenience totals
   const total      = results.reduce((a, b) => a + b, 0);
   const active     = STATUSES
-    .filter((s) => !['delivered', 'completed', 'cancelled'].includes(s))
+    .filter((s) => !TERMINAL_STATUSES.includes(s))
     .reduce((sum, s) => sum + byStatus[s], 0);
 
   // Additive and only on request (?include=fulfilment) — see getStaffCounts
@@ -1385,7 +1377,7 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
   const todayStart = startOfTodayWAT();
   const todayEnd   = watDayEnd(getTodayWAT());
 
-  const INACTIVE_STATUSES = ['delivered', 'completed', 'cancelled'];
+  const INACTIVE_STATUSES = TERMINAL_STATUSES;
 
   const [aggResult, totalOrders, activeOrders, pendingPayments, todayOrders] = await Promise.all([
     // Total revenue (all paid orders ever) + today's revenue
@@ -1483,7 +1475,7 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
   }
 
   // Block editing completed/delivered/cancelled orders
-  if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
+  if (TERMINAL_STATUSES.includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
@@ -1723,7 +1715,15 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/orders/:id/status
 // @access  Private (Staff/Admin)
 exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
-  const { status, notes } = req.body;
+  const { notes } = req.body;
+  // Retired values (washing, ironing, out-for-delivery, picked-up, delivered)
+  // from an out-of-date client are mapped once, here, and logged so the caller
+  // can be found. Only canonical statuses are ever stored.
+  const normalized = normalizeOrderStatus(req.body.status);
+  const status = normalized.status;
+  if (normalized.legacy) {
+    logger.warn(`[legacy-status] ${normalized.legacy} → ${status} via PUT /orders/:id/status (role=${req.user.role})`);
+  }
 
   const order = await Order.findById(req.params.id);
 
@@ -1737,9 +1737,9 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   // back after a mis-tap. What it does stop is unknown values, no-op re-sends
   // (which used to duplicate history rows and re-notify the customer) and
   // anyone below manager reopening a finished or cancelled order.
-  if (!ORDER_STATUSES.includes(status)) {
+  if (!status) {
     return next(new AppError(
-      `'${status}' is not a valid order status`,
+      `'${req.body.status}' is not a valid order status`,
       400,
       ERROR_CODES.VALIDATION_ERROR
     ));
@@ -1754,10 +1754,8 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   }
 
   const isSupervisor = ['admin', 'manager', 'developer'].includes(req.user.role);
-  // 'delivered' → 'completed' is the normal close-out and stays open to everyone
-  const isRoutineCloseOut = order.status === 'delivered' && status === 'completed';
-
-  if (TERMINAL_STATUSES.includes(order.status) && !isRoutineCloseOut && !isSupervisor) {
+  // A finished or cancelled order is only reopened by a supervisor.
+  if (TERMINAL_STATUSES.includes(order.status) && !isSupervisor) {
     return next(new AppError(
       `Order is ${order.status}. Only a manager or admin can reopen it.`,
       403
@@ -1787,14 +1785,16 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
   // Track who last updated this order (for "Handled by" display)
   order.lastUpdatedById = req.user.id;
 
-  // Track who picked up / delivered the order
-  if (status === 'picked-up') {
-    order.actualPickupDate = order.actualPickupDate || new Date();
-    if (!order.pickupStaffId) order.pickupStaffId = req.user.id;
-  }
-  if (status === 'delivered') {
+  // Delivery is metadata, not a status: closing an order that is out on a
+  // delivery run records the hand-over; stepping it back out of ready/completed
+  // cancels the run.
+  if (status === 'completed' && order.deliveryStatus === 'out_for_delivery') {
+    order.deliveryStatus = 'delivered';
     order.actualDeliveryDate = order.actualDeliveryDate || new Date();
     order.deliveredBy = req.user.id;
+  } else if (!['ready', 'completed'].includes(status) && order.deliveryStatus === 'out_for_delivery') {
+    order.deliveryStatus = undefined;
+    order.dispatchedAt = undefined;
   }
 
   // Compute stageDeadlineAt — always uses defaults if no DB document exists yet
@@ -1882,8 +1882,8 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
     await processReferralReward(order, status, req.app.get('io'));
   }
 
-  // Auto-award loyalty points on completion or delivery
-  if (['completed', 'delivered'].includes(status)) {
+  // Auto-award loyalty points on completion
+  if (status === 'completed') {
     await awardOrderPoints(order, req.app.get('io'));
   }
 
@@ -1923,10 +1923,8 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       resolvedCustomerId = orderUser?.customerId ? String(orderUser.customerId) : null;
     }
     const statusLabels = {
-      confirmed: 'confirmed', 'picked-up': 'picked up', in_progress: 'in progress',
-      washing: 'being washed', ironing: 'being ironed', 'out-for-delivery': 'out for delivery',
-      ready: 'ready for pickup', delivered: 'delivered', completed: 'completed',
-      cancelled: 'cancelled',
+      pending: 'pending', confirmed: 'confirmed', in_progress: 'in progress',
+      ready: 'ready', completed: 'completed', cancelled: 'cancelled',
     };
     const label = statusLabels[status] || status;
     if (resolvedCustomerId) {
@@ -2033,7 +2031,7 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
     return next(new AppError('Invalid or unrecognized QR code', 404));
   }
 
-  if (['delivered', 'completed'].includes(order.status)) {
+  if (order.status === 'completed') {
     return next(new AppError('This order has already been delivered', 400));
   }
 
@@ -2050,11 +2048,14 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
     }
   }
 
-  order.status = 'delivered';
+  // Delivery confirmed = every garment handed over = the order is completed.
+  // That the hand-over was a delivery lives in deliveryStatus/actualDeliveryDate.
+  order.status = 'completed';
+  order.deliveryStatus = 'delivered';
   order.actualDeliveryDate = new Date();
   order.deliveredBy = req.user.id;
   order.statusHistory.push({
-    status: 'delivered',
+    status: 'completed',
     updatedBy: req.user.id,
     actorRole: req.user.role,
     notes: 'Delivery confirmed via barcode scan',
@@ -2063,7 +2064,7 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
 
   // Delivered = every outstanding garment handed over, recorded as a collection
   if (order.itemTracking) {
-    const deliveryCollection = syncFulfilmentForStatus(order, 'delivered', req.user, { source: 'delivery_scan' });
+    const deliveryCollection = syncFulfilmentForStatus(order, 'completed', req.user, { source: 'delivery_scan' });
     await saveWithStatusSync(order, deliveryCollection);
   } else {
     await order.save();
@@ -2077,9 +2078,9 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
   if (io) {
     io.to(`order-${order._id}`).emit('order-status-updated', {
       orderId: order._id,
-      status: 'delivered',
+      status: 'completed',
     });
-    io.emit('order:status-updated', { orderId: order._id, status: 'delivered' });
+    io.emit('order:status-updated', { orderId: order._id, status: 'completed' });
   }
 
   res.status(200).json({
@@ -2132,7 +2133,7 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Walk-in orders created by staff are automatically assigned and cannot be picked', 400));
   }
 
-  if (['completed', 'cancelled', 'delivered'].includes(order.status)) {
+  if (TERMINAL_STATUSES.includes(order.status)) {
     return next(new AppError('Cannot accept a completed or cancelled order', 400));
   }
 
@@ -2248,7 +2249,8 @@ exports.acceptDelivery = asyncHandler(async (req, res, next) => {
       deliveredBy: { $exists: false },
     },
     {
-      $set: { deliveredBy: req.user.id, status: 'out-for-delivery' },
+      // The order stays 'ready'; being out on a run is delivery metadata.
+      $set: { deliveredBy: req.user.id, deliveryStatus: 'out_for_delivery', dispatchedAt: new Date() },
     },
     { new: true }
   )
@@ -2263,10 +2265,10 @@ exports.acceptDelivery = asyncHandler(async (req, res, next) => {
   }
 
   order.statusHistory.push({
-    status: 'out-for-delivery',
+    status: order.status,
     updatedBy: req.user.id,
     actorRole: req.user.role,
-    notes: `Delivery accepted and marked out-for-delivery by: ${req.user.name}`,
+    notes: `Delivery accepted and dispatched by: ${req.user.name}`,
   });
   await order.save();
 
@@ -2277,7 +2279,7 @@ exports.acceptDelivery = asyncHandler(async (req, res, next) => {
       deliveredBy: req.user.id,
       deliveryStaffName: req.user.name,
     });
-    io.emit('order:status-updated', { orderId: order._id, status: 'out-for-delivery' });
+    io.emit('order:status-updated', { orderId: order._id, status: order.status, deliveryStatus: 'out_for_delivery' });
   }
 
   res.status(200).json({
@@ -2303,6 +2305,9 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
   if (!['confirmed', 'pending'].includes(order.status)) {
     return next(new AppError(`Cannot confirm pickup: order is currently "${order.status}"`, 400));
   }
+  if (order.actualPickupDate) {
+    return next(new AppError('Pickup has already been confirmed for this order', 400));
+  }
 
   // Only the assigned pickup staff (or admin/manager/developer) can scan
   const isAdminRole = ['admin', 'manager', 'developer'].includes(req.user.role);
@@ -2313,11 +2318,13 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
     }
   }
 
-  order.status = 'picked-up';
+  // Pickup is metadata, not a status: the order is accepted (confirmed) and the
+  // garments are now with us. Status only moves if it was still pending.
+  order.status = 'confirmed';
   order.actualPickupDate = new Date();
   if (!order.pickupStaffId) order.pickupStaffId = req.user.id;
   order.statusHistory.push({
-    status: 'picked-up',
+    status: 'confirmed',
     updatedBy: req.user.id,
     actorRole: req.user.role,
     notes: 'Pickup confirmed via barcode scan',
@@ -2327,8 +2334,8 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
 
   const io = req.app.get('io');
   if (io) {
-    io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: 'picked-up' });
-    io.emit('order:status-updated', { orderId: order._id, status: 'picked-up' });
+    io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: 'confirmed', pickedUp: true });
+    io.emit('order:status-updated', { orderId: order._id, status: 'confirmed', pickedUp: true });
   }
 
   res.status(200).json({
@@ -2663,7 +2670,7 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   }
 
   // Check if order can be cancelled
-  if (['delivered', 'completed', 'cancelled'].includes(order.status)) {
+  if (TERMINAL_STATUSES.includes(order.status)) {
     return next(new AppError('Order cannot be cancelled', 400));
   }
 
@@ -2921,7 +2928,7 @@ exports.addOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Not authorized to edit order items', 403));
   }
 
-  if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
+  if (TERMINAL_STATUSES.includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
@@ -2983,7 +2990,7 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Not authorized to edit order items', 403));
   }
 
-  if (['completed', 'delivered', 'cancelled'].includes(order.status)) {
+  if (TERMINAL_STATUSES.includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
@@ -3319,6 +3326,16 @@ exports.addOrderMedia = asyncHandler(async (req, res, next) => {
   }
 
   const { mediaUrl, note } = req.body;
+  // Only plain http(s) URLs: a javascript:/data: URL stored here would be
+  // rendered by the staff UI.
+  let parsedUrl = null;
+  try { parsedUrl = typeof mediaUrl === 'string' && mediaUrl.length <= 2048 ? new URL(mediaUrl) : null; } catch { parsedUrl = null; }
+  if (!parsedUrl || !['http:', 'https:'].includes(parsedUrl.protocol)) {
+    return next(new AppError('A valid media URL is required', 400));
+  }
+  if (note !== undefined && (typeof note !== 'string' || note.length > 1000)) {
+    return next(new AppError('Note must be text of at most 1000 characters', 400));
+  }
   const source = req.user.role === 'customer' ? 'customer' : 'staff';
 
   const media = await OrderMedia.create({

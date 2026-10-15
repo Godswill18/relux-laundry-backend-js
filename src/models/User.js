@@ -128,12 +128,22 @@ const UserSchema = new mongoose.Schema(
     guarantorPhone: String,
     otp: String,
     otpExpires: Date,
+    otpAttempts: { type: Number, default: 0 },
     jwtVersion: { type: Number, default: 1 },
   },
   {
     timestamps: true,
+    // Never serialise secrets (OTP, password hash) into any API response.
+    toJSON: { transform: (_d, ret) => { delete ret.otp; delete ret.otpExpires; delete ret.password; return ret; } },
+    toObject: { transform: (_d, ret) => { delete ret.otp; delete ret.otpExpires; return ret; } },
   }
 );
+
+// A new (or cleared) OTP always starts with a fresh attempt budget.
+UserSchema.pre('save', function (next) {
+  if (this.isModified('otp')) this.otpAttempts = 0;
+  next();
+});
 
 // Hash password before saving
 UserSchema.pre('save', async function (next) {

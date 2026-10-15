@@ -6,7 +6,8 @@ const corsOptions = {
         if (allowedOrigins.indexOf(normalizedOrigin) !== -1 || !origin) {
             callback(null, true);
         } else {
-            callback(new Error('Not allowed by CORS: ' + origin));
+            // Reject quietly (no CORS headers) instead of raising a 500.
+            callback(null, false);
         }
     },
     credentials: true,

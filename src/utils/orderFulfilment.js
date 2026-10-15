@@ -29,10 +29,13 @@ const notify = require('./notify.js');
 const logger = require('./logger.js');
 
 // Statuses that mean every garment has been finished / handed over.
-const READY_IMPLIED_STATUSES = ['ready', 'out-for-delivery', 'delivered', 'completed'];
-const COLLECTED_IMPLIED_STATUSES = ['delivered', 'completed'];
+const {
+  READY_STATUSES: READY_IMPLIED_STATUSES,
+  COLLECTED_STATUSES: COLLECTED_IMPLIED_STATUSES,
+  PRE_READY_STATUSES: CANONICAL_PRE_READY,
+} = require('./orderStatus.js');
 // Statuses an order is in before its garments are all ready.
-const PRE_READY_STATUSES = ['draft', 'pending', 'confirmed', 'picked-up', 'in_progress', 'washing', 'ironing'];
+const PRE_READY_STATUSES = ['draft', ...CANONICAL_PRE_READY];
 
 const invalid = (message) => new AppError(message, 400, ERROR_CODES.VALIDATION_ERROR);
 
@@ -419,7 +422,7 @@ function settleOrderStatus(order, actor, before) {
   };
 
   if (collected >= total && total > 0) {
-    if (!['completed', 'delivered', 'cancelled'].includes(order.status)) {
+    if (!['completed', 'cancelled'].includes(order.status)) {
       if (paymentSettled(order)) setStatus('completed', 'All garments collected');
       else changes.awaitingPayment = true;
     }
@@ -505,7 +508,7 @@ function syncFulfilmentForStatus(order, status, actor, { source = 'status_update
       .map((i) => ({ itemId: i._id, quantity: i.quantity - (i.collectedQuantity || 0) }));
     if (outstanding.length) {
       collection = applyCollect(order, outstanding, actor, {
-        method: status === 'delivered' ? 'delivery' : 'status_update',
+        method: source === 'delivery_scan' ? 'delivery' : 'status_update',
         source,
         notes,
       });
