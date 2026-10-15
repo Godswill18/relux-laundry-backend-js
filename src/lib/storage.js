@@ -23,7 +23,10 @@ const s3 = new S3Client({
 
 // Upload a buffer and return { key, url }
 async function uploadFile(buffer, originalName, mimeType, prefix = 'uploads') {
-  const ext = path.extname(originalName).toLowerCase();
+  // Extension comes from the validated MIME type, never the client's filename
+  // (an "image/png" named evil.html must not be stored as .html).
+  const EXT_BY_MIME = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
+  const ext = EXT_BY_MIME[mimeType] || '';
   const key = `${prefix}/${randomUUID()}${ext}`;
   await s3.send(new PutObjectCommand({
     Bucket:      BUCKET,

@@ -96,7 +96,11 @@ exports.getNotifications = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/notifications/:id/read
 // @access  Private
 exports.markAsRead = asyncHandler(async (req, res, next) => {
-  const notification = await Notification.findById(req.params.id);
+  // Scoped to what this user may see — a bare findById let anyone mark any
+  // notification read by id.
+  const notification = await Notification.findOne({
+    $and: [{ _id: req.params.id }, buildNotifQuery(req.user)],
+  });
 
   if (!notification) {
     return next(new AppError('Notification not found', 404));

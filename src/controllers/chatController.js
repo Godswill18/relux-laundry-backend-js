@@ -56,7 +56,7 @@ exports.getThread = asyncHandler(async (req, res, next) => {
     return next(new AppError('Chat thread not found', 404));
   }
 
-  if (req.user.role === 'customer' && thread.customerId._id.toString() !== req.user.customerId) {
+  if (req.user.role === 'customer' && String(thread.customerId?._id || thread.customerId) !== String(req.user.customerId)) {
     return next(new AppError('Not authorized', 403));
   }
 
@@ -92,15 +92,18 @@ exports.createThread = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/v1/chats/:id/close
 // @access  Private
 exports.closeThread = asyncHandler(async (req, res, next) => {
-  const thread = await ChatThread.findByIdAndUpdate(
-    req.params.id,
-    { status: 'closed' },
-    { new: true }
-  );
+  const thread = await ChatThread.findById(req.params.id);
 
   if (!thread) {
     return next(new AppError('Chat thread not found', 404));
   }
+
+  if (req.user.role === 'customer' && String(thread.customerId) !== String(req.user.customerId)) {
+    return next(new AppError('Not authorized', 403));
+  }
+
+  thread.status = 'closed';
+  await thread.save();
 
   res.status(200).json({
     success: true,
@@ -119,7 +122,7 @@ exports.getMessages = asyncHandler(async (req, res, next) => {
     return next(new AppError('Chat thread not found', 404));
   }
 
-  if (req.user.role === 'customer' && thread.customerId.toString() !== req.user.customerId) {
+  if (req.user.role === 'customer' && String(thread.customerId) !== String(req.user.customerId)) {
     return next(new AppError('Not authorized', 403));
   }
 
@@ -157,6 +160,10 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
 
   if (!thread) {
     return next(new AppError('Chat thread not found', 404));
+  }
+
+  if (req.user.role === 'customer' && String(thread.customerId) !== String(req.user.customerId)) {
+    return next(new AppError('Not authorized', 403));
   }
 
   if (thread.status === 'closed') {

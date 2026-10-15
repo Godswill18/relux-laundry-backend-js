@@ -151,7 +151,7 @@ exports.getSlaPerformance = asyncHandler(async (req, res, next) => {
   const completed = levels.reduce((s, r) => s + r.completed, 0);
   const onTime = levels.reduce((s, r) => s + r.onTime, 0);
   const overdueNow = await Order.countDocuments({
-    slaActiveDueAt: { $lt: new Date() }, status: { $nin: ['cancelled', 'delivered', 'completed'] },
+    slaActiveDueAt: { $lt: new Date() }, status: { $nin: ['cancelled', 'completed'] },
   });
 
   res.status(200).json({

@@ -379,7 +379,7 @@ exports.getStaffProductivity = asyncHandler(async (req, res, next) => {
         inProgressOrders: {
           $sum: {
             $cond: [
-              { $in: ['$status', ['washing', 'drying', 'ironing', 'folding', 'processing', 'ready']] },
+              { $in: ['$status', ['confirmed', 'in_progress', 'ready']] },
               1,
               0,
             ],

@@ -36,7 +36,7 @@ const SLA_MIN_HOURS = 0.25;
 const SLA_MAX_HOURS = 24 * 30;
 
 // Orders in these states have finished processing (mirrors orderFulfilment).
-const READY_STATUSES = ['ready', 'out-for-delivery', 'delivered', 'completed'];
+const { READY_STATUSES } = require('./orderStatus.js');
 // A move from one of these into an active status is a (re)confirmation.
 const NOT_STARTED_STATUSES = ['draft', 'pending', 'cancelled'];
 

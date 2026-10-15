@@ -1,6 +1,7 @@
 // Generate OTP
 const generateOTP = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  // CSPRNG, not Math.random (predictable)
+  return String(require('crypto').randomInt(100000, 1000000));
 };
 
 // Split a "name" string into firstName / lastName

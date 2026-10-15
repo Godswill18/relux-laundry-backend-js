@@ -54,8 +54,14 @@ const errorHandler = (err, req, res, next) => {
     errorCode = ERROR_CODES.TOKEN_EXPIRED;
   }
 
+  // Never leak internals for server faults in production.
+  const status = error.statusCode || 500;
+  if (status >= 500 && process.env.NODE_ENV === 'production') {
+    error = { message: 'Something went wrong. Please try again later.', statusCode: status };
+  }
+
   // Standardized error response format
-  res.status(error.statusCode || 500).json({
+  res.status(status).json({
     success: false,
     data: null,
     message: error.message || 'Server Error',

@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ORDER_STATUSES } = require('../utils/orderStatus.js');
 // Loaded here, not looked up by name: nothing else requires Counter.js, so
 // mongoose.model('Counter') threw "Schema hasn't been registered for model
 // Counter" and every new order — online and walk-in — failed to save.
@@ -237,22 +238,14 @@ const OrderSchema = new mongoose.Schema(
     specialInstructions: String,
     status: {
       type: String,
-      enum: [
-        'draft',
-        'pending',
-        'confirmed',
-        'in_progress',
-        'picked-up',
-        'washing',
-        'ironing',
-        'ready',
-        'out-for-delivery',
-        'delivered',
-        'completed',
-        'cancelled',
-      ],
+      // Canonical statuses only (utils/orderStatus.js). 'draft' is retained
+      // solely so any pre-existing draft rows stay valid; nothing creates it.
+      enum: [...ORDER_STATUSES, 'draft'],
       default: 'pending',
     },
+    // Delivery logistics — metadata, deliberately NOT part of `status`.
+    deliveryStatus: { type: String, enum: ['out_for_delivery', 'delivered'] },
+    dispatchedAt: Date,
     paymentStatus: {
       type: String,
       enum: ['unpaid', 'paid', 'partial', 'refunded'],
@@ -576,5 +569,18 @@ OrderSchema.index({ slaActiveDueAt: 1 }, { sparse: true });
 OrderSchema.index({ slaDueSoonAt: 1 }, { sparse: true });
 // SLA performance reports window on when processing finished.
 OrderSchema.index({ readyAt: 1 }, { sparse: true });
+
+// Safety net while the status migration rolls out: a not-yet-migrated row is
+// still SERIALISED with its canonical status, so no client ever receives a
+// retired value. The migration (utils/migrations/canonicalOrderStatus.js) is
+// what actually changes the stored data.
+const { normalizeOrderStatus } = require('../utils/orderStatus.js');
+const canonicalise = (_doc, ret) => {
+  const n = normalizeOrderStatus(ret.status);
+  if (n.status && n.status !== ret.status) ret.status = n.status;
+  return ret;
+};
+OrderSchema.set('toJSON', { transform: canonicalise });
+OrderSchema.set('toObject', { transform: canonicalise });
 
 module.exports = mongoose.model('Order', OrderSchema);

@@ -1,16 +1,9 @@
 const rateLimit = require('express-rate-limit');
 
 // Extract the real client IP, handling proxies and load balancers.
-// Uses X-Forwarded-For first (set by proxies), falls back to req.ip.
-const getClientIP = (req) => {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) {
-    // X-Forwarded-For can be a comma-separated chain: "clientIP, proxy1, proxy2"
-    // The first entry is always the original client.
-    return forwarded.split(',')[0].trim();
-  }
-  return req.headers['x-real-ip'] || req.ip || 'unknown';
-};
+// Uses req.ip, which Express derives from X-Forwarded-For only for the
+// number of proxy hops declared via `trust proxy` (a raw header is spoofable).
+const getClientIP = (req) => req.ip || req.socket?.remoteAddress || 'unknown';
 
 // Build a per-IP key. For authenticated requests, fall back to userId
 // when multiple users share the same NAT/proxy IP.

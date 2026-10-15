@@ -18,7 +18,7 @@ function buildFilter(query) {
     if (query.startDate) filter.createdAt.$gte = watDayStart(query.startDate);
     if (query.endDate)   filter.createdAt.$lte = watDayEnd(query.endDate);
   }
-  if (query.status)        filter.status        = query.status;
+  if (query.status)        filter.status        = require('../utils/orderStatus.js').normalizeOrderStatus(query.status).status || query.status;
   if (query.paymentStatus) filter.paymentStatus = query.paymentStatus;
   if (query.orderType)     filter.orderType     = query.orderType;
 
@@ -171,17 +171,12 @@ exports.exportOrdersExcel = asyncHandler(async (req, res) => {
 
   // ── Data rows ────────────────────────────────────────────────────────────
   const STATUS_COLORS = {
-    pending:           'FFFEF3C7',
-    confirmed:         'FFDBEAFE',
-    'picked-up':       'FFE0E7FF',
-    in_progress:       'FFF3E8FF',
-    washing:           'FFE0F2FE',
-    ironing:           'FFFCE7F3',
-    ready:             'FFD1FAE5',
-    'out-for-delivery':'FFFEF9C3',
-    delivered:         'FFCFFAFE',
-    completed:         'FFD1FAE5',
-    cancelled:         'FFFEE2E2',
+    pending:     'FFFEF3C7',
+    confirmed:   'FFDBEAFE',
+    in_progress: 'FFCFFAFE',
+    ready:       'FFD1FAE5',
+    completed:   'FFA7F3D0',
+    cancelled:   'FFFEE2E2',
   };
 
   orders.forEach((order, idx) => {
@@ -364,10 +359,8 @@ exports.exportOrdersPDF = asyncHandler(async (req, res) => {
 
   // ── Draw a single data row ────────────────────────────────────────────────
   const STATUS_FILL = {
-    pending:           '#FEF3C7', confirmed: '#DBEAFE', 'picked-up': '#E0E7FF',
-    in_progress:       '#F3E8FF', washing:   '#E0F2FE', ironing:     '#FCE7F3',
-    ready:             '#D1FAE5', 'out-for-delivery': '#FEF9C3',
-    delivered:         '#CFFAFE', completed: '#D1FAE5', cancelled:   '#FEE2E2',
+    pending: '#FEF3C7', confirmed: '#DBEAFE', in_progress: '#CFFAFE',
+    ready: '#D1FAE5', completed: '#A7F3D0', cancelled: '#FEE2E2',
   };
 
   function drawRow(order, rowY, even) {

@@ -11,11 +11,42 @@ const ensureCustomer = require('../utils/ensureCustomer.js');
 const normalizePhone = require('../utils/normalizePhone.js');
 const { verifyEmailLink } = require('../utils/customerAppUrl.js');
 
+
+const DUMMY_HASH = require('bcryptjs').hashSync('relux-timing-equalizer', 10);
+
+// Max wrong guesses per issued OTP. A 6-digit code is only safe if guesses are
+// counted per ACCOUNT (IP limits alone are bypassed by rotating addresses).
+const OTP_MAX_ATTEMPTS = 5;
+
+// Returns the user when {email, otp} is valid, else null. The attempt is
+// counted atomically BEFORE comparing so parallel guesses cannot share one.
+async function findUserByValidOtp(email, otp, { withPassword = false } = {}) {
+  if (typeof email !== 'string' || typeof otp !== 'string') return null;
+  const crypto = require('crypto');
+  const counted = await User.findOneAndUpdate(
+    {
+      email: email.toLowerCase(),
+      otp: { $type: 'string' },
+      otpExpires: { $gt: Date.now() },
+      otpAttempts: { $not: { $gte: OTP_MAX_ATTEMPTS } },
+    },
+    { $inc: { otpAttempts: 1 } },
+    { new: false }
+  ).select('+otp').lean();
+  if (!counted) return null;
+  const a = Buffer.from(counted.otp);
+  const b = Buffer.from(otp);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  return User.findById(counted._id).select(withPassword ? '+password' : '');
+}
+
 // @desc    Register user
 // @route   POST /api/v1/auth/register
 // @access  Public
 exports.register = asyncHandler(async (req, res, next) => {
-  const { name, email, phone: rawPhone, password, role, referralCode } = req.body;
+  // `role` is deliberately NOT read from the body: public signup always
+  // creates a customer. Staff accounts are created by admins only.
+  const { name, email, phone: rawPhone, password, referralCode } = req.body;
 
   // Validate required fields
   if (!name || !rawPhone || !password) {
@@ -64,7 +95,7 @@ exports.register = asyncHandler(async (req, res, next) => {
     email: email.toLowerCase(),
     phone,
     password,
-    role: role || 'customer',
+    role: 'customer',
     emailVerified: false,
     otp,
     otpExpires,
@@ -204,11 +235,7 @@ exports.verifyEmail = asyncHandler(async (req, res, next) => {
     return next(new AppError('Please provide email and verification code', 400));
   }
 
-  const user = await User.findOne({
-    email: email.toLowerCase(),
-    otp,
-    otpExpires: { $gt: Date.now() },
-  });
+  const user = await findUserByValidOtp(email, otp);
 
   if (!user) {
     return next(new AppError('Invalid or expired verification code', 400));
@@ -307,6 +334,10 @@ exports.login = asyncHandler(async (req, res, next) => {
   if ((!phone && !email) || !password) {
     return next(new AppError('Please provide phone/email and password', 400));
   }
+  // Strings only — objects here would become query operators.
+  if ([phone, email, password].some((v) => v !== undefined && v !== null && typeof v !== 'string')) {
+    return next(new AppError('Invalid credentials', 400));
+  }
 
   // Smart detection: Check if phone field contains an email
   let query;
@@ -322,6 +353,9 @@ exports.login = asyncHandler(async (req, res, next) => {
   const user = await User.findOne(query).select('+password');
 
   if (!user) {
+    // Burn a bcrypt compare so an unknown account takes as long as a wrong
+    // password (no timing-based account enumeration).
+    await require('bcryptjs').compare(password, DUMMY_HASH).catch(() => {});
     return next(new AppError('Invalid credentials', 401));
   }
 
@@ -529,7 +563,7 @@ exports.requestOTP = asyncHandler(async (req, res, next) => {
   // TODO: Send OTP via SMS (Twilio integration)
   // For now, only expose OTP in development (never log it in production)
   if (process.env.NODE_ENV === 'development') {
-    logger.debug(`[requestOtp] OTP for ${phone}: ${otp}`);
+    logger.debug(`[requestOtp] OTP issued for ${phone}`);
   }
 
   res.status(200).json({
@@ -628,11 +662,7 @@ exports.resetPassword = asyncHandler(async (req, res, next) => {
     return next(new AppError('Password must be at least 6 characters', 400));
   }
 
-  const user = await User.findOne({
-    email: email.toLowerCase(),
-    otp,
-    otpExpires: { $gt: Date.now() },
-  }).select('+password');
+  const user = await findUserByValidOtp(email, otp, { withPassword: true });
 
   if (!user) {
     return next(new AppError('Invalid or expired reset code', 400));

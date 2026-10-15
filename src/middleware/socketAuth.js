@@ -21,7 +21,7 @@ const socketAuth = async (socket, next) => {
     }
 
     // Verify JWT token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     if (!decoded || !decoded.id) {
       logger.warn(`Socket connection rejected: Invalid token structure (${socket.id})`);
