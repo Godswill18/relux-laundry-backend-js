@@ -44,7 +44,10 @@ const {
   generateQRCode,
   paidOrderMatch,
   orderRevenueField,
+  revenuePipeline,
   startOfTodayWAT,
+  startOfDaysAgoWAT,
+  startOfMonthWAT,
   watDayEnd,
   getTodayWAT,
 } = require('../utils/helpers.js');
@@ -1380,17 +1383,31 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
   const INACTIVE_STATUSES = TERMINAL_STATUSES;
 
   const [aggResult, totalOrders, activeOrders, pendingPayments, todayOrders] = await Promise.all([
-    // Total revenue (all paid orders ever) + today's revenue
+    // Revenue = paid, non-cancelled orders (utils/helpers paidOrderMatch), dated
+    // by payment date. All-time total, today, this month, and the
+    // last 7 WAT days for the dashboard chart — all from the same pipeline.
     Order.aggregate([
+      ...revenuePipeline(),
       {
         $facet: {
           totalRevenue: [
-            { $match: paidOrderMatch() },
-            { $group: { _id: null, sum: { $sum: orderRevenueField() } } },
+            { $group: { _id: null, sum: { $sum: '$revenueAmount' }, orders: { $sum: 1 } } },
           ],
           todayRevenue: [
-            { $match: { ...paidOrderMatch(), createdAt: { $gte: todayStart, $lte: todayEnd } } },
-            { $group: { _id: null, sum: { $sum: orderRevenueField() } } },
+            { $match: { revenueAt: { $gte: todayStart, $lte: todayEnd } } },
+            { $group: { _id: null, sum: { $sum: '$revenueAmount' }, orders: { $sum: 1 } } },
+          ],
+          monthRevenue: [
+            { $match: { revenueAt: { $gte: startOfMonthWAT(), $lte: todayEnd } } },
+            { $group: { _id: null, sum: { $sum: '$revenueAmount' }, orders: { $sum: 1 } } },
+          ],
+          last7Days: [
+            { $match: { revenueAt: { $gte: startOfDaysAgoWAT(6), $lte: todayEnd } } },
+            { $group: {
+              _id: { $dateToString: { format: '%Y-%m-%d', date: '$revenueAt', timezone: '+01:00' } },
+              revenue: { $sum: '$revenueAmount' },
+              orders: { $sum: 1 },
+            } },
           ],
         },
       },
@@ -1404,11 +1421,21 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
   const facets = aggResult[0] || {};
   const totalRevenue = facets.totalRevenue?.[0]?.sum ?? 0;
   const todayRevenue = facets.todayRevenue?.[0]?.sum ?? 0;
+  const monthRevenue = facets.monthRevenue?.[0]?.sum ?? 0;
+  const revenueOrders = facets.totalRevenue?.[0]?.orders ?? 0;
+  // Seven WAT calendar days ending today, zero-filled, oldest first.
+  const byDay = new Map((facets.last7Days || []).map((d) => [d._id, d]));
+  const revenueLast7Days = Array.from({ length: 7 }, (_, i) => {
+    const date = new Date(startOfDaysAgoWAT(6 - i).getTime() + 3600000).toISOString().slice(0, 10);
+    const d = byDay.get(date);
+    return { date, revenue: d?.revenue ?? 0, revenueOrders: d?.orders ?? 0 };
+  });
 
   res.status(200).json({
     success: true,
     data: {
-      totalRevenue, todayRevenue, totalOrders, activeOrders, pendingPayments, todayOrders,
+      totalRevenue, todayRevenue, monthRevenue, revenueOrders, revenueLast7Days,
+      totalOrders, activeOrders, pendingPayments, todayOrders,
       fulfilment: await fulfilmentIndicators(),
     },
   });

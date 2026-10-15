@@ -114,14 +114,30 @@ const capToEndOfWATDay = (clockIn, proposedClockOut) => {
 };
 
 // ─── Canonical revenue definition ────────────────────────────────────────────
-// /orders/dashboard-stats matched on `paymentStatus`, /admin/dashboard matched on
-// `payment.status`, and only one of them excluded cancelled orders — so the two
-// dashboards reported different revenue for the same day. Every aggregate that
-// means "money we took" must build its $match from this.
+// REVENUE = orders whose payment status is PAID, in ANY order status except
+// CANCELLED (pending, confirmed, in progress, ready and completed all count).
+// Unpaid, partially paid and refunded orders are not revenue. Every dashboard,
+// report and export that shows "revenue" builds its $match from this — never
+// its own rule.
 const paidOrderMatch = () => ({
   paymentStatus: 'paid',
-  status: { $nin: ['cancelled'] },
+  status: { $ne: 'cancelled' },
 });
+
+// When a revenue order is recognised: its payment date (payment.paidAt). An
+// order with no recorded payment date falls back to its creation date (the
+// report flags how many). Monthly / daily revenue is bucketed on this, in WAT.
+const revenueDateField = () => ({ $ifNull: ['$payment.paidAt', '$createdAt'] });
+
+/**
+ * Pipeline prefix: revenue orders with `revenueAt` (and `revenueAmount`) set,
+ * optionally limited to revenueAt in [from, to).
+ */
+const revenuePipeline = ({ from, to } = {}) => [
+  { $match: paidOrderMatch() },
+  { $addFields: { revenueAt: revenueDateField(), revenueAmount: { $ifNull: ['$pricing.total', '$total'] } } },
+  ...(from || to ? [{ $match: { revenueAt: { ...(from ? { $gte: from } : {}), ...(to ? { $lt: to } : {}) } } }] : []),
+];
 
 // Revenue amount for one order. Orders written before `pricing` was introduced
 // carry only `total`, so the fallback is required or they sum as null.
@@ -171,6 +187,8 @@ module.exports = {
   capToEndOfWATDay,
   paidOrderMatch,
   orderRevenueField,
+  revenueDateField,
+  revenuePipeline,
   watDayStart,
   watDayEnd,
   startOfTodayWAT,
