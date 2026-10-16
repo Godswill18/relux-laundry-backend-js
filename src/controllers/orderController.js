@@ -1078,6 +1078,18 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
         ];
       }
     } else {
+      // No statusTab (the unfiltered default list): ?myOrders=true still limits
+      // a non-admin to the orders they are involved with — exactly as with a tab.
+      const isAdminRole = ['admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
+      if (!isAdminRole && req.query.myOrders === 'true') {
+        const staffId = req.user.id;
+        query.$or = [
+          { assignedStaff: staffId },
+          { pickupStaffId: staffId },
+          { deliveredBy: staffId },
+          { lastUpdatedById: staffId },
+        ];
+      }
       // Manual filters
       if (req.query.excludeCompleted === 'true') {
         query.status = notTerminalCondition();
@@ -1166,15 +1178,17 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     }
   }
 
-  // Cross-status search — when ?search= is provided, wipe tab/status filters
-  // and match orderNumber, code, or walk-in customer name/phone across ALL statuses.
+  // Search — matches orderNumber, code, or customer name/phone. Within the
+  // selected status when one is given, otherwise across every status.
   if (req.query.search?.trim() && req.user.role !== 'customer') {
     const raw = req.query.search.trim();
     const regex = new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     // Customer scope: the search narrows WITHIN the customer's own orders — the
     // ownership $or is never removed. Staff: search spans every status.
     if (!isCustomerScope) {
-      delete query.status;
+      // A status the user selected (statusTab/status) is kept: search runs
+      // within it. With no status selected, search spans every order.
+      if (!statusCondition) delete query.status;
       delete query.assignedStaff;
       delete query.$or;
     }
