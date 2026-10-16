@@ -75,7 +75,8 @@ const { logAudit } = require('../utils/auditLogger.js');
 // The six canonical order statuses, the legacy-value normaliser and the
 // terminal set all live in utils/orderStatus.js — never redefine them here.
 const {
-  ORDER_STATUSES, TERMINAL_STATUSES, normalizeOrderStatus,
+  normalizeOrderStatus,
+  STORED_VALUES, TERMINAL_STORED_VALUES, statusFilterCondition, notTerminalCondition, foldStatusCounts,
 } = require('../utils/orderStatus.js');
 
 /**
@@ -1009,6 +1010,16 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
 exports.getOrders = asyncHandler(async (req, res, next) => {
   let query;
 
+  // One status rule for every list (utils/orderStatus.statusFilterCondition):
+  //   'all' or no value → NO status condition (every authorised order, any
+  //   status — including any not-yet-migrated or unexpected value);
+  //   a status → that status plus its not-yet-migrated stored equivalents.
+  const statusParam = req.query.statusTab ?? req.query.status;
+  const statusCondition = statusFilterCondition(statusParam);
+  if (statusCondition === undefined) {
+    return next(new AppError(`'${statusParam}' is not a valid status filter`, 400, ERROR_CODES.VALIDATION_ERROR));
+  }
+
   // Customer UI always sends scope=customer — enforces personal-only view regardless of role.
   // This prevents staff accounts logged into the customer UI from seeing all orders.
   const isCustomerScope = req.user.role === 'customer' || req.query.scope === 'customer';
@@ -1024,6 +1035,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   // account is only linked to a customer record through a verified identifier.
   if (isCustomerScope) {
     query = customerOrderFilter(req.user);
+    if (statusCondition) query.status = statusCondition;
   } else {
     query = {};
 
@@ -1032,11 +1044,11 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
       // Unassigned online orders available to claim
       query.orderSource = 'online';
       query.assignedStaff = { $exists: false };
-      query.status = { $in: ['pending', 'confirmed'] };
+      query.status = { $in: [...STORED_VALUES.pending, ...STORED_VALUES.confirmed] };
     } else if (req.query.tab === 'mine') {
       // Orders assigned to this staff member that are still active
       query.assignedStaff = req.user.id;
-      query.status = { $nin: TERMINAL_STATUSES };
+      query.status = notTerminalCondition();
     } else if (req.query.tab === 'offline') {
       // Offline walk-in orders created by this staff member
       query.orderSource = 'offline';
@@ -1047,14 +1059,13 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
         { assignedStaff: req.user.id },
         { createdByStaff: req.user.id },
       ];
-      query.status = 'completed';
+      query.status = { $in: STORED_VALUES.completed };
     } else if (req.query.statusTab) {
       // --- 11-status workflow tab (Admin & Staff pages) ---
-      const st = req.query.statusTab;
       const isAdminRole = ['admin', 'manager', 'receptionist', 'developer'].includes(req.user.role);
 
-      // Legacy tab names (washing, out-for-delivery…) resolve to their status.
-      query.status = normalizeOrderStatus(st).status || st;
+      // 'all' adds no status condition; a status matches its stored equivalents.
+      if (statusCondition) query.status = statusCondition;
       // All statuses: staff see all orders globally.
       // When ?myOrders=true: filter to only orders this staff is involved with.
       if (!isAdminRole && req.query.myOrders === 'true') {
@@ -1069,11 +1080,14 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     } else {
       // Manual filters
       if (req.query.excludeCompleted === 'true') {
-        query.status = { $nin: TERMINAL_STATUSES };
+        query.status = notTerminalCondition();
       } else if (req.query.doneOnly === 'true') {
-        query.status = 'completed';
-      } else if (req.query.status) {
-        query.status = normalizeOrderStatus(req.query.status).status || req.query.status;
+        query.status = { $in: STORED_VALUES.completed };
+      } else if (statusCondition) {
+        query.status = statusCondition;
+      }
+      if (req.query.paymentStatus && req.query.paymentStatus !== 'all') {
+        query.paymentStatus = String(req.query.paymentStatus);
       }
       if (req.query.serviceType) query.serviceType = req.query.serviceType;
       if (req.query.customer) query.customer = req.query.customer;
@@ -1109,7 +1123,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     const slaCondition = slaFilter(String(req.query.sla || ''));
     if (slaCondition) {
       Object.assign(query, slaCondition);
-      if (!query.status) query.status = { $nin: TERMINAL_STATUSES };
+      if (!query.status) query.status = notTerminalCondition();
     }
 
     // Garment filters for the counter: ?fulfilment=
@@ -1123,11 +1137,11 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     } else if (fulfilmentFilter === 'ready_for_collection') {
       query.$and = [
         ...(query.$and || []),
-        { status: { $nin: TERMINAL_STATUSES } },
+        { status: notTerminalCondition() },
         {
           $or: [
             { itemTracking: true, $expr: { $gt: ['$readyGarments', '$collectedGarments'] } },
-            { itemTracking: { $ne: true }, status: 'ready' },
+            { itemTracking: { $ne: true }, status: { $in: STORED_VALUES.ready } },
           ],
         },
       ];
@@ -1157,9 +1171,13 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   if (req.query.search?.trim() && req.user.role !== 'customer') {
     const raw = req.query.search.trim();
     const regex = new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    delete query.status;
-    delete query.assignedStaff;
-    delete query.$or;
+    // Customer scope: the search narrows WITHIN the customer's own orders — the
+    // ownership $or is never removed. Staff: search spans every status.
+    if (!isCustomerScope) {
+      delete query.status;
+      delete query.assignedStaff;
+      delete query.$or;
+    }
     // NB: query.$and is intentionally preserved — it carries the delivery-role
     // scope, which a search must not be able to escape.
     const searchOr = [
@@ -1181,12 +1199,14 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     if (matchedCustomers.length) searchOr.push({ customerId: { $in: matchedCustomers.map((c) => c._id) } });
     if (matchedUsers.length) searchOr.push({ customer: { $in: matchedUsers.map((u) => u._id) } });
     if (phoneTail) searchOr.push({ 'walkInCustomer.phone': phoneTail });
-    query.$or = searchOr;
+    if (isCustomerScope) query.$and = [...(query.$and || []), { $or: searchOr }];
+    else query.$or = searchOr;
   }
 
-  // Pagination
-  const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 10;
+  // Pagination — the count and the page use the SAME query object, so `total`
+  // is always the full authorised, filtered set, never the page size.
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 10));
   const startIndex = (page - 1) * limit;
 
   const total = await Order.countDocuments(query);
@@ -1207,7 +1227,8 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
     .populate('lastUpdatedById', 'name')
     .populate('serviceLevelId', 'name percentageAdjustment priorityLevel')
     .populate('statusHistory.updatedBy', 'name')
-    .sort('-createdAt')
+    // _id breaks createdAt ties so consecutive pages never repeat or skip a row
+    .sort({ createdAt: -1, _id: -1 })
     .skip(startIndex)
     .limit(limit);
 
@@ -1233,7 +1254,7 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
 // their status (a legacy order at 'ready' has all its garments waiting).
 async function fulfilmentIndicators() {
   const [row] = await Order.aggregate([
-    { $match: { status: { $nin: TERMINAL_STATUSES } } },
+    { $match: { status: notTerminalCondition() } },
     {
       $project: {
         status: 1,
@@ -1287,8 +1308,8 @@ async function fulfilmentIndicators() {
   ]);
   const now = new Date();
   const [slaOverdue, slaDueSoon] = await Promise.all([
-    Order.countDocuments({ ...slaFilter('overdue', now), status: { $nin: TERMINAL_STATUSES } }),
-    Order.countDocuments({ ...slaFilter('due_soon', now), status: { $nin: TERMINAL_STATUSES } }),
+    Order.countDocuments({ ...slaFilter('overdue', now), status: notTerminalCondition() }),
+    Order.countDocuments({ ...slaFilter('due_soon', now), status: notTerminalCondition() }),
   ]);
   return {
     slaOverdue,
@@ -1311,37 +1332,35 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
   // scope=mine (default) → orders this staff is involved with
   const scope = req.query.scope || 'mine';
 
-  const STATUSES = ORDER_STATUSES;
-
-  const results = await Promise.all(
-    STATUSES.map((s) => {
-      if (scope === 'all') {
-        // Global count — all orders at this status regardless of assignment
-        return Order.countDocuments({ status: s });
-      }
-      // scope=mine: orders this staff is assigned to or has touched
-      return Order.countDocuments({
-        status: s,
-        $or: [
-          { assignedStaff: staffId },
-          { pickupStaffId: staffId },
-          { deliveredBy: staffId },
-          { lastUpdatedById: staffId },
-        ],
-      });
-    })
-  );
-
-  const byStatus = Object.fromEntries(STATUSES.map((s, i) => [s, results[i]]));
+  // One grouped query; not-yet-migrated values are counted in their canonical
+  // bucket (washing → in_progress …) so no order is missing from any count.
+  const match = scope === 'all' ? {} : {
+    $or: [
+      { assignedStaff: new mongoose.Types.ObjectId(String(staffId)) },
+      { pickupStaffId: new mongoose.Types.ObjectId(String(staffId)) },
+      { deliveredBy: new mongoose.Types.ObjectId(String(staffId)) },
+      { lastUpdatedById: new mongoose.Types.ObjectId(String(staffId)) },
+    ],
+  };
+  const rows = await Order.aggregate([{ $match: match }, { $group: { _id: '$status', n: { $sum: 1 } } }]);
+  const { counts: byStatus, other } = foldStatusCounts(rows);
+  const all = rows.reduce((t, r) => t + r.n, 0);
+  if (other) logger.warn(`[order-status] ${other} order(s) hold an unrecognised status (staff counts)`);
 
   // Garment indicators only on request (?include=fulfilment): the staff app
   // sums every value in this response, so an object here would corrupt the
   // total on any client that predates it.
-  const includeFulfilment = String(req.query.include || '').split(',').includes('fulfilment');
+  const include = String(req.query.include || '').split(',');
+  const includeFulfilment = include.includes('fulfilment');
 
   res.status(200).json({
     success: true,
-    data: { ...byStatus, ...(includeFulfilment ? { fulfilment: await fulfilmentIndicators() } : {}) },
+    data: {
+      ...byStatus,
+      // `totals` is an object, and opt-in, for the same reason as `fulfilment`.
+      ...(include.includes('totals') ? { totals: { all, other } } : {}),
+      ...(includeFulfilment ? { fulfilment: await fulfilmentIndicators() } : {}),
+    },
   });
 });
 
@@ -1349,26 +1368,21 @@ exports.getStaffCounts = asyncHandler(async (req, res) => {
 // @route   GET /api/v1/orders/counts
 // @access  Private (staff, admin, manager)
 exports.getOrderCounts = asyncHandler(async (req, res) => {
-  const STATUSES = ORDER_STATUSES;
-
-  const results = await Promise.all(
-    STATUSES.map((s) => Order.countDocuments({ status: s }))
-  );
-
-  const byStatus = Object.fromEntries(STATUSES.map((s, i) => [s, results[i]]));
-
-  // Convenience totals
-  const total      = results.reduce((a, b) => a + b, 0);
-  const active     = STATUSES
-    .filter((s) => !TERMINAL_STATUSES.includes(s))
-    .reduce((sum, s) => sum + byStatus[s], 0);
+  // One grouped query over EVERY order. Not-yet-migrated values are folded into
+  // their canonical bucket; `total` is every order (unrecognised values too, also
+  // reported as `other`), so the All tab always matches the database.
+  const rows = await Order.aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]);
+  const { counts: byStatus, other } = foldStatusCounts(rows);
+  const total = rows.reduce((t, r) => t + r.n, 0);
+  const active = byStatus.pending + byStatus.confirmed + byStatus.in_progress + byStatus.ready;
+  if (other) logger.warn(`[order-status] ${other} order(s) hold an unrecognised status`);
 
   // Additive and only on request (?include=fulfilment) — see getStaffCounts
   const includeFulfilment = String(req.query.include || '').split(',').includes('fulfilment');
 
   res.status(200).json({
     success: true,
-    data: { ...byStatus, total, active, ...(includeFulfilment ? { fulfilment: await fulfilmentIndicators() } : {}) },
+    data: { ...byStatus, total, active, other, ...(includeFulfilment ? { fulfilment: await fulfilmentIndicators() } : {}) },
   });
 });
 
@@ -1380,7 +1394,6 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
   const todayStart = startOfTodayWAT();
   const todayEnd   = watDayEnd(getTodayWAT());
 
-  const INACTIVE_STATUSES = TERMINAL_STATUSES;
 
   const [aggResult, totalOrders, activeOrders, pendingPayments, todayOrders] = await Promise.all([
     // Revenue = paid, non-cancelled orders (utils/helpers paidOrderMatch), dated
@@ -1413,7 +1426,7 @@ exports.getOrderDashboardStats = asyncHandler(async (req, res) => {
       },
     ]),
     Order.countDocuments({}),
-    Order.countDocuments({ status: { $nin: INACTIVE_STATUSES } }),
+    Order.countDocuments({ status: notTerminalCondition() }),
     Order.countDocuments({ paymentStatus: { $in: ['unpaid', 'partial'] } }),
     Order.countDocuments({ createdAt: { $gte: todayStart, $lte: todayEnd } }),
   ]);
@@ -1502,7 +1515,7 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
   }
 
   // Block editing completed/delivered/cancelled orders
-  if (TERMINAL_STATUSES.includes(order.status)) {
+  if (TERMINAL_STORED_VALUES.includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
@@ -1782,7 +1795,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
 
   const isSupervisor = ['admin', 'manager', 'developer'].includes(req.user.role);
   // A finished or cancelled order is only reopened by a supervisor.
-  if (TERMINAL_STATUSES.includes(order.status) && !isSupervisor) {
+  if (TERMINAL_STORED_VALUES.includes(order.status) && !isSupervisor) {
     return next(new AppError(
       `Order is ${order.status}. Only a manager or admin can reopen it.`,
       403
@@ -2058,7 +2071,7 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
     return next(new AppError('Invalid or unrecognized QR code', 404));
   }
 
-  if (order.status === 'completed') {
+  if (STORED_VALUES.completed.includes(order.status)) {
     return next(new AppError('This order has already been delivered', 400));
   }
 
@@ -2160,7 +2173,7 @@ exports.acceptOrder = asyncHandler(async (req, res, next) => {
     return next(new AppError('Walk-in orders created by staff are automatically assigned and cannot be picked', 400));
   }
 
-  if (TERMINAL_STATUSES.includes(order.status)) {
+  if (TERMINAL_STORED_VALUES.includes(order.status)) {
     return next(new AppError('Cannot accept a completed or cancelled order', 400));
   }
 
@@ -2697,7 +2710,7 @@ exports.cancelOrder = asyncHandler(async (req, res, next) => {
   }
 
   // Check if order can be cancelled
-  if (TERMINAL_STATUSES.includes(order.status)) {
+  if (TERMINAL_STORED_VALUES.includes(order.status)) {
     return next(new AppError('Order cannot be cancelled', 400));
   }
 
@@ -2955,7 +2968,7 @@ exports.addOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Not authorized to edit order items', 403));
   }
 
-  if (TERMINAL_STATUSES.includes(order.status)) {
+  if (TERMINAL_STORED_VALUES.includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
@@ -3017,7 +3030,7 @@ exports.removeOrderItem = asyncHandler(async (req, res, next) => {
     return next(new AppError('Not authorized to edit order items', 403));
   }
 
-  if (TERMINAL_STATUSES.includes(order.status)) {
+  if (TERMINAL_STORED_VALUES.includes(order.status)) {
     return next(new AppError('Cannot edit a completed, delivered, or cancelled order', 400));
   }
 
