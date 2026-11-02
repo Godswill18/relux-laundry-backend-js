@@ -69,6 +69,9 @@ const {
 } = require('../utils/orderFulfilment.js');
 const { buildSlaView, slaFilter, resolveServiceLevel } = require('../utils/orderSla.js');
 const normalizePhone = require('../utils/normalizePhone.js');
+const {
+  canTransferOrders, requestTransfer, verifyTransfer, cancelTransfer, getOpenTransfer,
+} = require('../utils/orderTransfer.js');
 const logger = require('../utils/logger.js');
 const { logAudit } = require('../utils/auditLogger.js');
 
@@ -1575,6 +1578,20 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     'pickupMethod', 'rush', 'stainRemoval', 'fragrance',
     'notes', 'walkInCustomer', 'assignedStaff', 'paymentStatus',
   ];
+  // A changed phone is never just edited: it may mean the order belongs to a
+  // different account. The contact keeps its current number here and the change
+  // goes through the transfer flow below (utils/orderTransfer.js).
+  let requestedPhone = null;
+  const bodyPhone = req.body.walkInCustomer?.phone;
+  if (typeof bodyPhone === 'string' && bodyPhone.trim()) {
+    const currentRaw = order.walkInCustomer?.phone;
+    const same = normalizePhone(bodyPhone) && normalizePhone(bodyPhone) === normalizePhone(currentRaw || '');
+    if (!same && bodyPhone.trim() !== currentRaw) {
+      requestedPhone = bodyPhone.trim();
+      req.body.walkInCustomer = { ...req.body.walkInCustomer, phone: currentRaw };
+    }
+  }
+
   scalarFields.forEach((field) => {
     if (req.body[field] !== undefined) order[field] = req.body[field];
   });
@@ -1758,10 +1775,22 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     emitSlaUpdate(io, order);
   }
 
+  // The rest of the edit is saved whatever happens to the phone change.
+  let transfer;
+  if (requestedPhone) {
+    try {
+      transfer = await canTransferOrders(req.user)
+        ? await requestTransfer({ orderId: order._id, phone: requestedPhone, actor: req.user })
+        : { outcome: 'not_permitted', message: 'The phone number was not changed: your role cannot change the customer on an order.' };
+    } catch (err) {
+      transfer = { outcome: 'error', message: err.message };
+    }
+  }
+
   res.status(200).json({
     success: true,
     message: 'Order updated successfully',
-    data: { order: withFulfilment(order), priceDifference: difference, refundIssued, refundAmount },
+    data: { order: withFulfilment(order), priceDifference: difference, refundIssued, refundAmount, ...(transfer ? { transfer } : {}) },
   });
 });
 
@@ -3618,4 +3647,36 @@ exports.backfillWalkIn = asyncHandler(async (req, res) => {
     message: 'Walk-in phone numbers normalized. Orders are linked to customers through customer records — run the linkWalkInCustomers migration for historical orders.',
     data: { linkedCount: 0 },
   });
+});
+
+// ─── Order ownership transfer (utils/orderTransfer.js) ──────────────────────
+// Routes are gated by authorize(); this is the finer EDIT_ORDER check.
+exports.requireTransferPermission = asyncHandler(async (req, res, next) => {
+  if (!(await canTransferOrders(req.user))) {
+    return next(new AppError('You do not have permission to change the customer on an order', 403));
+  }
+  next();
+});
+
+// @route GET /api/v1/orders/:id/transfer
+exports.getOrderTransfer = asyncHandler(async (req, res) => {
+  res.status(200).json({ success: true, data: { transfer: await getOpenTransfer(req.params.id) } });
+});
+
+// @route POST /api/v1/orders/:id/transfer   { phone } — start, resend or resume
+exports.startOrderTransfer = asyncHandler(async (req, res) => {
+  const result = await requestTransfer({ orderId: req.params.id, phone: req.body.phone, actor: req.user });
+  res.status(200).json({ success: true, message: result.message, data: result });
+});
+
+// @route POST /api/v1/orders/:id/transfer/verify   { code }
+exports.verifyOrderTransfer = asyncHandler(async (req, res) => {
+  const result = await verifyTransfer({ orderId: req.params.id, code: req.body.code, actor: req.user, io: req.app.get('io') });
+  res.status(200).json({ success: true, message: result.message, data: result });
+});
+
+// @route DELETE /api/v1/orders/:id/transfer
+exports.cancelOrderTransfer = asyncHandler(async (req, res) => {
+  const result = await cancelTransfer({ orderId: req.params.id, actor: req.user });
+  res.status(200).json({ success: true, message: result.message, data: result });
 });

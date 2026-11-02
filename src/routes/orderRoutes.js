@@ -40,7 +40,8 @@ const {
 } = require('../controllers/orderNoteController.js');
 
 const { protect, authorize } = require('../middleware/auth.js');
-const { orderLimiter } = require('../middleware/rateLimiter.js');
+const { orderLimiter, authLimiter } = require('../middleware/rateLimiter.js');
+const orderCtl = require('../controllers/orderController.js');
 
 // All routes require authentication (JWT tokens)
 router.use(protect);
@@ -65,6 +66,14 @@ router.post('/scan-pickup',   authorize('staff', 'admin', 'manager', 'delivery')
 router.route('/:id')
   .get(getOrder)
   .put(authorize('staff', 'admin', 'manager'), updateOrder);
+
+// Moving an order to another account. Backend-enforced EDIT_ORDER, which the
+// default staff and delivery roles do not have. Customers can never reach these.
+const transferGate = [authorize('staff', 'admin', 'manager', 'receptionist'), orderCtl.requireTransferPermission];
+router.get('/:id/transfer',           transferGate, orderCtl.getOrderTransfer);
+router.post('/:id/transfer',          transferGate, authLimiter, orderCtl.startOrderTransfer);
+router.post('/:id/transfer/verify',   transferGate, authLimiter, orderCtl.verifyOrderTransfer);
+router.delete('/:id/transfer',        transferGate, orderCtl.cancelOrderTransfer);
 
 router.patch('/:id/status',           authorize('staff', 'admin', 'manager', 'delivery'), updateOrderStatus);
 router.patch('/:id/accept',           authorize('staff', 'admin', 'manager'), acceptOrder);
