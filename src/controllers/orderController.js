@@ -956,7 +956,9 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   try {
     const io = req.app.get('io');
     if (io) {
-      io.emit('order-created', order);
+      // Staff lists refetch on this, so an id is all they need. This used to
+      // broadcast the whole order, customer details included, to every socket.
+      io.to('admin').to('delivery').emit('order-created', { orderId: order._id, orderNumber: order.orderNumber });
       io.to(`user-${orderCustomerRefId || orderCustomerId}`).emit('order:created', order);
     }
 
@@ -1981,6 +1983,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       stageDurationMinutes,
     });
     // Global broadcast so all connected clients (delivery, staff, admin) get live updates
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', {
       orderId: order._id,
       status,
@@ -2163,6 +2166,7 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       status: 'completed',
     });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', { orderId: order._id, status: 'completed' });
   }
 
@@ -2362,6 +2366,7 @@ exports.acceptDelivery = asyncHandler(async (req, res, next) => {
       deliveredBy: req.user.id,
       deliveryStaffName: req.user.name,
     });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', { orderId: order._id, status: order.status, deliveryStatus: 'out_for_delivery' });
   }
 
@@ -2418,6 +2423,7 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
   const io = req.app.get('io');
   if (io) {
     io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: 'confirmed', pickedUp: true });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', { orderId: order._id, status: 'confirmed', pickedUp: true });
   }
 
@@ -3153,6 +3159,15 @@ function withFulfilment(order, { customerScope = false, collections } = {}) {
 
 // SLA changes only on confirmation, readiness, cancellation or an edit — never
 // per second — so a single event on those moments is all clients need.
+// Tells only this order's owner to refresh. Customer lists used to refetch on the
+// global status broadcast, so one status change made every connected customer
+// re-download their whole history.
+function notifyOrderOwner(io, order) {
+  const rooms = [order.customer?._id ?? order.customer, order.customerId?._id ?? order.customerId]
+    .filter(Boolean).map((id) => `user-${id}`);
+  if (rooms.length) io.to(rooms).emit('order:mine-updated', { orderId: order._id });
+}
+
 function emitSlaUpdate(io, order) {
   if (!io || !order) return;
   const sla = buildSlaView(order);
@@ -3175,6 +3190,7 @@ function emitFulfilmentUpdate(req, order, changes = {}) {
   emitSlaUpdate(io, order);
   if (changes.statusChangedTo) {
     io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: order.status });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', {
       orderId: order._id,
       status: order.status,

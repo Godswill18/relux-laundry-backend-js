@@ -429,6 +429,10 @@ async function verifyTransfer({ orderId, code, actor, io }) {
   if (io) {
     // Open order lists (both customers', staff) already refetch on this event.
     io.emit('order:status-updated', { orderId: order._id, status: order.status });
+    // Both accounts' My Orders refresh: it leaves one list and joins the other.
+    const rooms = [transfer.fromUserId, transfer.fromCustomerId, target._id, target.customerId]
+      .filter(Boolean).map((id) => `user-${id}`);
+    io.to(rooms).emit('order:mine-updated', { orderId: order._id });
     io.emit('order:updated', { orderId: order._id });
   }
 
