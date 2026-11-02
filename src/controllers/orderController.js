@@ -69,6 +69,9 @@ const {
 } = require('../utils/orderFulfilment.js');
 const { buildSlaView, slaFilter, resolveServiceLevel } = require('../utils/orderSla.js');
 const normalizePhone = require('../utils/normalizePhone.js');
+const {
+  canTransferOrders, requestTransfer, verifyTransfer, cancelTransfer, getOpenTransfer,
+} = require('../utils/orderTransfer.js');
 const logger = require('../utils/logger.js');
 const { logAudit } = require('../utils/auditLogger.js');
 
@@ -953,7 +956,9 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   try {
     const io = req.app.get('io');
     if (io) {
-      io.emit('order-created', order);
+      // Staff lists refetch on this, so an id is all they need. This used to
+      // broadcast the whole order, customer details included, to every socket.
+      io.to('admin').to('delivery').emit('order-created', { orderId: order._id, orderNumber: order.orderNumber });
       io.to(`user-${orderCustomerRefId || orderCustomerId}`).emit('order:created', order);
     }
 
@@ -1575,6 +1580,20 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     'pickupMethod', 'rush', 'stainRemoval', 'fragrance',
     'notes', 'walkInCustomer', 'assignedStaff', 'paymentStatus',
   ];
+  // A changed phone is never just edited: it may mean the order belongs to a
+  // different account. The contact keeps its current number here and the change
+  // goes through the transfer flow below (utils/orderTransfer.js).
+  let requestedPhone = null;
+  const bodyPhone = req.body.walkInCustomer?.phone;
+  if (typeof bodyPhone === 'string' && bodyPhone.trim()) {
+    const currentRaw = order.walkInCustomer?.phone;
+    const same = normalizePhone(bodyPhone) && normalizePhone(bodyPhone) === normalizePhone(currentRaw || '');
+    if (!same && bodyPhone.trim() !== currentRaw) {
+      requestedPhone = bodyPhone.trim();
+      req.body.walkInCustomer = { ...req.body.walkInCustomer, phone: currentRaw };
+    }
+  }
+
   scalarFields.forEach((field) => {
     if (req.body[field] !== undefined) order[field] = req.body[field];
   });
@@ -1758,10 +1777,22 @@ exports.updateOrder = asyncHandler(async (req, res, next) => {
     emitSlaUpdate(io, order);
   }
 
+  // The rest of the edit is saved whatever happens to the phone change.
+  let transfer;
+  if (requestedPhone) {
+    try {
+      transfer = await canTransferOrders(req.user)
+        ? await requestTransfer({ orderId: order._id, phone: requestedPhone, actor: req.user })
+        : { outcome: 'not_permitted', message: 'The phone number was not changed: your role cannot change the customer on an order.' };
+    } catch (err) {
+      transfer = { outcome: 'error', message: err.message };
+    }
+  }
+
   res.status(200).json({
     success: true,
     message: 'Order updated successfully',
-    data: { order: withFulfilment(order), priceDifference: difference, refundIssued, refundAmount },
+    data: { order: withFulfilment(order), priceDifference: difference, refundIssued, refundAmount, ...(transfer ? { transfer } : {}) },
   });
 });
 
@@ -1952,6 +1983,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res, next) => {
       stageDurationMinutes,
     });
     // Global broadcast so all connected clients (delivery, staff, admin) get live updates
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', {
       orderId: order._id,
       status,
@@ -2134,6 +2166,7 @@ exports.scanDelivery = asyncHandler(async (req, res, next) => {
       orderId: order._id,
       status: 'completed',
     });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', { orderId: order._id, status: 'completed' });
   }
 
@@ -2333,6 +2366,7 @@ exports.acceptDelivery = asyncHandler(async (req, res, next) => {
       deliveredBy: req.user.id,
       deliveryStaffName: req.user.name,
     });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', { orderId: order._id, status: order.status, deliveryStatus: 'out_for_delivery' });
   }
 
@@ -2389,6 +2423,7 @@ exports.scanPickup = asyncHandler(async (req, res, next) => {
   const io = req.app.get('io');
   if (io) {
     io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: 'confirmed', pickedUp: true });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', { orderId: order._id, status: 'confirmed', pickedUp: true });
   }
 
@@ -3124,6 +3159,15 @@ function withFulfilment(order, { customerScope = false, collections } = {}) {
 
 // SLA changes only on confirmation, readiness, cancellation or an edit — never
 // per second — so a single event on those moments is all clients need.
+// Tells only this order's owner to refresh. Customer lists used to refetch on the
+// global status broadcast, so one status change made every connected customer
+// re-download their whole history.
+function notifyOrderOwner(io, order) {
+  const rooms = [order.customer?._id ?? order.customer, order.customerId?._id ?? order.customerId]
+    .filter(Boolean).map((id) => `user-${id}`);
+  if (rooms.length) io.to(rooms).emit('order:mine-updated', { orderId: order._id });
+}
+
 function emitSlaUpdate(io, order) {
   if (!io || !order) return;
   const sla = buildSlaView(order);
@@ -3146,6 +3190,7 @@ function emitFulfilmentUpdate(req, order, changes = {}) {
   emitSlaUpdate(io, order);
   if (changes.statusChangedTo) {
     io.to(`order-${order._id}`).emit('order-status-updated', { orderId: order._id, status: order.status });
+    notifyOrderOwner(io, order);
     io.emit('order:status-updated', {
       orderId: order._id,
       status: order.status,
@@ -3618,4 +3663,36 @@ exports.backfillWalkIn = asyncHandler(async (req, res) => {
     message: 'Walk-in phone numbers normalized. Orders are linked to customers through customer records — run the linkWalkInCustomers migration for historical orders.',
     data: { linkedCount: 0 },
   });
+});
+
+// ─── Order ownership transfer (utils/orderTransfer.js) ──────────────────────
+// Routes are gated by authorize(); this is the finer EDIT_ORDER check.
+exports.requireTransferPermission = asyncHandler(async (req, res, next) => {
+  if (!(await canTransferOrders(req.user))) {
+    return next(new AppError('You do not have permission to change the customer on an order', 403));
+  }
+  next();
+});
+
+// @route GET /api/v1/orders/:id/transfer
+exports.getOrderTransfer = asyncHandler(async (req, res) => {
+  res.status(200).json({ success: true, data: { transfer: await getOpenTransfer(req.params.id) } });
+});
+
+// @route POST /api/v1/orders/:id/transfer   { phone } — start, resend or resume
+exports.startOrderTransfer = asyncHandler(async (req, res) => {
+  const result = await requestTransfer({ orderId: req.params.id, phone: req.body.phone, actor: req.user });
+  res.status(200).json({ success: true, message: result.message, data: result });
+});
+
+// @route POST /api/v1/orders/:id/transfer/verify   { code }
+exports.verifyOrderTransfer = asyncHandler(async (req, res) => {
+  const result = await verifyTransfer({ orderId: req.params.id, code: req.body.code, actor: req.user, io: req.app.get('io') });
+  res.status(200).json({ success: true, message: result.message, data: result });
+});
+
+// @route DELETE /api/v1/orders/:id/transfer
+exports.cancelOrderTransfer = asyncHandler(async (req, res) => {
+  const result = await cancelTransfer({ orderId: req.params.id, actor: req.user });
+  res.status(200).json({ success: true, message: result.message, data: result });
 });

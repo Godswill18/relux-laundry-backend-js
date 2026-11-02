@@ -554,6 +554,8 @@ OrderSchema.index({ 'payment.status': 1 });
 OrderSchema.index({ paymentStatus: 1, status: 1 });
 // Reporting and export windows are all createdAt ranges, usually narrowed by status.
 OrderSchema.index({ createdAt: -1 });
+// Every delivery and pickup scan looks an order up by this
+OrderSchema.index({ qrCode: 1 }, { sparse: true });
 // Staff dashboard tabs: assigned/unassigned pools and the walk-in list.
 OrderSchema.index({ assignedStaff: 1, status: 1 });
 OrderSchema.index({ orderSource: 1, status: 1 });
