@@ -10,35 +10,21 @@ const sendEmail = require('../utils/sendEmail.js');
 const ensureCustomer = require('../utils/ensureCustomer.js');
 const normalizePhone = require('../utils/normalizePhone.js');
 const { verifyEmailLink } = require('../utils/customerAppUrl.js');
+const logger = require('../utils/logger.js');
 
 
 const DUMMY_HASH = require('bcryptjs').hashSync('relux-timing-equalizer', 10);
 
-// Max wrong guesses per issued OTP. A 6-digit code is only safe if guesses are
-// counted per ACCOUNT (IP limits alone are bypassed by rotating addresses).
-const OTP_MAX_ATTEMPTS = 5;
+// Every emailed code (signup verification, password reset) goes through
+// utils/emailCode.js: one active code per purpose, hashed, issued atomically
+// with a resend cooldown, checked and consumed atomically.
+const { issueCode, checkCode, releaseCooldown, MESSAGES: CODE_MESSAGES } = require('../utils/emailCode.js');
 
-// Returns the user when {email, otp} is valid, else null. The attempt is
-// counted atomically BEFORE comparing so parallel guesses cannot share one.
-async function findUserByValidOtp(email, otp, { withPassword = false } = {}) {
-  if (typeof email !== 'string' || typeof otp !== 'string') return null;
-  const crypto = require('crypto');
-  const counted = await User.findOneAndUpdate(
-    {
-      email: email.toLowerCase(),
-      otp: { $type: 'string' },
-      otpExpires: { $gt: Date.now() },
-      otpAttempts: { $not: { $gte: OTP_MAX_ATTEMPTS } },
-    },
-    { $inc: { otpAttempts: 1 } },
-    { new: false }
-  ).select('+otp').lean();
-  if (!counted) return null;
-  const a = Buffer.from(counted.otp);
-  const b = Buffer.from(otp);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-  return User.findById(counted._id).select(withPassword ? '+password' : '');
-}
+const codeFailure = (result, fallback) => new AppError(
+  CODE_MESSAGES[result.reason] || fallback,
+  result.reason === 'locked' ? 429 : 400,
+  `CODE_${String(result.reason).toUpperCase()}`
+);
 
 // @desc    Register user
 // @route   POST /api/v1/auth/register
@@ -85,9 +71,6 @@ exports.register = asyncHandler(async (req, res, next) => {
     ));
   }
 
-  // Generate email verification OTP before creating the user
-  const otp = generateOTP();
-  const otpExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
 
   // Create user with emailVerified = false
   const user = await User.create({
@@ -97,8 +80,6 @@ exports.register = asyncHandler(async (req, res, next) => {
     password,
     role: 'customer',
     emailVerified: false,
-    otp,
-    otpExpires,
   });
 
   // Auto-generate a unique referral code for this new user
@@ -134,6 +115,11 @@ exports.register = asyncHandler(async (req, res, next) => {
     }
   }
 
+  // Issue the verification code only now the account exists, through the one
+  // code path every resend also uses.
+  const issued = await issueCode({ email: user.email, purpose: 'verify_email', ttlMs: 10 * 60 * 1000 });
+  const otp = issued.code;
+
   // Send verification OTP
   const verifyHtml = `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px;">
@@ -154,20 +140,29 @@ exports.register = asyncHandler(async (req, res, next) => {
     </div>
   `;
 
-  try {
-    await sendEmail({ to: user.email, subject: 'Verify your Relux Laundry email', html: verifyHtml });
-  } catch (_) {
-    // Don't block signup if email fails — user can resend
+  // The account stays either way; a failed send must not pretend a code is on
+  // its way. No cooldown applies, so "Resend" works straight away.
+  let emailSent = false;
+  if (issued.issued) {
+    try {
+      await sendEmail({ to: user.email, subject: 'Verify your Relux Laundry email', html: verifyHtml });
+      emailSent = true;
+    } catch (err) {
+      logger.error('[register] verification email failed', { userId: user._id, error: err.message });
+      await releaseCooldown(user._id);
+    }
   }
 
   // Return pending state — no token until email is verified
   res.status(201).json({
     success: true,
-    message: 'Account created! Please check your email for a 6-digit verification code.',
+    message: emailSent
+      ? 'Account created! Please check your email for a 6-digit verification code.'
+      : "Account created, but we couldn't send your verification code. Please request a new code on the next page.",
     data: {
       email: user.email,
       pendingVerification: true,
-      ...(process.env.NODE_ENV === 'development' && { otp }),
+      emailSent,
     },
   });
 });
@@ -178,22 +173,26 @@ exports.register = asyncHandler(async (req, res, next) => {
 exports.resendEmailVerification = asyncHandler(async (req, res, next) => {
   const { email } = req.body;
 
-  if (!email) {
+  if (!email || typeof email !== 'string') {
     return next(new AppError('Please provide your email address', 400));
   }
 
-  const user = await User.findOne({ email: email.toLowerCase() });
+  // The same reply whether or not the address has an account (no enumeration).
+  const generic = () => res.status(200).json({ success: true, message: 'If that email is pending verification, a new code has been sent.' });
 
-  // Always respond success to prevent email enumeration
-  if (!user || user.emailVerified) {
-    return res.status(200).json({ success: true, message: 'If that email is pending verification, a new code has been sent.' });
-  }
+  // onlyIfNoActiveCode: the automatic send when an unverified customer is
+  // stopped at sign-in. It must never replace a code they already have — that
+  // silent replacement is what made codes "invalid" on arrival.
+  const result = await issueCode({
+    email,
+    purpose: 'verify_email',
+    ttlMs: 10 * 60 * 1000,
+    extraFilter: { emailVerified: false },
+    onlyIfNoActive: req.body.onlyIfNoActiveCode === true,
+  });
+  if (!result.issued) return generic();
 
-  const otp = generateOTP();
-  user.otp = otp;
-  user.otpExpires = Date.now() + 10 * 60 * 1000;
-  await user.save({ validateBeforeSave: false });
-
+  const { user, code: otp } = result;
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px;">
       <h2 style="color:#1d4ed8;margin-bottom:8px;">Relux Laundry</h2>
@@ -214,15 +213,13 @@ exports.resendEmailVerification = asyncHandler(async (req, res, next) => {
 
   try {
     await sendEmail({ to: user.email, subject: 'Your Relux Laundry verification code', html });
-  } catch (_) {
+  } catch (err) {
+    logger.error('[resendEmailVerification] email failed', { userId: user._id, error: err.message });
+    await releaseCooldown(user._id);
     return next(new AppError('Email could not be sent. Please try again later.', 500));
   }
 
-  res.status(200).json({
-    success: true,
-    message: 'If that email is pending verification, a new code has been sent.',
-    ...(process.env.NODE_ENV === 'development' && { otp }),
-  });
+  return generic();
 });
 
 // @desc    Verify email with OTP
@@ -235,17 +232,15 @@ exports.verifyEmail = asyncHandler(async (req, res, next) => {
     return next(new AppError('Please provide email and verification code', 400));
   }
 
-  const user = await findUserByValidOtp(email, otp);
-
-  if (!user) {
-    return next(new AppError('Invalid or expired verification code', 400));
+  if (typeof email !== 'string' || (typeof otp !== 'string' && typeof otp !== 'number')) {
+    return next(new AppError(CODE_MESSAGES.incorrect, 400, 'CODE_INCORRECT'));
   }
 
-  // Mark email as verified and clear OTP
-  user.emailVerified = true;
-  user.otp = undefined;
-  user.otpExpires = undefined;
-  await user.save({ validateBeforeSave: false });
+  // Checks the code and marks the email verified in ONE atomic update.
+  const result = await checkCode({ email, code: otp, purpose: 'verify_email', consumeSet: { emailVerified: true } });
+  if (!result.ok) return next(codeFailure(result, 'Invalid or expired verification code'));
+
+  const user = await User.findById(result.userId);
 
   // Email is now proven — link the account to its customer record. If a
   // walk-in record already holds this email, that record is claimed instead
@@ -556,6 +551,7 @@ exports.requestOTP = asyncHandler(async (req, res, next) => {
   // Generate OTP
   const otp = generateOTP();
   user.otp = otp;
+  user.otpPurpose = 'phone'; // never accepted as an email or reset code
   user.otpExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
 
   await user.save({ validateBeforeSave: false });
@@ -605,11 +601,14 @@ exports.forgotPassword = asyncHandler(async (req, res, next) => {
     });
   }
 
-  // Generate 6-digit OTP and store it (reuses existing otp / otpExpires fields)
-  const otp = generateOTP();
-  user.otp = otp;
-  user.otpExpires = Date.now() + 15 * 60 * 1000; // 15 minutes
-  await user.save({ validateBeforeSave: false });
+  // Its own purpose: a reset request no longer wipes a pending signup code,
+  // and a signup code can't reset a password. Within the resend cooldown the
+  // earlier code stays valid and nothing new is sent.
+  const issued = await issueCode({ email: user.email, purpose: 'reset_password', ttlMs: 15 * 60 * 1000 });
+  if (!issued.issued) {
+    return res.status(200).json({ success: true, message: 'If that email is registered, a reset code has been sent.' });
+  }
+  const otp = issued.code;
 
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px;">
@@ -634,17 +633,14 @@ exports.forgotPassword = asyncHandler(async (req, res, next) => {
       html,
     });
   } catch (err) {
-    // Clear OTP so user can retry
-    user.otp = undefined;
-    user.otpExpires = undefined;
-    await user.save({ validateBeforeSave: false });
+    logger.error('[forgotPassword] email failed', { userId: user._id, error: err.message });
+    await releaseCooldown(user._id);
     return next(new AppError('Email could not be sent. Please try again later.', 500));
   }
 
   res.status(200).json({
     success: true,
     message: 'If that email is registered, a reset code has been sent.',
-    ...(process.env.NODE_ENV === 'development' && { otp }),
   });
 });
 
@@ -662,15 +658,15 @@ exports.resetPassword = asyncHandler(async (req, res, next) => {
     return next(new AppError('Password must be at least 6 characters', 400));
   }
 
-  const user = await findUserByValidOtp(email, otp, { withPassword: true });
-
-  if (!user) {
+  if (typeof email !== 'string' || typeof newPassword !== 'string') {
     return next(new AppError('Invalid or expired reset code', 400));
   }
 
+  const result = await checkCode({ email, code: otp, purpose: 'reset_password' });
+  if (!result.ok) return next(codeFailure(result, 'Invalid or expired reset code'));
+
+  const user = await User.findById(result.userId).select('+password');
   user.password = newPassword;
-  user.otp = undefined;
-  user.otpExpires = undefined;
   // Bump jwtVersion to invalidate all existing sessions
   user.jwtVersion = (user.jwtVersion || 0) + 1;
   await user.save();
