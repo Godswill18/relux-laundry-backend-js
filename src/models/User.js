@@ -129,13 +129,19 @@ const UserSchema = new mongoose.Schema(
     otp: String,
     otpExpires: Date,
     otpAttempts: { type: Number, default: 0 },
+    // Which flow the active code belongs to, the code it replaced (so a stale
+    // email can be recognised), and when it was sent (resend cooldown).
+    // See utils/emailCode.js.
+    otpPurpose: { type: String, enum: ['verify_email', 'reset_password', 'phone'] },
+    otpPrevious: { type: String },
+    otpSentAt: { type: Date },
     jwtVersion: { type: Number, default: 1 },
   },
   {
     timestamps: true,
     // Never serialise secrets (OTP, password hash) into any API response.
-    toJSON: { transform: (_d, ret) => { delete ret.otp; delete ret.otpExpires; delete ret.password; return ret; } },
-    toObject: { transform: (_d, ret) => { delete ret.otp; delete ret.otpExpires; return ret; } },
+    toJSON: { transform: (_d, ret) => { delete ret.otp; delete ret.otpExpires; delete ret.otpPrevious; delete ret.otpAttempts; delete ret.otpSentAt; delete ret.otpPurpose; delete ret.password; return ret; } },
+    toObject: { transform: (_d, ret) => { delete ret.otp; delete ret.otpExpires; delete ret.otpPrevious; delete ret.otpAttempts; delete ret.otpSentAt; delete ret.otpPurpose; return ret; } },
   }
 );
 
