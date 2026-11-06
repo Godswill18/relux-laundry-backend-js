@@ -28,6 +28,12 @@ router.get('/stage-durations', protect, authorize('admin', 'manager', 'staff', '
 router.put('/stage-durations', protect, authorize('admin'), updateStageDurationSettings);
 
 // Admin-only settings
+// Campaigns (e.g. the anniversary celebration): Superadmin only, checked
+// before the admin gate below so ordinary admins can't reach them.
+const campaign = require('../controllers/campaignController.js');
+router.get('/campaigns/:key', protect, campaign.requireSuperadmin, campaign.getCampaignSettings);
+router.put('/campaigns/:key', protect, campaign.requireSuperadmin, campaign.updateCampaignSettings);
+
 router.use(protect);
 router.use(authorize('admin'));
 
