@@ -3,7 +3,10 @@ const {
   PutObjectCommand,
   DeleteObjectCommand,
   ListObjectsV2Command,
+  HeadObjectCommand,
+  GetObjectCommand,
 } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { randomUUID } = require('crypto');
 const path = require('path');
 
@@ -74,4 +77,79 @@ async function replaceFile(oldKey, buffer, mimeType) {
   return { key, url: getFileUrl(key) };
 }
 
-module.exports = { uploadFile, getFileUrl, extractKey, listFiles, deleteFile, replaceFile };
+// ── Direct browser → MinIO uploads ──────────────────────────────────────────
+// The browser PUTs the file straight to MinIO with a short-lived signed URL;
+// the API never sees the bytes. The URL is signed for one key, one content
+// type and one exact size, so it can't be reused to write anything else.
+//
+// MINIO_PUBLIC_ENDPOINT: the address browsers use, if it differs from the one
+// the API uses (e.g. an internal Docker hostname). Signatures cover the host,
+// so the URL must be signed for the address the browser will actually call.
+const PUBLIC_ENDPOINT = (process.env.MINIO_PUBLIC_ENDPOINT || ENDPOINT || '').replace(/\/+$/, '');
+//
+// Its own client: recent AWS SDKs add an x-amz-checksum-crc32 to signed URLs,
+// computed over an EMPTY body at signing time. MinIO checks it against the
+// uploaded file and rejects every upload. WHEN_REQUIRED keeps it out.
+const publicS3 = new S3Client({
+  endpoint: PUBLIC_ENDPOINT,
+  region: 'us-east-1',
+  forcePathStyle: true,
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  credentials: { accessKeyId: process.env.MINIO_ACCESS_KEY, secretAccessKey: process.env.MINIO_SECRET_KEY },
+});
+const PUBLIC_BASE_URL = `${PUBLIC_ENDPOINT}/${BUCKET}`;
+
+const IMAGE_EXT = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
+
+async function createPresignedUpload({ prefix, contentType, size, expiresIn = 300 }) {
+  const ext = IMAGE_EXT[contentType];
+  if (!ext) throw new Error('unsupported content type');
+  const key = `${prefix}/${randomUUID()}${ext}`;
+  const uploadUrl = await getSignedUrl(
+    publicS3,
+    new PutObjectCommand({ Bucket: BUCKET, Key: key, ContentType: contentType, ContentLength: size }),
+    { expiresIn, signableHeaders: new Set(['content-type', 'content-length']) }
+  );
+  return { key, uploadUrl, url: `${PUBLIC_BASE_URL}/${key}`, expiresIn };
+}
+
+// First bytes of each allowed format — the stored content must really be one.
+const MAGIC = {
+  'image/jpeg': (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,
+  'image/png': (b) => b.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  'image/gif': (b) => b.slice(0, 6).toString('ascii') === 'GIF87a' || b.slice(0, 6).toString('ascii') === 'GIF89a',
+  'image/webp': (b) => b.slice(0, 4).toString('ascii') === 'RIFF' && b.slice(8, 12).toString('ascii') === 'WEBP',
+};
+
+/**
+ * Confirm a directly-uploaded object exists and is the image it claims to be
+ * (reads only the first 16 bytes — the API never downloads the file).
+ * Returns { ok: true } or { ok: false, reason }.
+ */
+async function verifyUploadedImage(key, { maxBytes }) {
+  let head;
+  try {
+    head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+  } catch (err) {
+    return { ok: false, reason: err?.$metadata?.httpStatusCode === 404 || err?.name === 'NotFound' ? 'missing' : 'unreachable' };
+  }
+  const type = head.ContentType;
+  if (!MAGIC[type]) return { ok: false, reason: 'type' };
+  if (!head.ContentLength || head.ContentLength > maxBytes) return { ok: false, reason: 'size' };
+  const part = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key, Range: 'bytes=0-15' }));
+  const bytes = Buffer.from(await part.Body.transformToByteArray());
+  if (!MAGIC[type](bytes)) return { ok: false, reason: 'content' };
+  return { ok: true };
+}
+
+// Key for a URL under either the API's or the browser's MinIO address.
+function keyFromAnyUrl(url) {
+  if (typeof url !== 'string') return null;
+  if (url.startsWith(PUBLIC_BASE_URL + '/')) return url.slice(PUBLIC_BASE_URL.length + 1);
+  return extractKey(url);
+}
+
+module.exports = {
+  uploadFile, getFileUrl, extractKey, listFiles, deleteFile, replaceFile,
+  createPresignedUpload, verifyUploadedImage, keyFromAnyUrl, IMAGE_EXT,
+};

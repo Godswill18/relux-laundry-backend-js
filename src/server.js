@@ -366,6 +366,19 @@ mongoose.connection.once('open', () => {
 
     // Every 15 minutes: auto-fail abandoned transactions and catch anything missed
     setInterval(() => recoverPendingPaystackTransactions(io), 15 * 60 * 1000);
+
+    // Every 6 hours: remove announcement images that were uploaded straight to
+    // MinIO but never saved (only announcements/direct/, only >24h old, only
+    // unreferenced). Skipped when MinIO isn't configured.
+    if (process.env.MINIO_ENDPOINT && process.env.MINIO_BUCKET) {
+      const { cleanupAbandonedAnnouncementUploads } = require('./controllers/announcementController.js');
+      setInterval(() => {
+        withJobLock('announcementUploadCleanup', 30 * 60 * 1000, async () => {
+          const n = await cleanupAbandonedAnnouncementUploads();
+          if (n) logger.info(`[announcementUploadCleanup] removed ${n} abandoned upload(s)`);
+        }).catch((err) => logger.error(`[announcementUploadCleanup] Failed: ${err.message}`));
+      }, 6 * 60 * 60 * 1000);
+    }
   });
 });
 
