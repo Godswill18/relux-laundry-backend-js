@@ -7,22 +7,16 @@ const {
   createAnnouncement,
   updateAnnouncement,
   deleteAnnouncement,
-  uploadAnnouncementImage,
+  getAnnouncementUploadUrl,
 } = require('../controllers/announcementController.js');
-const { protect, authorize }                    = require('../middleware/auth.js');
-const { uploadAnnouncementImage: multerUpload } = require('../middleware/upload.js');
+const { protect, authorize } = require('../middleware/auth.js');
 
 // Active announcements for current user's role — any authenticated user
 router.get('/active', protect, getActiveAnnouncements);
 
-// Image upload (must be before /:id routes to avoid conflict)
-router.post(
-  '/upload-image',
-  protect,
-  authorize('admin', 'manager'),
-  multerUpload,
-  uploadAnnouncementImage,
-);
+// Signed URL for a direct browser → MinIO image upload. The image itself never
+// comes through the API. (Must be before /:id routes.)
+router.post('/upload-url', protect, authorize('admin', 'manager'), getAnnouncementUploadUrl);
 
 // Admin/Manager CRUD
 router.get('/',    protect, authorize('admin', 'manager'), getAnnouncements);

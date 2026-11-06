@@ -135,13 +135,15 @@ exports.createAnnouncement = asyncHandler(async (req, res, next) => {
     return next(new AppError('endDate must be after startDate', 400));
   }
 
+  const image = await acceptImage(imageUrl);
+
   const item = await Announcement.create({
     title:          title.trim(),
     message:        message.trim(),
     type:           type           || 'announcement',
     targetAudience: targetAudience || 'both',
     displayMode:    displayMode    || 'banner',
-    imageUrl:       imageUrl       || '',
+    imageUrl:       image,
     ctaLabel:       ctaLabel       || '',
     ctaUrl:         ctaUrl         || '',
     startDate:      new Date(startDate),
@@ -164,10 +166,8 @@ exports.updateAnnouncement = asyncHandler(async (req, res, next) => {
   const item = await Announcement.findById(req.params.id);
   if (!item) return next(new AppError('Announcement not found', 404));
 
-  // If imageUrl is being replaced, delete the old stored image
-  if (req.body.imageUrl !== undefined && req.body.imageUrl !== item.imageUrl) {
-    await deleteStoredImage(item.imageUrl);
-  }
+  const previousImage = item.imageUrl;
+  if (req.body.imageUrl !== undefined) req.body.imageUrl = await acceptImage(req.body.imageUrl, item.imageUrl);
 
   const fields = [
     'title', 'message', 'type', 'targetAudience', 'displayMode',
@@ -182,6 +182,11 @@ exports.updateAnnouncement = asyncHandler(async (req, res, next) => {
   }
 
   await item.save();
+
+  // Only once the new reference is saved: a failed edit must never cost the
+  // announcement its existing image.
+  if (previousImage && previousImage !== item.imageUrl) await deleteStoredImage(previousImage);
+
   res.status(200).json({
     success: true,
     message: 'Announcement updated',
@@ -207,21 +212,87 @@ exports.deleteAnnouncement = asyncHandler(async (req, res, next) => {
   });
 });
 
-// ── Upload announcement image ─────────────────────────────────────────────────
-// @route   POST /api/v1/announcements/upload-image
+// ── Announcement images: direct browser → MinIO uploads ─────────────────────
+// The API never receives image bytes. It signs an upload URL, then, when the
+// announcement is saved, checks the uploaded object before storing its URL.
+const DIRECT_PREFIX = 'announcements/direct';
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // same limit as before
+const DIRECT_KEY = /^announcements\/direct\/[0-9a-f-]{36}\.(jpg|png|webp|gif)$/;
+const EXT_OK = { 'image/jpeg': ['jpg', 'jpeg'], 'image/png': ['png'], 'image/webp': ['webp'], 'image/gif': ['gif'] };
+
+// @route   POST /api/v1/announcements/upload-url   { fileName, contentType, size }
 // @access  Private (Admin/Manager)
-// Multer middleware (memoryStorage) is applied in the route — req.file.buffer is the image data.
-exports.uploadAnnouncementImage = asyncHandler(async (req, res, next) => {
-  if (!req.file) return next(new AppError('No image file provided', 400));
-  const { url } = await storage.uploadFile(
-    req.file.buffer,
-    req.file.originalname,
-    req.file.mimetype,
-    'announcements',
-  );
+exports.getAnnouncementUploadUrl = asyncHandler(async (req, res, next) => {
+  const { fileName, contentType } = req.body;
+  const size = Number(req.body.size);
+  if (!storage.IMAGE_EXT[contentType]) {
+    return next(new AppError('Only JPG, PNG, WebP or GIF images can be uploaded', 415));
+  }
+  const ext = String(fileName || '').toLowerCase().split('.').pop();
+  if (fileName && !EXT_OK[contentType].includes(ext)) {
+    return next(new AppError("The file's extension doesn't match its type", 415));
+  }
+  if (!Number.isInteger(size) || size <= 0 || size > MAX_IMAGE_BYTES) {
+    return next(new AppError('Images must be 5 MB or smaller', 413));
+  }
+  const upload = await storage.createPresignedUpload({ prefix: DIRECT_PREFIX, contentType, size });
   res.status(200).json({
     success: true,
-    message: 'Image uploaded successfully',
-    data: { imageUrl: url },
+    data: {
+      uploadUrl: upload.uploadUrl,
+      method: 'PUT',
+      headers: { 'Content-Type': contentType },
+      key: upload.key,
+      imageUrl: upload.url,
+      expiresIn: upload.expiresIn,
+    },
   });
 });
+
+/**
+ * The image to store for an announcement. Accepts: no image, the announcement's
+ * current image unchanged, or a direct upload this API signed — verified to
+ * exist and to really be an image. Anything else (another URL, another key,
+ * an expiring signed URL) is refused.
+ */
+async function acceptImage(imageUrl, current = '') {
+  if (!imageUrl) return '';
+  if (imageUrl === current) return current;
+  const key = storage.keyFromAnyUrl(imageUrl);
+  if (!key || !DIRECT_KEY.test(key) || imageUrl.includes('?')) {
+    throw new AppError('Upload the image again — that image reference is not valid.', 400);
+  }
+  const check = await storage.verifyUploadedImage(key, { maxBytes: MAX_IMAGE_BYTES });
+  if (!check.ok) {
+    if (['type', 'size', 'content'].includes(check.reason)) await storage.deleteFile(key).catch(() => {});
+    const msg = {
+      missing: 'The image upload did not finish. Please upload it again.',
+      unreachable: 'Image storage is unavailable right now. Please try again.',
+      type: 'Only JPG, PNG, WebP or GIF images can be used.',
+      size: 'Images must be 5 MB or smaller.',
+      content: "That file isn't a valid image.",
+    }[check.reason];
+    throw new AppError(msg, check.reason === 'unreachable' ? 503 : 400);
+  }
+  return storage.getFileUrl(key);
+}
+
+/**
+ * Remove direct uploads nobody saved (form closed after uploading). Only
+ * touches announcements/direct/, only objects over a day old, and only ones no
+ * announcement references. Existing images elsewhere are never considered.
+ */
+exports.cleanupAbandonedAnnouncementUploads = async ({ olderThanMs = 24 * 60 * 60 * 1000 } = {}) => {
+  const files = await storage.listFiles(DIRECT_PREFIX + '/');
+  const cutoff = Date.now() - olderThanMs;
+  const old = files.filter((f) => f.lastModified && new Date(f.lastModified).getTime() < cutoff);
+  if (!old.length) return 0;
+  const used = new Set((await Announcement.find({ imageUrl: { $ne: '' } }).select('imageUrl').lean())
+    .map((a) => storage.keyFromAnyUrl(a.imageUrl)).filter(Boolean));
+  let removed = 0;
+  for (const f of old) {
+    if (used.has(f.key)) continue;
+    await storage.deleteFile(f.key).then(() => { removed += 1; }).catch(() => {});
+  }
+  return removed;
+};
