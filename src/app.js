@@ -156,6 +156,8 @@ app.use(`/api/${API_VERSION}/attendance`, staffGate, attendanceRoutes);
 app.use(`/api/${API_VERSION}/work-location`, staffGate, workLocationRoutes);
 app.use(`/api/${API_VERSION}/payroll`, staffGate, payrollRoutes);
 app.use(`/api/${API_VERSION}/settings`, staffGate, settingsRoutes);
+// Read-only campaign state for the customer app (public: it is not secret)
+app.get(`/api/${API_VERSION}/campaigns/:key`, require('./controllers/campaignController.js').getCampaignState);
 app.use(`/api/${API_VERSION}/audit-logs`, staffGate, auditRoutes);
 app.use(`/api/${API_VERSION}/announcements`, announcementRoutes);
 app.use(`/api/${API_VERSION}/files`,         fileRoutes);
