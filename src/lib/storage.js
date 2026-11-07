@@ -10,7 +10,19 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { randomUUID } = require('crypto');
 const path = require('path');
 
-const ENDPOINT = process.env.MINIO_ENDPOINT; // e.g. https://storage.dotnetpro.tech
+// MinIO's own env style gives a bare host plus MINIO_USE_SSL / MINIO_PORT
+// (e.g. storage.dotnetpro.tech, true, 443); the S3 SDK needs a full URL.
+// Accept either, so a bare host doesn't make every upload fail ("Invalid URL").
+function toEndpointUrl(raw) {
+  const v = (raw || '').trim().replace(/\/+$/, '');
+  if (!v || /^https?:\/\//i.test(v)) return v;
+  const ssl = String(process.env.MINIO_USE_SSL ?? 'true').toLowerCase() !== 'false';
+  const port = String(process.env.MINIO_PORT || '').trim();
+  const defaultPort = ssl ? '443' : '80';
+  return `${ssl ? 'https' : 'http'}://${v}${port && port !== defaultPort ? `:${port}` : ''}`;
+}
+
+const ENDPOINT = toEndpointUrl(process.env.MINIO_ENDPOINT); // e.g. https://storage.dotnetpro.tech
 const BUCKET   = process.env.MINIO_BUCKET;   // e.g. relux
 const BASE_URL  = `${ENDPOINT}/${BUCKET}`;
 
@@ -85,7 +97,8 @@ async function replaceFile(oldKey, buffer, mimeType) {
 // MINIO_PUBLIC_ENDPOINT: the address browsers use, if it differs from the one
 // the API uses (e.g. an internal Docker hostname). Signatures cover the host,
 // so the URL must be signed for the address the browser will actually call.
-const PUBLIC_ENDPOINT = (process.env.MINIO_PUBLIC_ENDPOINT || ENDPOINT || '').replace(/\/+$/, '');
+// MINIO_PUBLIC_URL is accepted as the same setting.
+const PUBLIC_ENDPOINT = toEndpointUrl(process.env.MINIO_PUBLIC_ENDPOINT || process.env.MINIO_PUBLIC_URL) || ENDPOINT || '';
 //
 // Its own client: recent AWS SDKs add an x-amz-checksum-crc32 to signed URLs,
 // computed over an EMPTY body at signing time. MinIO checks it against the
